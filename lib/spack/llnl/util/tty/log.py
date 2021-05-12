@@ -743,6 +743,7 @@ def _writer_daemon(stdin_multiprocess_fd, read_multiprocess_fd, write_fd, echo,
     events = []
     try:
         with keyboard_input(stdin) as kb:
+            line_count = 0
             while True:
                 # fix the terminal settings if we recently came to
                 # the foreground
@@ -762,6 +763,9 @@ def _writer_daemon(stdin_multiprocess_fd, read_multiprocess_fd, write_fd, echo,
                         try:
                             if stdin.read(1) == 'v':
                                 echo = not echo
+                                events.append(
+                                    'v:' + str(echo) + ':' + str(line_count))
+                                line_count = 0
                         except IOError as e:
                             # If SIGTTIN is ignored, the system gives EIO
                             # to let the caller know the read failed b/c it
@@ -770,7 +774,6 @@ def _writer_daemon(stdin_multiprocess_fd, read_multiprocess_fd, write_fd, echo,
                                 raise
 
                 if in_pipe in rlist:
-                    line_count = 0
                     try:
                         while line_count < 100:
                             # Handle output from the calling process.
@@ -795,8 +798,12 @@ def _writer_daemon(stdin_multiprocess_fd, read_multiprocess_fd, write_fd, echo,
                             if num_controls > 0:
                                 controls = control.findall(line)
                                 if xon in controls:
+                                    events.append('force_echo:on:' + str(line_count))
+                                    line_count = 0
                                     force_echo = True
                                 if xoff in controls:
+                                    events.append('force_echo:off:' + str(line_count))
+                                    line_count = 0
                                     force_echo = False
 
                             if not _input_available(in_pipe):
