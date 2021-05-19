@@ -744,6 +744,7 @@ def _writer_daemon(stdin_multiprocess_fd, read_multiprocess_fd, write_fd, echo,
     try:
         with keyboard_input(stdin) as kb:
             line_count = 0
+            backgrounded_record = False
             while True:
                 # fix the terminal settings if we recently came to
                 # the foreground
@@ -757,6 +758,9 @@ def _writer_daemon(stdin_multiprocess_fd, read_multiprocess_fd, write_fd, echo,
                 # Currently ignores other chars.
                 # only read stdin if we're in the foreground
                 if stdin in rlist and not _is_background_tty(stdin):
+                    if backgrounded_record:
+                        events.append("un-backgrounded")
+                        backgrounded_record = False
                     # it's possible to be backgrounded between the above
                     # check and the read, so we ignore SIGTTIN here.
                     with ignore_signal(signal.SIGTTIN):
@@ -772,6 +776,10 @@ def _writer_daemon(stdin_multiprocess_fd, read_multiprocess_fd, write_fd, echo,
                             # was in the bg. Ignore that too.
                             if e.errno != errno.EIO:
                                 raise
+                elif stdin in rlist:
+                    if not backgrounded_record:
+                        events.append("backgrounded")
+                        backgrounded_record = True
 
                 if in_pipe in rlist:
                     try:
