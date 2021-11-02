@@ -136,6 +136,15 @@ class Tfel(CMakePackage):
 
     conflicts('%gcc@:7', when='@4:')
 
+    def patch(self):
+        """Spack prepends it's arch flags using its cc wrapper, so remove our march="""
+        # Replacing it with Wno-attributes for gcc silences hundreds of gcc-11 warnings
+        filter_file('march=native', 'Wno-attributes',
+                    join_path('cmake', 'modules', 'gcc.cmake'))
+        for file_prefix in ['clang', 'intel', 'pgi', 'OptimizeForArchitecture']:
+            filter_file('.*OPTIMISATION_FLAGS_MARCH', '# ',
+                        join_path('cmake', 'modules', file_prefix + '.cmake'))
+
     def cmake_args(self):
 
         args = []
