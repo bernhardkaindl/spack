@@ -780,7 +780,13 @@ def _writer_daemon(stdin_multiprocess_fd, read_multiprocess_fd, write_fd, echo,
                     try:
                         while line_count < 100:
                             # Handle output from the calling process.
-                            line = _retry(in_pipe.readline)()
+                            try:
+                                line = _retry(in_pipe.readline)()
+                            except UnicodeDecodeError:
+                                # Sometimes build processes produce invalid unicode that
+                                # the decoder can't handle. Ignore it and move on.
+                                line = '<line lost due to invalid unicode>\n'
+
                             if not line:
                                 return
                             line_count += 1

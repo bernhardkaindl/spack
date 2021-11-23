@@ -62,6 +62,23 @@ def test_log_python_output_without_echo(capfd, tmpdir):
         assert capfd.readouterr()[0] == ''
 
 
+@pytest.mark.skipif(sys.version_info.major == 2 or sys.version_info.minor == 5,
+                    reason="Cannot force bug in python2.")
+def test_log_python_output_with_bad_unicode(capfd, tmpdir):
+    with tmpdir.as_cwd():
+        with log_output('foo.txt'):
+            print('logging')
+            print('\xc3\x28Bad unicode\x99')
+            sys.stdout.write(b'\xc3\x28')
+
+        # foo.txt has output
+        with open('foo.txt') as f:
+            assert '<line lost due to invalid unicode>' in f.read()
+
+        # nothing on stdout or stderr
+        assert capfd.readouterr()[0] == ''
+
+
 def test_log_python_output_and_echo_output(capfd, tmpdir):
     with tmpdir.as_cwd():
         # echo two lines
