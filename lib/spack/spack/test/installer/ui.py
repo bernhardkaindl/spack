@@ -106,6 +106,9 @@ def add_mock_builds(tui: TerminalUI, count: int) -> List[str]:
     build_ids = [f"pkg{i}" for i in range(count)]
     for i, build_id in enumerate(build_ids):
         on_build_added(tui, build_id, version=f"{i}.0")
+    # The real installer event loop drains UI commands after handling each callback. Tests do
+    # not run that event loop, so emulate the drain to keep setup commands out of assertions.
+    tui.commands.clear()
     return build_ids
 
 
@@ -246,7 +249,7 @@ class TestBasicStateManagement:
 
         # Update progress
         tui.on_progress(build_id, 50, 100)
-        assert tui.builds[build_id].progress_percent == 50
+        assert tui.builds[build_id].progress_percent == "fetching: 50%"
         assert tui.dirty is True
 
         # Same percentage shouldn't mark dirty again
@@ -256,7 +259,7 @@ class TestBasicStateManagement:
 
         # Different percentage should mark dirty
         tui.on_progress(build_id, 75, 100)
-        assert tui.builds[build_id].progress_percent == 75
+        assert tui.builds[build_id].progress_percent == "fetching: 75%"
         assert tui.dirty is True
 
     def test_completion_counter(self):
@@ -815,6 +818,62 @@ class TestLogFollowing:
         # Nothing should be printed
         assert fake_stdout.getvalue() == ""
 
+    def test_parse_fractional_progress_line(self):
+        """Test that build progress lines update the overview build row."""
+        tui, _, fake_stdout = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"...\n[2/10] ...\n")
+        assert fake_stdout.getvalue() == ""
+        assert tui.builds[build_id].progress_percent == "20%"
+
+    def test_parse_building_lines_when_in_overview_mode(self):
+        """Test that build progress lines update the overview build row."""
+        tui, _, fake_stdout = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(
+            build_id,
+            b"...\n[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\nRunning tests...\n",
+        )
+
+        assert fake_stdout.getvalue() == ""
+        assert tui.builds[build_id].progress_percent == "96% foo.cpp"
+
+    def test_render_building_filename_as_progress_message(self):
+        """Test that a Building line's filename appears in the overview row."""
+        tui, _, _ = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+        tui.on_state_changed(build_id, "build")
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\n")
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id]))
+
+        assert " 96% foo.cpp" in rendered
+
+    def test_parse_building_line_split_across_log_chunks(self):
+        """Test that an incomplete log chunk does not truncate a Building filename."""
+        tui, _, _ = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object CMakeFiles/foo")
+        assert tui.builds[build_id].progress_percent is None
+
+        tui.on_log_output(build_id, b".cpp.o\n")
+
+        assert tui.builds[build_id].progress_percent == "96% foo.cpp"
+
+    def test_parse_non_building_cmake_progress_lines(self):
+        """Test that non-Building CMake progress lines are retained as messages."""
+        tui, _, _ = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"[100%] Built target gmock_main\n")
+        assert tui.builds[build_id].progress_percent == "100% Built target gmock_main"
+
+        tui.on_log_output(build_id, b"[  0%] Linking C executable timeit-target\n")
+        assert tui.builds[build_id].progress_percent == "0% Linking C executable timeit-target"
+
     def test_print_logs_discarded_when_not_tracked(self):
         """Test that logs from non-tracked builds are discarded"""
         tui, _, fake_stdout = create_tui(total=2)
@@ -925,11 +984,8 @@ class TestNavigationIntegration:
         tui.next(1)
         assert tui.tracked_build_id == build_ids[1]
         assert "pkg1" in fake_stdout.getvalue()
-        # Echoing stopped for the previous build and started for the new one
-        assert tui.commands[-2:] == [
-            inst.SetEcho(build_ids[0], False),
-            inst.SetEcho(build_ids[1], True),
-        ]
+        # TTY overview mode keeps build logs enabled so progress parsing still works later.
+        assert tui.commands[-1:] == [inst.SetEcho(build_ids[1], True)]
 
         fake_stdout.clear()
 
@@ -1044,8 +1100,20 @@ class TestToggle:
         assert tui.search_mode is False
         assert tui.active_area_rows == 0
         assert tui.dirty is True
-        # Echoing was stopped for the previously tracked build
-        assert tui.commands[-1] == inst.SetEcho(tracked_id, False)
+        # TTY overview mode keeps build logs enabled so progress parsing still works later.
+        assert inst.SetEcho(tracked_id, False) not in tui.commands
+
+    def test_tty_progress_parsing_after_returning_from_logs(self):
+        """Returning from log-following mode keeps TTY logs enabled for overview progress."""
+        tui, _, _ = create_tui(total=1)
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.next()
+        tui.toggle()
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\n")
+
+        assert tui.overview_mode is True
+        assert tui.builds[build_id].progress_percent == "96% foo.cpp"
 
     def test_on_state_changed_finished_triggers_toggle_when_tracking(self):
         """Test that finishing a tracked build triggers toggle back to overview"""
@@ -1340,13 +1408,13 @@ class TestEdgeCases:
 
         # Test rounding
         tui.on_progress(build_id, 1, 3)
-        assert tui.builds[build_id].progress_percent == 33  # int(100/3)
+        assert tui.builds[build_id].progress_percent == "fetching: 33%"
 
         tui.on_progress(build_id, 2, 3)
-        assert tui.builds[build_id].progress_percent == 66  # int(200/3)
+        assert tui.builds[build_id].progress_percent == "fetching: 66%"
 
         tui.on_progress(build_id, 3, 3)
-        assert tui.builds[build_id].progress_percent == 100
+        assert tui.builds[build_id].progress_percent == "fetching: 100%"
 
 
 class TestTerminalUIVerbose:
@@ -1586,12 +1654,50 @@ class TestLineRendering:
     """Test individual build-line components in the rendered output."""
 
     def test_fetch_progress_rendered(self):
-        """A build with fetch progress shows a percentage instead of its state."""
-        tui, _, fake_stdout = create_tui(total=1)
+        """A build with fetch progress shows the state and progress text."""
+        tui, fake_time, fake_stdout = create_tui(total=1)
         [build_id] = add_mock_builds(tui, 1)
         tui.on_progress(build_id, 50, 100)
+        fake_time.append(1.0)
         tui.render()
-        assert "fetching: 50%" in fake_stdout.getvalue()
+        output = fake_stdout.getvalue()
+        assert "starting" in output
+        assert output.index("starting") < output.index("fetching: 50%")
+
+    def test_partial_progress_renders_eta(self):
+        """A partial percent progress string shows a coarse remaining time estimate."""
+        tui, fake_time, _ = create_tui(total=1)
+        [build_id] = add_mock_builds(tui, 1)
+        tui.builds[build_id].progress_percent = "25% foo.cpp"
+        fake_time.append(75.0)
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id], now=fake_time[-1]))
+
+        assert "[4m] 25% foo.cpp" in rendered
+
+    def test_complete_progress_does_not_render_eta(self):
+        """A 100% progress string does not show a remaining time estimate."""
+        tui, fake_time, _ = create_tui(total=1)
+        [build_id] = add_mock_builds(tui, 1)
+        tui.builds[build_id].progress_percent = "100% Built target gmock_main"
+        fake_time.append(75.0)
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id], now=fake_time[-1]))
+
+        assert "100% Built target gmock_main" in rendered
+        assert "100% Built target gmock_main [" not in rendered
+
+    def test_embedded_percent_does_not_render_eta(self):
+        """An embedded percent without whitespace delimiters is not treated as progress."""
+        tui, fake_time, _ = create_tui(total=1)
+        [build_id] = add_mock_builds(tui, 1)
+        tui.builds[build_id].progress_percent = "foo25% bar"
+        fake_time.append(75.0)
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id], now=fake_time[-1]))
+
+        assert "foo25% bar" in rendered
+        assert "foo25% bar [" not in rendered
 
     def test_failed_line_shows_log_path(self):
         """A failed build's line includes the path to its log file."""
