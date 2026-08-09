@@ -223,8 +223,7 @@ class TerminalUI(InstallerUI):
             self.gray, self.bold, self.reset = "\033[0;90m", "\033[1m", "\033[0m"
         else:
             self.red = self.green = self.cyan = self.gray = self.bold = self.reset = ""
-        #: Verbose mode only applies to non-TTY where we want to track a single build log.
-        self.verbose = verbose and not self.is_tty
+        self.verbose = verbose
         self.filter_padding = filter_padding
         #: When True, suppress all terminal output (process is in background).
         self.headless = False
@@ -245,20 +244,18 @@ class TerminalUI(InstallerUI):
         self.headless = headless
 
     def refresh_interval(self) -> Optional[float]:
-        # Only an interactive, foreground terminal animates the spinner; a suppressed (headless)
-        # or non-tty frontend needs no periodic redraw.
-        if self.headless or not self.is_tty:
-            return None
-        return SPINNER_INTERVAL
+        if self.overview_mode and self.is_tty and not self.headless:
+            return SPINNER_INTERVAL
+        return None
 
     def on_build_added(self, info: BuildInfo) -> None:
         """Add a new build to the display and mark the display as dirty."""
         info.start_time = int(self.get_time())
         self.builds[info.id] = info
         self.dirty = True
-        # Track the new build's logs when we're not already following another build. This applies
-        # only in non-TTY verbose mode.
+        # Track the new build's logs when we're not already following another build.
         if self.verbose and not self.tracked_build_id:
+            self.overview_mode = False
             self.tracked_build_id = info.id
             self.commands.append(SetEcho(info.id, True))
 
