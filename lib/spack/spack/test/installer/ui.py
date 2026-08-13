@@ -249,7 +249,7 @@ class TestBasicStateManagement:
 
         # Update progress
         tui.on_progress(build_id, 50, 100)
-        assert tui.builds[build_id].progress_percent == 50
+        assert tui.builds[build_id].progress_percent == "fetching: 50%"
         assert tui.dirty is True
 
         # Same percentage shouldn't mark dirty again
@@ -259,7 +259,7 @@ class TestBasicStateManagement:
 
         # Different percentage should mark dirty
         tui.on_progress(build_id, 75, 100)
-        assert tui.builds[build_id].progress_percent == 75
+        assert tui.builds[build_id].progress_percent == "fetching: 75%"
         assert tui.dirty is True
 
     def test_completion_counter(self):
@@ -1415,13 +1415,13 @@ class TestEdgeCases:
 
         # Test rounding
         tui.on_progress(build_id, 1, 3)
-        assert tui.builds[build_id].progress_percent == 33  # int(100/3)
+        assert tui.builds[build_id].progress_percent == "fetching: 33%"
 
         tui.on_progress(build_id, 2, 3)
-        assert tui.builds[build_id].progress_percent == 66  # int(200/3)
+        assert tui.builds[build_id].progress_percent == "fetching: 66%"
 
         tui.on_progress(build_id, 3, 3)
-        assert tui.builds[build_id].progress_percent == 100
+        assert tui.builds[build_id].progress_percent == "fetching: 100%"
 
 
 class TestTerminalUIVerbose:
