@@ -12,7 +12,8 @@ import io
 import os
 import sys
 import time
-from typing import Callable, Dict, Generator, List, NamedTuple, Optional, Union, cast
+from collections import deque
+from typing import Callable, Deque, Dict, Generator, List, NamedTuple, Optional, Union, cast
 
 import spack.config
 import spack.util.tty.color
@@ -50,6 +51,9 @@ SPINNER_CHARS = "|/-\\"
 
 #: How long to display finished packages before graying them out
 CLEANUP_TIMEOUT = 2.0
+
+#: How many recent log chunks to keep per build for instant context when switching streams.
+LOG_HISTORY_SIZE = 15
 
 
 class BuildInfo:
@@ -202,6 +206,9 @@ class TerminalUI(InstallerUI):
         self.next_update = 0.0
         self.overview_mode = True  # Whether to draw the package overview
         self.tracked_build_id = ""  # identifier of the package whose logs we follow
+        self.log_streaming = verbose
+        self.streamed_log_rows = 0
+        self.log_history: Dict[str, Deque[bytes]] = {}
         self.search_term = ""
         self.search_mode = False
         self.log_ends_with_newline = True
@@ -223,7 +230,6 @@ class TerminalUI(InstallerUI):
             self.gray, self.bold, self.reset = "\033[0;90m", "\033[1m", "\033[0m"
         else:
             self.red = self.green = self.cyan = self.gray = self.bold = self.reset = ""
-        self.verbose = verbose
         self.filter_padding = filter_padding
         #: When True, suppress all terminal output (process is in background).
         self.headless = False
@@ -252,10 +258,10 @@ class TerminalUI(InstallerUI):
         """Add a new build to the display and mark the display as dirty."""
         info.start_time = int(self.get_time())
         self.builds[info.id] = info
+        self.log_history[info.id] = deque(maxlen=LOG_HISTORY_SIZE)
         self.dirty = True
         # Track the new build's logs when we're not already following another build.
-        if self.verbose and not self.tracked_build_id:
-            self.overview_mode = False
+        if self.log_streaming and not self.tracked_build_id:
             self.tracked_build_id = info.id
             self.commands.append(SetEcho(info.id, True))
         # When on a tty, receive the logs so on_log_output() can parse the progress
@@ -266,13 +272,40 @@ class TerminalUI(InstallerUI):
     def on_build_removed(self, build_id: str) -> None:
         """Remove a build from the display (e.g. after a binary cache miss before retry)."""
         self.builds.pop(build_id, None)
+        self.log_history.pop(build_id, None)
         if self.tracked_build_id == build_id:
             self.tracked_build_id = ""
             self.overview_mode = True
         self.dirty = True
 
     def toggle(self) -> None:
-        """Toggle between overview mode and following a specific build."""
+        """Toggle streaming the tracked build's logs above the overview."""
+        if not self.log_streaming:
+            if not self.tracked_build_id:
+                self.next()
+            if not self.tracked_build_id:
+                return
+            self.log_streaming = True
+            self.dirty = True
+            if not self.is_tty:
+                self.commands.append(SetEcho(self.tracked_build_id, True))
+            else:
+                self._redraw_overview_with_log_history(self.tracked_build_id)
+        else:
+            if not self.log_ends_with_newline:
+                self.stdout.buffer.write(b"\n")
+                self.log_ends_with_newline = True
+            self.search_term = ""
+            self.search_mode = False
+            self.log_streaming = False
+            self.dirty = True
+            if self.tracked_build_id and not self.is_tty:
+                self.commands.append(SetEcho(self.tracked_build_id, False))
+            elif self.is_tty:
+                self._redraw_overview_with_log_history("")
+
+    def _toggle_overview(self) -> None:
+        """Legacy helper for returning from full-screen log display."""
         if self.overview_mode:
             self.next()
         else:
@@ -316,8 +349,10 @@ class TerminalUI(InstallerUI):
                 self.search_input(char)
             elif overview and char == "/":
                 self.enter_search()
-            elif char == "v" or char in ("q", "\x1b") and not overview:
+            elif char == "v":
                 self.toggle()
+            elif char in ("q", "\x1b") and not overview:
+                self._toggle_overview()
             elif char == "n":
                 self.next(1)
             elif char == "p" or char == "N":
@@ -359,10 +394,8 @@ class TerminalUI(InstallerUI):
 
         new_build = self.builds[new_build_id]
 
-        self.overview_mode = False
-
         # Stop following the previous and start following the new build.
-        if self.tracked_build_id and not self.is_tty:
+        if self.tracked_build_id and self.log_streaming and not self.is_tty:
             self.commands.append(SetEcho(self.tracked_build_id, False))
 
         self.tracked_build_id = new_build_id
@@ -383,12 +416,11 @@ class TerminalUI(InstallerUI):
                     self.stdout.write("Full log: ")
                 self.stdout.write(f"{new_build.log_path}\n")
             self.stdout.flush()
-        else:
-            # Tell the user we're following new logs, and instruct the child to start sending.
-            self.stdout.write(f"{prefix}==> Following logs of {new_build.name}{version_str}\n")
-            self.log_ends_with_newline = True
-            self.stdout.flush()
+        elif self.log_streaming:
+            # Instruct the child to start sending logs for the newly tracked build.
             self.commands.append(SetEcho(new_build_id, True))
+            if self.is_tty:
+                self._redraw_overview_with_log_history(new_build_id)
 
     def on_blocked_changed(self, blocked: bool) -> None:
         """Set whether all pending builds are blocked by another Spack process."""
@@ -434,12 +466,13 @@ class TerminalUI(InstallerUI):
             build_info.duration = now - build_info.start_time
             build_info.finished_time = now + CLEANUP_TIMEOUT
 
-            # Stop tracking the finished build's logs.
+            # Keep streaming enabled across successful builds and follow the next one.
             if build_id == self.tracked_build_id:
-                if not self.overview_mode:
-                    self.toggle()
-                if self.verbose:
-                    self.tracked_build_id = ""
+                self.tracked_build_id = ""
+                if state == "finished" and self.log_streaming:
+                    self.next()
+                else:
+                    self.log_streaming = False
 
         self.dirty = True
         self._update_terminal_title()
@@ -513,6 +546,11 @@ class TerminalUI(InstallerUI):
         if not self.dirty and not finalize:
             return
 
+        self._render_overview(now=now, has_unfinished=has_unfinished, finalize=finalize)
+
+    def _render_overview(
+        self, *, now: float, has_unfinished: bool, finalize: bool = False
+    ) -> None:
         # Build the overview output in a buffer and print all at once to avoid flickering.
         buffer = io.StringIO()
 
@@ -533,7 +571,7 @@ class TerminalUI(InstallerUI):
         # First flush the finished builds. These are "persisted" in terminal history.
         if self.finished_builds:
             for build in self.finished_builds:
-                self._render_build(build, buffer, now=now)
+                self._render_build(build, buffer, max_width, now=now)
                 self._println(buffer, force_newline=True)  # should scroll the terminal
             self.finished_builds.clear()
             # Finished builds can span multiple lines, overlapping our "active area", invalidating
@@ -548,13 +586,16 @@ class TerminalUI(InstallerUI):
                 jobs_str = f"{self.actual_jobs}=>{self.target_jobs}"
             else:
                 jobs_str = str(self.target_jobs)
-            bold, reset, cyan = self.bold, self.reset, self.cyan
+            bold, reset, cyan, gray = self.bold, self.reset, self.cyan, self.gray
+            tracked_build = self.builds.get(self.tracked_build_id)
+            tracked_str = f"  {gray}({tracked_build.name}){reset}" if tracked_build else ""
             long_header = (
                 f"{bold}Progress:{reset} {self.completed}/{self.total}"
                 f"  {cyan}+{reset}/{cyan}-{reset}: "
                 f"{jobs_str} jobs"
                 f"  {cyan}/{reset}: filter  {cyan}v{reset}: logs"
                 f"  {cyan}n{reset}/{cyan}p{reset}: next/prev"
+                f"{tracked_str}"
             )
             if spack.util.tty.color.clen(long_header) < max_width:
                 self._println(buffer, long_header)
@@ -615,6 +656,10 @@ class TerminalUI(InstallerUI):
     def on_log_output(self, build_id: str, data: bytes) -> None:
         if self.headless:
             return
+        self.log_history.setdefault(build_id, deque(maxlen=LOG_HISTORY_SIZE)).append(data)
+        if self.overview_mode and self.is_tty:
+            if not (self.log_streaming and build_id == self.tracked_build_id):
+                return
         # Discard logs we are not following. Generally this should not happen as we tell the child
         # to only send logs when we are following it. It could maybe happen while transitioning
         # between builds.
@@ -622,9 +667,49 @@ class TerminalUI(InstallerUI):
             return
         if self.filter_padding:
             data = padding_filter_bytes(data)
+        if self.overview_mode and self.is_tty:
+            now = self.get_time()
+            if self.active_area_rows > 0:
+                self.stdout.write(f"\033[{self.active_area_rows}A\r\033[0J")
         self.stdout.buffer.write(data)
+        if self.overview_mode and self.is_tty:
+            if not data.endswith(b"\n"):
+                self.stdout.buffer.write(b"\n")
+                self.log_ends_with_newline = True
+                self.streamed_log_rows += data.count(b"\n") + 1
+            else:
+                self.streamed_log_rows += data.count(b"\n")
+            self.dirty = True
+            self.active_area_rows = 0
+            has_unfinished = any(pkg.finished_time is None for pkg in self.builds.values())
+            self._render_overview(now=now, has_unfinished=has_unfinished)
+        else:
+            self.log_ends_with_newline = data.endswith(b"\n")
         self.stdout.flush()
-        self.log_ends_with_newline = data.endswith(b"\n")
+
+    def _redraw_overview_with_log_history(self, build_id: str) -> None:
+        if self.headless or not self.is_tty:
+            return
+        log_rows_to_clear = self.streamed_log_rows
+        rows_to_clear = log_rows_to_clear + self.active_area_rows
+        if rows_to_clear > 0:
+            self.stdout.write(f"\033[{rows_to_clear}A\r\033[0J")
+            if not build_id and log_rows_to_clear > 0:
+                self.stdout.write(f"\033[{log_rows_to_clear}B\r")
+        self.streamed_log_rows = 0
+        for chunk in self.log_history.get(build_id, ()):
+            self.stdout.buffer.write(chunk)
+            self.streamed_log_rows += chunk.count(b"\n")
+        if build_id and self.log_history.get(build_id) and not self.log_history[build_id][-1].endswith(b"\n"):
+            self.stdout.buffer.write(b"\n")
+            self.log_ends_with_newline = True
+            self.streamed_log_rows += 1
+        now = self.get_time()
+        self.dirty = True
+        self.active_area_rows = 0
+        has_unfinished = any(pkg.finished_time is None for pkg in self.builds.values())
+        self._render_overview(now=now, has_unfinished=has_unfinished)
+        self.stdout.flush()
 
     def _render_build(
         self, build_info: BuildInfo, buffer: io.StringIO, max_width: int = 0, now: float = 0.0
