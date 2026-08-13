@@ -106,6 +106,9 @@ def add_mock_builds(tui: TerminalUI, count: int) -> List[str]:
     build_ids = [f"pkg{i}" for i in range(count)]
     for i, build_id in enumerate(build_ids):
         on_build_added(tui, build_id, version=f"{i}.0")
+    # The real installer event loop drains UI commands after handling each callback. Tests do
+    # not run that event loop, so emulate the drain to keep setup commands out of assertions.
+    tui.commands.clear()
     return build_ids
 
 
@@ -780,6 +783,26 @@ class TestLogFollowing:
         # Check that logs were echoed to stdout
         assert fake_stdout._buffer.getvalue() == log_data
 
+    def test_verbose_tty_streams_logs_without_overview_redraws(self):
+        """Verbose TTY mode streams logs instead of interleaving overview redraws."""
+        tui, time_values, fake_stdout = create_tui(total=1, verbose=True)
+        on_build_added(tui, "pkg0")
+        tui.on_jobs_changed(16, 16)
+        fake_stdout.clear()
+
+        assert tui.overview_mode is False
+        assert tui.tracked_build_id == "pkg0"
+
+        tui.render()
+        tui.on_log_output("pkg0", b"-- Configuring done\n")
+        time_values.append(1.0)
+        tui.render()
+        tui.on_log_output("pkg0", b"-- Generating done\n")
+
+        output = fake_stdout.getvalue()
+        assert "Progress:" not in output
+        assert "-- Configuring done\n-- Generating done\n" == output
+
     def test_print_logs_discarded_when_in_overview_mode(self):
         """Test that logs are discarded when in overview mode"""
         tui, _, fake_stdout = create_tui()
@@ -905,11 +928,8 @@ class TestNavigationIntegration:
         tui.next(1)
         assert tui.tracked_build_id == build_ids[1]
         assert "pkg1" in fake_stdout.getvalue()
-        # Echoing stopped for the previous build and started for the new one
-        assert tui.commands[-2:] == [
-            inst.SetEcho(build_ids[0], False),
-            inst.SetEcho(build_ids[1], True),
-        ]
+        # TTY overview mode keeps build logs enabled so progress parsing still works later.
+        assert tui.commands[-1:] == [inst.SetEcho(build_ids[1], True)]
 
         fake_stdout.clear()
 
@@ -1024,8 +1044,19 @@ class TestToggle:
         assert tui.search_mode is False
         assert tui.active_area_rows == 0
         assert tui.dirty is True
-        # Echoing was stopped for the previously tracked build
-        assert tui.commands[-1] == inst.SetEcho(tracked_id, False)
+        # TTY overview mode keeps build logs enabled so progress parsing still works later.
+        assert inst.SetEcho(tracked_id, False) not in tui.commands
+
+    def test_tty_progress_parsing_after_returning_from_logs(self):
+        """Returning from log-following mode keeps TTY logs enabled for overview progress."""
+        tui, _, _ = create_tui(total=1)
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.next()
+        tui.toggle()
+
+        assert tui.overview_mode is True
+        assert inst.SetEcho(build_id, False) not in tui.commands
 
     def test_on_state_changed_finished_triggers_toggle_when_tracking(self):
         """Test that finishing a tracked build triggers toggle back to overview"""
@@ -1388,13 +1419,14 @@ class TestTerminalUIVerbose:
         stdout.flush()
         assert stdout.buffer.getvalue() == b""
 
-    def test_verbose_tty_no_effect(self):
-        """In TTY mode, on_build_added() does not set tracked_build_id automatically."""
+    def test_verbose_tty_tracks_first_build(self):
+        """In TTY mode, verbose starts following the first build automatically."""
         tui, _, _ = create_tui(is_tty=True, verbose=True, total=4)
 
         on_build_added(tui, "trivial-install-test-package")
-        assert tui.tracked_build_id == ""
-        assert tui.commands == []
+        assert tui.overview_mode is False
+        assert tui.tracked_build_id == "trivial-install-test-package"
+        assert tui.commands == [inst.SetEcho("trivial-install-test-package", True)]
 
 
 class TestTerminalUIColor:
@@ -1530,6 +1562,9 @@ class TestHeadlessMode:
         tui, _, _ = create_tui(is_tty=True)
         assert tui.refresh_interval() == inst.SPINNER_INTERVAL
         tui.headless = True
+        assert tui.refresh_interval() is None
+        tui.headless = False
+        tui.overview_mode = False
         assert tui.refresh_interval() is None
         non_tty, _, _ = create_tui(is_tty=False)
         assert non_tty.refresh_interval() is None
