@@ -99,7 +99,7 @@ class BuildInfo:
         self.finished_time: Optional[float] = None
         self.start_time: float = 0.0
         self.duration: Optional[float] = None
-        self.progress_percent: Optional[int] = None
+        self.progress_percent: Optional[str] = None
         self.log_path = log_path
         self.log_summary: Optional[str] = None
 
@@ -504,12 +504,22 @@ class TerminalUI(InstallerUI):
         self.total += count
 
     def on_progress(self, build_id: str, current: int, total: int) -> None:
-        """Update the progress of a package and mark the display as dirty."""
+        """Update the binary cache fetching progress of a package."""
         percent = int((current / total) * 100)
         build_info = self.builds[build_id]
-        if build_info.progress_percent != percent:
-            build_info.progress_percent = percent
+        self._set_progress(build_info, f"fetching: {percent}%")
+
+    def _set_progress(self, build_info: BuildInfo, progress: Optional[str]) -> None:
+        if build_info.progress_percent != progress:
+            build_info.progress_percent = progress
             self.dirty = True
+
+    def _progress_prefix(self, build_info: BuildInfo) -> str:
+        if build_info.progress_percent:
+            progress = build_info.progress_percent.split(maxsplit=1)[0]
+            if progress.endswith("%"):
+                return progress
+        return "0%"
 
     def render(self, finalize: bool = False) -> None:
         """Redraw the interactive display."""
@@ -766,10 +776,7 @@ class TerminalUI(InstallerUI):
         yield reset
 
         # progress or state
-        if build_info.progress_percent is not None:
-            yield " fetching"
-            yield f": {build_info.progress_percent}%"
-        elif build_info.state == "finished":
+        if build_info.state == "finished":
             prefix = build_info.prefix
             yield f" {padding_filter(prefix) if self.filter_padding else prefix}"
         elif build_info.state == "failed":
@@ -789,3 +796,6 @@ class TerminalUI(InstallerUI):
             yield gray
             yield f" ({pretty_duration(elapsed)})"
             yield reset
+
+        if build_info.state not in ("finished", "failed") and build_info.progress_percent:
+            yield f" {build_info.progress_percent}"
