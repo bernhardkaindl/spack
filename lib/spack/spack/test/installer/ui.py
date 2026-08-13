@@ -857,6 +857,62 @@ class TestLogFollowing:
         # Nothing should be printed
         assert fake_stdout.getvalue() == ""
 
+    def test_parse_fractional_progress_line(self):
+        """Test that build progress lines update the overview build row."""
+        tui, _, fake_stdout = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"...\n[2/10] ...\n")
+        assert fake_stdout.getvalue() == ""
+        assert tui.builds[build_id].progress_percent == "20%"
+
+    def test_parse_building_lines_when_in_overview_mode(self):
+        """Test that build progress lines update the overview build row."""
+        tui, _, fake_stdout = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(
+            build_id,
+            b"...\n[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\nRunning tests...\n",
+        )
+
+        assert fake_stdout.getvalue() == ""
+        assert tui.builds[build_id].progress_percent == "96% foo.cpp"
+
+    def test_render_building_filename_as_progress_message(self):
+        """Test that a Building line's filename appears in the overview row."""
+        tui, _, _ = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+        tui.on_state_changed(build_id, "build")
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\n")
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id]))
+
+        assert " 96% foo.cpp" in rendered
+
+    def test_parse_building_line_split_across_log_chunks(self):
+        """Test that an incomplete log chunk does not truncate a Building filename."""
+        tui, _, _ = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object CMakeFiles/foo")
+        assert tui.builds[build_id].progress_percent is None
+
+        tui.on_log_output(build_id, b".cpp.o\n")
+
+        assert tui.builds[build_id].progress_percent == "96% foo.cpp"
+
+    def test_parse_non_building_cmake_progress_lines(self):
+        """Test that non-Building CMake progress lines are retained as messages."""
+        tui, _, _ = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"[100%] Built target gmock_main\n")
+        assert tui.builds[build_id].progress_percent == "100% Built target gmock_main"
+
+        tui.on_log_output(build_id, b"[  0%] Linking C executable timeit-target\n")
+        assert tui.builds[build_id].progress_percent == "0% Linking C executable timeit-target"
+
     def test_print_logs_discarded_when_not_tracked(self):
         """Test that logs from non-tracked builds are discarded"""
         tui, _, fake_stdout = create_tui(total=2)
@@ -1091,9 +1147,11 @@ class TestToggle:
 
         tui.toggle()
         tui.toggle()
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\n")
 
         assert tui.overview_mode is True
-        assert inst.SetEcho(build_id, False) not in tui.commands
+        assert tui.log_streaming is False
+        assert tui.builds[build_id].progress_percent == "96% foo.cpp"
 
     def test_on_state_changed_finished_continues_streaming_next_build(self):
         """Finishing a streamed build follows the next unfinished build."""

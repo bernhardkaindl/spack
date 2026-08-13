@@ -10,6 +10,7 @@ for the overall design."""
 
 import io
 import os
+import re
 import sys
 import time
 from collections import deque
@@ -43,6 +44,10 @@ class ChangeJobs(NamedTuple):
 #: A command produced by the UI and executed by the event loop.
 UiCommand = Union[SetEcho, ChangeJobs]
 
+ANSI_ESCAPE = re.compile(rb"\x1b\[[0-9;]*m")
+PROGRESS_LINE = re.compile(r"^\s*\[\s*([\d/%]+)\]\s*(.*)$")
+FRACTIONAL_PROGRESS_LINE = re.compile(r"^\s*\[\s*(\d+)/(\d+)\]\s*(.*)$")
+
 #: How often to update a spinner in seconds
 SPINNER_INTERVAL = 0.1
 
@@ -73,6 +78,7 @@ class BuildInfo:
         "start_time",
         "duration",
         "progress_percent",
+        "progress_buffer",
         "log_path",
         "log_summary",
     )
@@ -100,6 +106,7 @@ class BuildInfo:
         self.start_time: float = 0.0
         self.duration: Optional[float] = None
         self.progress_percent: Optional[str] = None
+        self.progress_buffer: bytes = b""
         self.log_path = log_path
         self.log_summary: Optional[str] = None
 
@@ -663,11 +670,60 @@ class TerminalUI(InstallerUI):
         else:
             buffer.write("\033[0m\033[K\033[1B\r")  # reset, clear to EOL, move to next line
 
+    def _parse_builder_progress(self, build_info: BuildInfo, data: bytes) -> None:
+        """Parse the build log for progress lines and update the build info."""
+        # Pipe reads can split a CMake line at any byte. Keep the incomplete tail until
+        # the next callback so only complete lines update the displayed progress.
+        lines = (build_info.progress_buffer + data).split(b"\n")
+        build_info.progress_buffer = lines.pop()
+        for line in lines:
+            clean_line = ANSI_ESCAPE.sub(b"", line).decode(errors="replace").strip()
+
+            if clean_line.startswith("-- ") or clean_line.startswith("CMake "):
+                message = clean_line[3:] if clean_line.startswith("-- ") else clean_line
+                self._set_progress(build_info, f"{self._progress_prefix(build_info)} {message}")
+                continue
+
+            progress_line = PROGRESS_LINE.match(clean_line)
+            if not progress_line:
+                continue
+
+            progress = None
+            if progress_line.group(1).endswith("%"):
+                progress = progress_line.group(1).strip()
+            else:
+                num_match = FRACTIONAL_PROGRESS_LINE.match(clean_line)
+                if num_match:
+                    total = int(num_match.group(2))
+                    if total > 0:
+                        progress = f"{int((int(num_match.group(1)) / total) * 100)}%"
+
+            if progress is None:
+                continue
+
+            build_message = progress_line.group(2).strip()
+            if build_message:
+                if build_message.startswith("Linking "):
+                    progress = f"{progress} {build_message}"
+                elif build_message.startswith("Built target "):
+                    progress = f"{progress} {build_message}"
+                elif build_message.startswith("Building "):
+                    _, sep, msg = build_message.partition(" object ")
+                    if sep:
+                        progress = f"{progress} {msg.rpartition('CMakeFiles/')[2].rstrip('.o')}"
+
+            self._set_progress(build_info, progress)
+
     def on_log_output(self, build_id: str, data: bytes) -> None:
         if self.headless:
             return
         self.log_history.setdefault(build_id, deque(maxlen=LOG_HISTORY_SIZE)).append(data)
         if self.overview_mode and self.is_tty:
+            if self.filter_padding:
+                data = padding_filter_bytes(data)
+            build_info = self.builds.get(build_id)
+            if build_info is not None:
+                self._parse_builder_progress(build_info, data)
             if not (self.log_streaming and build_id == self.tracked_build_id):
                 return
         # Discard logs we are not following. Generally this should not happen as we tell the child
