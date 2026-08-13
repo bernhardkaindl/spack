@@ -47,6 +47,7 @@ UiCommand = Union[SetEcho, ChangeJobs]
 ANSI_ESCAPE = re.compile(rb"\x1b\[[0-9;]*m")
 PROGRESS_LINE = re.compile(r"^\s*\[\s*([\d/%]+)\]\s*(.*)$")
 FRACTIONAL_PROGRESS_LINE = re.compile(r"^\s*\[\s*(\d+)/(\d+)\]\s*(.*)$")
+PERCENT_PROGRESS = re.compile(r"(?<!\S)(\d+)%(?!\S)")
 
 #: How often to update a spinner in seconds
 SPINNER_INTERVAL = 0.1
@@ -59,6 +60,17 @@ CLEANUP_TIMEOUT = 2.0
 
 #: How many recent log chunks to keep per build for instant context when switching streams.
 LOG_HISTORY_SIZE = 15
+
+def _format_eta_duration(seconds: float) -> str:
+    seconds = max(1, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        minutes = minutes + (1 if seconds >= 30 else 0)
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
 
 
 class BuildInfo:
@@ -529,6 +541,18 @@ class TerminalUI(InstallerUI):
                 return progress
         return "0%"
 
+    def _progress_with_eta(self, progress: str, elapsed: float) -> str:
+        percent_match = PERCENT_PROGRESS.search(progress)
+        if not percent_match:
+            return progress
+        percent = int(percent_match.group(1))
+        if percent < 5 or percent >= 100 or elapsed <= 0:
+            return progress
+
+        remaining = elapsed * (100 - percent) / percent
+        f = f"[{_format_eta_duration(remaining)}] {progress} "
+        return f
+
     def render(self, finalize: bool = False) -> None:
         """Redraw the interactive display."""
         if finalize:
@@ -690,9 +714,9 @@ class TerminalUI(InstallerUI):
 
             progress = None
             if progress_line.group(1).endswith("%"):
-                progress = progress_line.group(1).strip()
+                progress = progress_line.group(1).strip()  # "[10%] ..."
             else:
-                num_match = FRACTIONAL_PROGRESS_LINE.match(clean_line)
+                num_match = FRACTIONAL_PROGRESS_LINE.match(clean_line)  # "[1/10] ..."
                 if num_match:
                     total = int(num_match.group(2))
                     if total > 0:
@@ -704,12 +728,16 @@ class TerminalUI(InstallerUI):
             build_message = progress_line.group(2).strip()
             if build_message:
                 if build_message.startswith("Linking "):
+                    # e.g. "Linking CXX executable src/foo"
                     progress = f"{progress} {build_message}"
                 elif build_message.startswith("Built target "):
+                    # e.g. "Built target ..."
                     progress = f"{progress} {build_message}"
                 elif build_message.startswith("Building "):
+                    # e.g. "Building CXX object src/CMakeFiles/foo.dir/foo.cpp.o"
                     _, sep, msg = build_message.partition(" object ")
                     if sep:
+                        # e.g. "Building CXX object src/CMakeFiles/foo.dir/foo.cpp.o"
                         progress = f"{progress} {msg.rpartition('CMakeFiles/')[2].rstrip('.o')}"
 
             self._set_progress(build_info, progress)
@@ -856,4 +884,4 @@ class TerminalUI(InstallerUI):
             yield reset
 
         if build_info.state not in ("finished", "failed") and build_info.progress_percent:
-            yield f" {build_info.progress_percent}"
+            yield f" {self._progress_with_eta(build_info.progress_percent, elapsed)}"

@@ -1723,12 +1723,50 @@ class TestLineRendering:
     """Test individual build-line components in the rendered output."""
 
     def test_fetch_progress_rendered(self):
-        """A build with fetch progress shows a percentage instead of its state."""
-        tui, _, fake_stdout = create_tui(total=1)
+        """A build with fetch progress shows the state and progress text."""
+        tui, fake_time, fake_stdout = create_tui(total=1)
         [build_id] = add_mock_builds(tui, 1)
         tui.on_progress(build_id, 50, 100)
+        fake_time.append(1.0)
         tui.render()
-        assert "fetching: 50%" in fake_stdout.getvalue()
+        output = fake_stdout.getvalue()
+        assert "starting" in output
+        assert output.index("starting") < output.index("fetching: 50%")
+
+    def test_partial_progress_renders_eta(self):
+        """A partial percent progress string shows a coarse remaining time estimate."""
+        tui, fake_time, _ = create_tui(total=1)
+        [build_id] = add_mock_builds(tui, 1)
+        tui.builds[build_id].progress_percent = "25% foo.cpp"
+        fake_time.append(75.0)
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id], now=fake_time[-1]))
+
+        assert "[4m] 25% foo.cpp" in rendered
+
+    def test_complete_progress_does_not_render_eta(self):
+        """A 100% progress string does not show a remaining time estimate."""
+        tui, fake_time, _ = create_tui(total=1)
+        [build_id] = add_mock_builds(tui, 1)
+        tui.builds[build_id].progress_percent = "100% Built target gmock_main"
+        fake_time.append(75.0)
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id], now=fake_time[-1]))
+
+        assert "100% Built target gmock_main" in rendered
+        assert "100% Built target gmock_main [" not in rendered
+
+    def test_embedded_percent_does_not_render_eta(self):
+        """An embedded percent without whitespace delimiters is not treated as progress."""
+        tui, fake_time, _ = create_tui(total=1)
+        [build_id] = add_mock_builds(tui, 1)
+        tui.builds[build_id].progress_percent = "foo25% bar"
+        fake_time.append(75.0)
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id], now=fake_time[-1]))
+
+        assert "foo25% bar" in rendered
+        assert "foo25% bar [" not in rendered
 
     def test_failed_line_shows_log_path(self):
         """A failed build's line includes the path to its log file."""
