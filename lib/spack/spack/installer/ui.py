@@ -10,6 +10,7 @@ for the overall design."""
 
 import io
 import os
+import re
 import sys
 import time
 from typing import Callable, Dict, Generator, List, NamedTuple, Optional, Union, cast
@@ -42,6 +43,11 @@ class ChangeJobs(NamedTuple):
 #: A command produced by the UI and executed by the event loop.
 UiCommand = Union[SetEcho, ChangeJobs]
 
+ANSI_ESCAPE = re.compile(rb"\x1b\[[0-9;]*m")
+PROGRESS_LINE = re.compile(r"^\s*\[\s*([\d/%]+)\]\s*(.*)$")
+FRACTIONAL_PROGRESS_LINE = re.compile(r"^\s*\[\s*(\d+)/(\d+)\]\s*(.*)$")
+PERCENT_PROGRESS = re.compile(r"(?<!\S)(\d+)%(?!\S)")
+
 #: How often to update a spinner in seconds
 SPINNER_INTERVAL = 0.1
 
@@ -50,6 +56,17 @@ SPINNER_CHARS = "|/-\\"
 
 #: How long to display finished packages before graying them out
 CLEANUP_TIMEOUT = 2.0
+
+def _format_eta_duration(seconds: float) -> str:
+    seconds = max(1, int(round(seconds)))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        minutes = minutes + (1 if seconds >= 30 else 0)
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
 
 
 class BuildInfo:
@@ -69,6 +86,7 @@ class BuildInfo:
         "start_time",
         "duration",
         "progress_percent",
+        "progress_buffer",
         "log_path",
         "log_summary",
     )
@@ -95,7 +113,8 @@ class BuildInfo:
         self.finished_time: Optional[float] = None
         self.start_time: float = 0.0
         self.duration: Optional[float] = None
-        self.progress_percent: Optional[int] = None
+        self.progress_percent: Optional[str] = None
+        self.progress_buffer: bytes = b""
         self.log_path = log_path
         self.log_summary: Optional[str] = None
 
@@ -223,8 +242,7 @@ class TerminalUI(InstallerUI):
             self.gray, self.bold, self.reset = "\033[0;90m", "\033[1m", "\033[0m"
         else:
             self.red = self.green = self.cyan = self.gray = self.bold = self.reset = ""
-        #: Verbose mode only applies to non-TTY where we want to track a single build log.
-        self.verbose = verbose and not self.is_tty
+        self.verbose = verbose
         self.filter_padding = filter_padding
         #: When True, suppress all terminal output (process is in background).
         self.headless = False
@@ -245,21 +263,23 @@ class TerminalUI(InstallerUI):
         self.headless = headless
 
     def refresh_interval(self) -> Optional[float]:
-        # Only an interactive, foreground terminal animates the spinner; a suppressed (headless)
-        # or non-tty frontend needs no periodic redraw.
-        if self.headless or not self.is_tty:
-            return None
-        return SPINNER_INTERVAL
+        if self.overview_mode and self.is_tty and not self.headless:
+            return SPINNER_INTERVAL
+        return None
 
     def on_build_added(self, info: BuildInfo) -> None:
         """Add a new build to the display and mark the display as dirty."""
         info.start_time = int(self.get_time())
         self.builds[info.id] = info
         self.dirty = True
-        # Track the new build's logs when we're not already following another build. This applies
-        # only in non-TTY verbose mode.
+        # Track the new build's logs when we're not already following another build.
         if self.verbose and not self.tracked_build_id:
+            self.overview_mode = False
             self.tracked_build_id = info.id
+            self.commands.append(SetEcho(info.id, True))
+        # When on a tty, receive the logs so on_log_output() can parse the progress
+        # lines and when switched to overview mode, display them in the overview.
+        elif self.is_tty:
             self.commands.append(SetEcho(info.id, True))
 
     def on_build_removed(self, build_id: str) -> None:
@@ -283,7 +303,8 @@ class TerminalUI(InstallerUI):
             self.search_mode = False
             self.overview_mode = True
             self.dirty = True
-            self.commands.append(SetEcho(self.tracked_build_id, False))
+            if not self.is_tty:
+                self.commands.append(SetEcho(self.tracked_build_id, False))
             self.tracked_build_id = ""
 
     def search_input(self, char: str) -> None:
@@ -360,7 +381,7 @@ class TerminalUI(InstallerUI):
         self.overview_mode = False
 
         # Stop following the previous and start following the new build.
-        if self.tracked_build_id:
+        if self.tracked_build_id and not self.is_tty:
             self.commands.append(SetEcho(self.tracked_build_id, False))
 
         self.tracked_build_id = new_build_id
@@ -470,12 +491,34 @@ class TerminalUI(InstallerUI):
         self.total += count
 
     def on_progress(self, build_id: str, current: int, total: int) -> None:
-        """Update the progress of a package and mark the display as dirty."""
+        """Update the binary cache fetching progress of a package."""
         percent = int((current / total) * 100)
         build_info = self.builds[build_id]
-        if build_info.progress_percent != percent:
-            build_info.progress_percent = percent
+        self._set_progress(build_info, f"fetching: {percent}%")
+
+    def _set_progress(self, build_info: BuildInfo, progress: Optional[str]) -> None:
+        if build_info.progress_percent != progress:
+            build_info.progress_percent = progress
             self.dirty = True
+
+    def _progress_prefix(self, build_info: BuildInfo) -> str:
+        if build_info.progress_percent:
+            progress = build_info.progress_percent.split(maxsplit=1)[0]
+            if progress.endswith("%"):
+                return progress
+        return "0%"
+
+    def _progress_with_eta(self, progress: str, elapsed: float) -> str:
+        percent_match = PERCENT_PROGRESS.search(progress)
+        if not percent_match:
+            return progress
+        percent = int(percent_match.group(1))
+        if percent < 5 or percent >= 100 or elapsed <= 0:
+            return progress
+
+        remaining = elapsed * (100 - percent) / percent
+        f = f"[{_format_eta_duration(remaining)}] {progress} "
+        return f
 
     def render(self, finalize: bool = False) -> None:
         """Redraw the interactive display."""
@@ -610,8 +653,63 @@ class TerminalUI(InstallerUI):
         else:
             buffer.write("\033[0m\033[K\033[1B\r")  # reset, clear to EOL, move to next line
 
+    def _parse_builder_progress(self, build_info: BuildInfo, data: bytes) -> None:
+        """Parse the build log for progress lines and update the build info."""
+        # Pipe reads can split a CMake line at any byte. Keep the incomplete tail until
+        # the next callback so only complete lines update the displayed progress.
+        lines = (build_info.progress_buffer + data).split(b"\n")
+        build_info.progress_buffer = lines.pop()
+        for line in lines:
+            clean_line = ANSI_ESCAPE.sub(b"", line).decode(errors="replace").strip()
+
+            if clean_line.startswith("-- ") or clean_line.startswith("CMake "):
+                message = clean_line[3:] if clean_line.startswith("-- ") else clean_line
+                self._set_progress(build_info, f"{self._progress_prefix(build_info)} {message}")
+                continue
+
+            progress_line = PROGRESS_LINE.match(clean_line)
+            if not progress_line:
+                continue
+
+            progress = None
+            if progress_line.group(1).endswith("%"):
+                progress = progress_line.group(1).strip()  # "[10%] ..."
+            else:
+                num_match = FRACTIONAL_PROGRESS_LINE.match(clean_line)  # "[1/10] ..."
+                if num_match:
+                    total = int(num_match.group(2))
+                    if total > 0:
+                        progress = f"{int((int(num_match.group(1)) / total) * 100)}%"
+
+            if progress is None:
+                continue
+
+            build_message = progress_line.group(2).strip()
+            if build_message:
+                if build_message.startswith("Linking "):
+                    # e.g. "Linking CXX executable src/foo"
+                    progress = f"{progress} {build_message}"
+                elif build_message.startswith("Built target "):
+                    # e.g. "Built target ..."
+                    progress = f"{progress} {build_message}"
+                elif build_message.startswith("Building "):
+                    # e.g. "Building CXX object src/CMakeFiles/foo.dir/foo.cpp.o"
+                    _, sep, msg = build_message.partition(" object ")
+                    if sep:
+                        # e.g. "Building CXX object src/CMakeFiles/foo.dir/foo.cpp.o"
+                        progress = f"{progress} {msg.rpartition('CMakeFiles/')[2].rstrip('.o')}"
+
+            self._set_progress(build_info, progress)
+
     def on_log_output(self, build_id: str, data: bytes) -> None:
         if self.headless:
+            return
+        if self.overview_mode and not self.verbose:
+            if self.filter_padding:
+                data = padding_filter_bytes(data)
+            build_info = self.builds.get(build_id)
+            if build_info is not None:
+                self._parse_builder_progress(build_info, data)
             return
         # Discard logs we are not following. Generally this should not happen as we tell the child
         # to only send logs when we are following it. It could maybe happen while transitioning
@@ -681,10 +779,7 @@ class TerminalUI(InstallerUI):
         yield reset
 
         # progress or state
-        if build_info.progress_percent is not None:
-            yield " fetching"
-            yield f": {build_info.progress_percent}%"
-        elif build_info.state == "finished":
+        if build_info.state == "finished":
             prefix = build_info.prefix
             yield f" {padding_filter(prefix) if self.filter_padding else prefix}"
         elif build_info.state == "failed":
@@ -704,3 +799,6 @@ class TerminalUI(InstallerUI):
             yield gray
             yield f" ({pretty_duration(elapsed)})"
             yield reset
+
+        if build_info.state not in ("finished", "failed") and build_info.progress_percent:
+            yield f" {self._progress_with_eta(build_info.progress_percent, elapsed)}"
