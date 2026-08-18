@@ -21,6 +21,7 @@ import spack.cmd
 import spack.compilers.config
 import spack.compilers.libraries
 import spack.concretize
+import spack.concretize_ui
 import spack.config
 import spack.deptypes as dt
 import spack.environment as ev
@@ -55,6 +56,7 @@ from spack.solver.reuse import spec_filter_from_packages_yaml
 from spack.spec import Spec
 from spack.store import Store
 from spack.test.conftest import RepoBuilder
+from spack.test.utilities import RecordingUI
 from spack.version import Version, VersionList, ver
 
 
@@ -4757,6 +4759,17 @@ def test_concretization_cache_reapplies_patches_on_hit(
     assert initial_sha256s <= new_sha256s
 
 
+def test_patch_condition_on_direct_dependency(use_concretization_cache):
+    """A patch with a condition on a direct dependency (e.g. ``%gcc@10:``) is applied both on
+    a fresh solve and on a cache hit, where specs are rebuilt from serialized solver output."""
+    fix_patch = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    for _ in range(2):
+        spec = spack.concretize.concretize_one("patch-when-compiler %gcc@10.2.1")
+        assert (fix_patch,) == spec.variants["patches"].value
+        # concrete specs record every edge without the direct flag
+        assert not any(e.direct for s in spec.traverse() for e in s.edges_to_dependencies())
+
+
 def test_concretization_cache_count_cleanup(
     use_concretization_cache, mutable_config: Configuration
 ):
@@ -5500,3 +5513,100 @@ def test_solve_in_rounds_with_no_specs(mock_packages, config):
     """Tests that solving no specs at all yields no result, instead of being unsatisfiable."""
     solver = spack.solver.asp.Solver()
     assert list(solver.solve_in_rounds([])) == []
+
+
+def test_concretize_separately_reports_progress(mutable_config, mock_packages):
+    """Tests that concretizing separately reports the start of the concretization, and one event
+    per spec, to the injected frontend.
+    """
+    ui = RecordingUI()
+    spack.concretize.concretize_separately([(Spec("pkg-a"), None), (Spec("pkg-b"), None)], ui=ui)
+
+    assert ui.started == [(spack.concretize_ui.SolveKind.SEPARATELY, 2, 1)]
+    assert [count for _, _, count, _ in ui.concretized] == [1, 2]
+    assert {abstract.name for abstract, _, _, _ in ui.concretized} == {"pkg-a", "pkg-b"}
+    assert not ui.groups
+
+    for abstract, concrete, _, _ in ui.concretized:
+        assert concrete.concrete and concrete.satisfies(abstract)
+
+
+def test_concretize_together_when_possible_reports_progress(mutable_config, mock_packages):
+    """Tests that concretizing "when possible" reports the start of the concretization, and one
+    event per spec. The two specs cannot be unified, so they are solved in different rounds, and
+    the count has to keep increasing across rounds.
+    """
+    ui = RecordingUI()
+    spack.concretize.concretize_together_when_possible(
+        [(Spec("pkg-a@1.0"), None), (Spec("pkg-a@2.0"), None)], ui=ui
+    )
+
+    assert ui.started == [(spack.concretize_ui.SolveKind.WHEN_POSSIBLE, 2, 1)]
+    assert [count for _, _, count, _ in ui.concretized] == [1, 2]
+    assert {str(abstract) for abstract, _, _, _ in ui.concretized} == {"pkg-a@1.0", "pkg-a@2.0"}
+
+    for abstract, concrete, _, _ in ui.concretized:
+        assert concrete.concrete and concrete.satisfies(abstract)
+
+
+def test_concretize_together_reports_progress(mutable_config, mock_packages):
+    """Tests that concretizing together reports the start of the concretization, and one event
+    per spec.
+    """
+    ui = RecordingUI()
+    spack.concretize.concretize_together([(Spec("pkg-a"), None), (Spec("pkg-b"), None)], ui=ui)
+
+    assert ui.started == [(spack.concretize_ui.SolveKind.TOGETHER, 2, 1)]
+    assert [count for _, _, count, _ in ui.concretized] == [1, 2]
+    assert {abstract.name for abstract, _, _, _ in ui.concretized} == {"pkg-a", "pkg-b"}
+    assert len({duration for _, _, _, duration in ui.concretized}) == 1
+    assert not ui.groups
+
+    for abstract, concrete, _, _ in ui.concretized:
+        assert concrete.concrete and concrete.satisfies(abstract)
+
+
+@pytest.mark.parametrize(
+    "concretize_fn",
+    [
+        spack.concretize.concretize_together,
+        spack.concretize.concretize_together_when_possible,
+        spack.concretize.concretize_separately,
+    ],
+)
+def test_reported_total_matches_number_of_specs(concretize_fn, mutable_config, mock_packages):
+    """Tests that, whatever the concretization strategy, the total announced when concretization
+    starts is the number of specs that are reported as concretized afterwards, and that the counts
+    reported along the way run from 1 to that total. Frontends rely on this to show a percentage.
+    """
+    ui = RecordingUI()
+    concretize_fn([(Spec("pkg-a"), None), (Spec("pkg-b"), None), (Spec("libelf"), None)], ui=ui)
+
+    assert len(ui.started) == 1
+    _, total, _ = ui.started[0]
+    assert total == len(ui.concretized) == 3
+    assert [count for _, _, count, _ in ui.concretized] == list(range(1, total + 1))
+
+
+def test_concretize_separately_reports_start_with_nothing_to_do(mutable_config, mock_packages):
+    """Tests that concretization is announced even when every input spec is already concrete, so
+    that frontends always see a start event.
+    """
+    concrete = spack.concretize.concretize_one(Spec("pkg-a"))
+    ui = RecordingUI()
+    result = spack.concretize.concretize_separately([(Spec("pkg-a"), concrete)], ui=ui)
+
+    assert ui.started == [(spack.concretize_ui.SolveKind.SEPARATELY, 0, 1)]
+    assert not ui.concretized
+    assert [concrete for _, concrete in result] == [concrete]
+
+
+@pytest.mark.parametrize("total,announced", [(2, True), (0, False)])
+def test_terminal_ui_announces_pool_only_when_solving(total, announced, capsys):
+    """Tests that the terminal frontend stays silent when there is nothing to concretize."""
+    ui = spack.concretize_ui.TerminalUI()
+    ui.on_concretization_started(
+        kind=spack.concretize_ui.SolveKind.SEPARATELY, total=total, processes=1
+    )
+
+    assert ("Starting concretization" in capsys.readouterr().out) is announced
