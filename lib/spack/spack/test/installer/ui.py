@@ -160,7 +160,7 @@ class TestBasicStateManagement:
         # Update to 'building' state
         tui.on_state_changed(build_id, "building")
         assert tui.builds[build_id].state == "building"
-        assert tui.builds[build_id].progress_percent is None
+        assert tui.builds[build_id].progress is None
         assert tui.completed == 0
 
         # Update to 'finished' state
@@ -249,7 +249,7 @@ class TestBasicStateManagement:
 
         # Update progress
         tui.on_progress(build_id, 50, 100)
-        assert tui.builds[build_id].progress_percent == "fetching: 50%"
+        assert tui.builds[build_id].progress == inst.BuildProgress("50%", "fetching")
         assert tui.dirty is True
 
         # Same percentage shouldn't mark dirty again
@@ -259,7 +259,7 @@ class TestBasicStateManagement:
 
         # Different percentage should mark dirty
         tui.on_progress(build_id, 75, 100)
-        assert tui.builds[build_id].progress_percent == "fetching: 75%"
+        assert tui.builds[build_id].progress == inst.BuildProgress("75%", "fetching")
         assert tui.dirty is True
 
     def test_completion_counter(self):
@@ -748,7 +748,7 @@ class TestBuildInfo:
         assert build_info.external is False
         assert build_info.state == "starting"
         assert build_info.finished_time is None
-        assert build_info.progress_percent is None
+        assert build_info.progress is None
 
     def test_build_info_external_package(self):
         """Test BuildInfo for external package"""
@@ -807,6 +807,21 @@ class TestLogFollowing:
         assert "starting" in output
         assert output.index("-- Configuring done") < output.rindex("Progress:")
 
+    def test_verbose_tty_continues_partial_log_line(self):
+        """A later log chunk continues the partial line displayed above the overview."""
+        tui, _, fake_stdout = create_tui(total=1, verbose=True)
+        on_build_added(tui, "pkg0")
+        tui.render()
+        fake_stdout.clear()
+
+        tui.on_log_output("pkg0", b"checking for boost...")
+        tui.on_log_output("pkg0", b"yes\n")
+
+        output = fake_stdout.getvalue()
+        assert "checking for boost...\n" not in output
+        assert "checking for boost...\0337\033[1B\r" in output
+        assert "\0338\033[0Jyes\n" in output
+
     def test_verbose_tty_toggle_off_clears_streamed_log(self):
         """Turning streaming off clears the screen and restores the overview position."""
         tui, _, fake_stdout = create_tui(total=1, verbose=True)
@@ -862,6 +877,101 @@ class TestLogFollowing:
 
         # Nothing should be printed
         assert fake_stdout.getvalue() == ""
+
+    def test_parse_fractional_progress_line(self):
+        """Test that build progress lines update the overview build row."""
+        tui, _, fake_stdout = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"...\n[2/10] ...\n")
+        assert fake_stdout.getvalue() == ""
+        assert tui.builds[build_id].progress == inst.BuildProgress("20%")
+
+    def test_progress_bazel_comma_fractional_progress_line(self):
+        """Test that build progress display supports bazel's comma-separated job counts."""
+        tui, _, fake_stdout = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(
+            build_id,
+            b"[15,557 / 23,143] TdGenerate dir/file.inc; 7s local ... (6 actions, 5 running)\n",
+        )
+
+        assert fake_stdout.getvalue() == ""
+        assert tui.builds[build_id].progress == inst.BuildProgress("67%", "dir/file.inc")
+
+    def test_progress_bazel_compiling_message(self):
+        """Test that build progress display supports bazel's compiling messages."""
+        tui, _, fake_stdout = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(
+            build_id,
+            b"[51 / 100] Compiling dir/file.cc; 42s local ... (16 actions, 15 running)\n",
+        )
+
+        assert fake_stdout.getvalue() == ""
+        assert tui.builds[build_id].progress == inst.BuildProgress("51%", "dir/file.cc")
+
+    def test_overview_cmake_ccx_building_line(self):
+        """Test that build progress lines update the overview build row."""
+        tui, _, fake_stdout = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(
+            build_id,
+            b"...\n[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\nRunning tests...\n",
+        )
+
+        assert fake_stdout.getvalue() == ""
+        assert tui.builds[build_id].progress == inst.BuildProgress("96%", "foo.cpp")
+
+    def test_render_building_filename_as_progress_message(self):
+        """Test that a Building line's filename appears in the overview row."""
+        tui, _, _ = create_tui(color=False)
+        [build_id] = add_mock_builds(tui, 1)
+        tui.on_state_changed(build_id, "build")
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\n")
+
+        rendered = "".join(tui._generate_line_components(tui.builds[build_id]))
+
+        assert " (96%) foo.cpp" in rendered
+
+    def test_parse_building_line_split_across_log_chunks(self):
+        """Test that an incomplete log chunk does not truncate a Building filename."""
+        tui, _, _ = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object CMakeFiles/foo")
+        assert tui.builds[build_id].progress is None
+
+        tui.on_log_output(build_id, b".cpp.o\n")
+
+        assert tui.builds[build_id].progress == inst.BuildProgress("96%", "foo.cpp")
+
+    def test_parse_non_building_cmake_progress_lines(self):
+        """Test that non-Building CMake progress lines are retained as messages."""
+        tui, _, _ = create_tui()
+        [build_id] = add_mock_builds(tui, 1)
+
+        tui.on_log_output(build_id, b"CMake message\n")
+        assert tui.builds[build_id].progress == inst.BuildProgress(
+            "", "CMake message"
+        )
+
+        tui.on_log_output(build_id, b"-- Checking\n")
+        assert tui.builds[build_id].progress == inst.BuildProgress(
+            "", "Checking"
+        )
+
+        tui.on_log_output(build_id, b"[ 99%] Linking C executable timeit-target\n")
+        assert tui.builds[build_id].progress == inst.BuildProgress(
+            "99%", "Linking C executable timeit-target"
+        )
+        tui.on_log_output(build_id, b"[100%] Built target gmock_main\n")
+        assert tui.builds[build_id].progress == inst.BuildProgress(
+            "100%", "Built target gmock_main"
+        )
 
     def test_print_logs_discarded_when_not_tracked(self):
         """Test that logs from non-tracked builds are discarded"""
@@ -1097,9 +1207,11 @@ class TestToggle:
 
         tui.toggle()
         tui.toggle()
+        tui.on_log_output(build_id, b"[ 96%] Building CXX object src/CMakeFiles/foo.cpp.o\n")
 
         assert tui.overview_mode is True
-        assert inst.SetEcho(build_id, False) not in tui.commands
+        assert tui.log_streaming is False
+        assert tui.builds[build_id].progress == inst.BuildProgress("96%", "foo.cpp")
 
     def test_on_state_changed_finished_continues_streaming_next_build(self):
         """Finishing a streamed build follows the next unfinished build."""
@@ -1135,8 +1247,8 @@ class TestToggle:
         assert tui.log_streaming is True
         assert tui.tracked_build_id == "next"
 
-    def test_partial_line_newline_on_toggle_and_next(self):
-        """Ensure newline is inserted before mode transitions when log doesn't end with newline."""
+    def test_partial_line_handling_on_toggle_and_next(self):
+        """Ensure partial log lines remain well-formed across mode transitions."""
         tui, _, fake_stdout = create_tui(total=2)
         build_a, build_b = add_mock_builds(tui, 2)
 
@@ -1156,10 +1268,11 @@ class TestToggle:
         # There shouldn't be any double newlines:
         assert "\n\n" not in written
 
-        # All partial and newline-terminated logs should be present with appropriate newlines:
+        # Toggling replays partial history with a newline, while switching away can leave the
+        # temporary line represented by a cursor move rather than materializing a newline.
         assert "checking for foo...\n" in written
         assert "checking for bar... yes\n" in written
-        assert "checking for baz...\n" in written
+        assert "checking for baz...\0337\033[1B\r" in written
 
     @pytest.mark.not_on_windows("Padding functionality unsupported on Windows")
     @pytest.mark.parametrize("filter_padding", [True, False])
@@ -1415,13 +1528,13 @@ class TestEdgeCases:
 
         # Test rounding
         tui.on_progress(build_id, 1, 3)
-        assert tui.builds[build_id].progress_percent == "fetching: 33%"
+        assert tui.builds[build_id].progress == inst.BuildProgress("33%", "fetching")
 
         tui.on_progress(build_id, 2, 3)
-        assert tui.builds[build_id].progress_percent == "fetching: 66%"
+        assert tui.builds[build_id].progress == inst.BuildProgress("66%", "fetching")
 
         tui.on_progress(build_id, 3, 3)
-        assert tui.builds[build_id].progress_percent == "fetching: 100%"
+        assert tui.builds[build_id].progress == inst.BuildProgress("100%", "fetching")
 
 
 class TestTerminalUIVerbose:
@@ -1671,12 +1784,13 @@ class TestLineRendering:
     """Test individual build-line components in the rendered output."""
 
     def test_fetch_progress_rendered(self):
-        """A build with fetch progress shows a percentage instead of its state."""
-        tui, _, fake_stdout = create_tui(total=1)
+        """A build shows its percentage with elapsed time and its message afterward."""
+        tui, fake_time, fake_stdout = create_tui(total=1, color=True)
         [build_id] = add_mock_builds(tui, 1)
         tui.on_progress(build_id, 50, 100)
+        fake_time[0] = 65
         tui.render()
-        assert "fetching: 50%" in fake_stdout.getvalue()
+        assert f"{tui.gray} (1m05s, 50%){tui.reset} fetching" in fake_stdout.getvalue()
 
     def test_failed_line_shows_log_path(self):
         """A failed build's line includes the path to its log file."""
@@ -1702,19 +1816,18 @@ class TestLineRendering:
         assert line.startswith("[ ] ")
         assert "pkg@1.0" in line
 
-    def test_line_truncated_to_terminal_width(self):
-        """Build lines are cut off at the terminal width in the interactive overview."""
+    def test_finished_overview_line_truncated_to_terminal_width(self):
+        """A mutable completed row remains bounded to keep cursor tracking accurate."""
         tui, _, fake_stdout = create_tui(total=1, terminal_cols=30, color=False)
         on_build_added(tui, "pkg", prefix="/quite/long/prefix/path")
         tui.on_state_changed("pkg", "finished")
         tui.render()
         output = fake_stdout.getvalue()
         assert "pkg@1.0" in output
-        # The prefix would exceed the terminal width, so it is not rendered.
         assert "/quite/long/prefix/path" not in output
 
-    def test_finished_line_truncated_to_terminal_width(self):
-        """Persisted finished-build lines do not wrap past the terminal width."""
+    def test_persisted_finished_line_keeps_prefix_in_narrow_terminal(self):
+        """A persisted completed build always shows its install prefix."""
         tui, fake_time, fake_stdout = create_tui(
             total=1, terminal_cols=30, color=False
         )
@@ -1726,9 +1839,7 @@ class TestLineRendering:
 
         lines = [line for line in fake_stdout.getvalue().splitlines() if "pkg@1.0" in line]
         assert lines
-        visible_lines = [line.rpartition("\x07")[2].replace("\033[0m\033[K", "") for line in lines]
-        assert all(len(line) <= 30 for line in visible_lines)
-        assert "/quite/long/prefix/path" not in fake_stdout.getvalue()
+        assert "/quite/long/prefix/path" in fake_stdout.getvalue()
 
 
 class TestStdinReader:
