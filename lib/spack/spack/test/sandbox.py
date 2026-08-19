@@ -187,6 +187,7 @@ def test_enable_sandbox_paths(
     assert sbang_file.resolve() in allow_read_resolved
 
     allow_write_resolved = [c[1] for c in mock_sandbox.write_calls]
+    assert pathlib.Path(spec.prefix).parent.resolve() not in allow_write_resolved
     assert stage_path.resolve() in allow_write_resolved
     assert pathlib.Path(spec.prefix).resolve() in allow_write_resolved
     assert custom_write.resolve() in allow_write_resolved
