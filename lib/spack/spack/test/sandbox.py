@@ -13,7 +13,8 @@ if sys.platform != "linux":
 import os
 import pathlib
 import tempfile
-from typing import List, Tuple
+from types import SimpleNamespace
+from typing import List, Tuple, cast
 
 import spack.concretize
 import spack.config
@@ -21,6 +22,7 @@ import spack.installer.sandbox
 import spack.installer_dispatch
 import spack.paths
 import spack.sandbox
+import spack.spec
 import spack.store
 
 
@@ -164,6 +166,78 @@ class MockSandbox(spack.sandbox.Sandbox):
         self.apply_calls.append((restrict_filesystem, restrict_network))
 
 
+def test_allow_selected_compiler_paths(tmp_path: pathlib.Path):
+    """Allow selected C/C++ drivers once while leaving unselected Fortran inaccessible."""
+    compiler_dir = tmp_path / "compiler" / "bin"
+    compiler_dir.mkdir(parents=True)
+    compiler_paths = {
+        language: str(compiler_dir / executable)
+        for language, executable in (("c", "cc"), ("cxx", "c++"), ("fortran", "fc"))
+    }
+    for path in compiler_paths.values():
+        pathlib.Path(path).touch()
+
+    compiler_spec = SimpleNamespace(extra_attributes={"compilers": compiler_paths})
+    selected_edge = SimpleNamespace(spec=compiler_spec, virtuals=("c", "cxx"))
+    node = SimpleNamespace(edges_to_dependencies=lambda: [selected_edge, selected_edge])
+    spec = SimpleNamespace(traverse=lambda: [node])
+    sandbox = MockSandbox()
+
+    spack.installer.sandbox.allow_compiler_paths(sandbox, cast(spack.spec.Spec, spec))
+
+    allowed = [resolved for _, resolved in sandbox.read_calls]
+    assert pathlib.Path(compiler_paths["c"]).resolve() in allowed
+    assert pathlib.Path(compiler_paths["cxx"]).resolve() in allowed
+    assert pathlib.Path(compiler_paths["fortran"]).resolve() not in allowed
+    assert len(allowed) == 2
+
+
+def test_prepend_compiler_aliases(tmp_path, monkeypatch):
+    compiler_dir = tmp_path / "compiler"
+    compiler_dir.mkdir()
+    compiler_paths = {
+        "c": str(compiler_dir / "gcc"),
+        "cxx": str(compiler_dir / "g++"),
+        "fortran": str(compiler_dir / "gfortran"),
+    }
+    for path in compiler_paths.values():
+        pathlib.Path(path).touch()
+
+    compiler_spec = SimpleNamespace(extra_attributes={"compilers": compiler_paths})
+    compiler_edge = SimpleNamespace(spec=compiler_spec, virtuals=("c", "cxx", "fortran"))
+    node = SimpleNamespace(edges_to_dependencies=lambda: [compiler_edge])
+    spec = SimpleNamespace(traverse=lambda: [node])
+    monkeypatch.setenv("PATH", "/original/path")
+
+    alias_dir = spack.installer.sandbox.prepend_compiler_aliases(
+        cast(spack.spec.Spec, spec), str(tmp_path)
+    )
+
+    assert alias_dir is not None
+    assert pathlib.Path(alias_dir, "cc").resolve() == pathlib.Path(compiler_paths["c"])
+    for alias in ("c++", "g++", "clang++"):
+        assert pathlib.Path(alias_dir, alias).resolve() == pathlib.Path(compiler_paths["cxx"])
+    assert pathlib.Path(alias_dir, "gfortran").resolve() == pathlib.Path(compiler_paths["fortran"])
+    assert os.environ["PATH"].split(os.pathsep) == [alias_dir, "/original/path"]
+
+
+def test_prepend_compiler_aliases_omits_unselected_languages(tmp_path, monkeypatch):
+    compiler = tmp_path / "compiler"
+    compiler.touch()
+    compiler_spec = SimpleNamespace(extra_attributes={"compilers": {"c": str(compiler)}})
+    compiler_edge = SimpleNamespace(spec=compiler_spec, virtuals=("c",))
+    node = SimpleNamespace(edges_to_dependencies=lambda: [compiler_edge])
+    spec = SimpleNamespace(traverse=lambda: [node])
+    monkeypatch.setenv("PATH", "/original/path")
+
+    alias_dir = spack.installer.sandbox.prepend_compiler_aliases(
+        cast(spack.spec.Spec, spec), str(tmp_path)
+    )
+
+    assert alias_dir is not None
+    assert {path.name for path in pathlib.Path(alias_dir).iterdir()} == {"cc"}
+
+
 def test_enable_sandbox_paths(
     config, mock_packages, monkeypatch, temporary_store: spack.store.Store, tmp_path: pathlib.Path
 ):
@@ -201,6 +275,7 @@ def test_enable_sandbox_paths(
         "allow_read": [str(custom_read_link)],
         "allow_write": [str(custom_write)],
     }
+    monkeypatch.setenv("PATH", "/original/path")
 
     spack.installer.sandbox.enable(config, spec, str(stage_path))
 
