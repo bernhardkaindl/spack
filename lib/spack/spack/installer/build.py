@@ -32,7 +32,6 @@ import spack.config
 import spack.error
 import spack.hooks
 import spack.mirrors.mirror
-import spack.sandbox
 import spack.spec
 import spack.store
 import spack.url_buildcache
@@ -49,6 +48,7 @@ from spack.installer.base import (
     Makeflags,
     ProcessExitNotifier,
 )
+from spack.installer import sandbox as build_sandbox
 from spack.old_installer import _do_fake_install, dump_packages
 from spack.subprocess_context import GlobalStateMarshaler
 from spack.util.executable import ProcessError
@@ -70,7 +70,6 @@ OVERWRITE_BACKUP_SUFFIX = ".old"
 
 #: Suffix for temporary cleanup during failed install
 OVERWRITE_GARBAGE_SUFFIX = ".garbage"
-
 
 class ProcessLike(Protocol):
     """The part of the ``multiprocessing.Process`` interface the event loop relies on. Tests
@@ -559,44 +558,6 @@ def _archive_build_metadata(pkg: "spack.package_base.PackageBase") -> None:
         spack.util.tty.debug(e)
 
 
-def _enable_sandbox(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
-    if not config.get("enable", False):
-        return
-
-    try:
-        sandbox = spack.sandbox.get_sandbox()
-    except spack.sandbox.SandboxError as e:
-        raise spack.error.InstallError(f"Cannot enable build sandbox: {e}") from e
-
-    for dep in spec.traverse(root=False):
-        if not dep.external:
-            sandbox.allow_read(dep.prefix)
-
-    sandbox.allow_write(stage_path)
-    sandbox.allow_write(spec.prefix)
-
-    # POSIX prescribes /tmp and /dev/null are present. In the future we can consider setting
-    # TMPPATH to a sibling of the stage path to isolate concurrent builds better.
-    sandbox.allow_write(tempfile.gettempdir())
-    sandbox.allow_write(os.devnull)
-
-    # Allow read access to sbang, which might be needed to run build scripts.
-    sandbox.allow_read(os.path.join(spack.store.STORE.unpadded_root, "bin", "sbang"))
-    for upstream_db in spack.store.STORE.upstreams or []:
-        sandbox.allow_read(os.path.join(upstream_db.root, "bin", "sbang"))
-
-    # User-configured paths
-    for p in config.get("allow_read", []):
-        sandbox.allow_read(p)
-    for p in config.get("allow_write", []):
-        sandbox.allow_write(p)
-
-    try:
-        sandbox.apply(block_network=not config.get("allow_network", True))
-    except spack.sandbox.SandboxError as e:
-        raise spack.error.InstallError(f"Cannot enable build sandbox: {e}") from e
-
-
 def _rewire_no_db(spec: spack.spec.Spec, explicit: bool) -> None:
     """Rewire a spliced spec from its build_spec prefix, without writing to the database."""
     tmpdir = tempfile.mkdtemp()
@@ -705,7 +666,7 @@ def _install(
         if stop_at is not None and stop_at not in builder.phases:
             raise spack.error.InstallError(f"'{stop_at}' is not a valid phase for {pkg.name}")
 
-        _enable_sandbox(spack.config.CONFIG.get("config:sandbox", {}), spec, stage.path)
+        build_sandbox.enable(spack.config.CONFIG.get("config:sandbox", {}), spec, stage.path)
 
         for phase in builder:
             if stop_before is not None and phase.name == stop_before:
