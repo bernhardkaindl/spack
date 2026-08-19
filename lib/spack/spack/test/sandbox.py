@@ -151,7 +151,10 @@ def test_landlock_sandbox_no_restrictions_is_noop():
 
 
 class MockSandbox(spack.sandbox.Sandbox):
+    """Record paths and network settings passed to the abstract sandbox interface."""
+
     def __init__(self):
+        """Initialize empty call lists for each sandbox operation."""
         self.read_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
         self.write_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
         self.apply_calls: List[Tuple[bool, bool]] = []
@@ -238,10 +241,75 @@ def test_prepend_compiler_aliases_omits_unselected_languages(tmp_path, monkeypat
     assert {path.name for path in pathlib.Path(alias_dir).iterdir()} == {"cc"}
 
 
+def test_allow_direct_compiler_dependency_paths(tmp_path: pathlib.Path):
+    """Allow every driver exposed by a direct compiler dependency."""
+    compiler_paths = {}
+    for language, executable in (("c", "gcc"), ("cxx", "g++"), ("fortran", "gfortran")):
+        path = tmp_path / executable
+        path.touch()
+        compiler_paths[language] = str(path)
+
+    compiler_spec = SimpleNamespace(extra_attributes={"compilers": compiler_paths})
+    compiler_edge = SimpleNamespace(spec=compiler_spec, virtuals=())
+    node = SimpleNamespace(edges_to_dependencies=lambda: [compiler_edge])
+    spec = SimpleNamespace(traverse=lambda: [node])
+    sandbox = MockSandbox()
+
+    spack.installer.sandbox.allow_compiler_paths(sandbox, cast(spack.spec.Spec, spec))
+
+    allowed = {resolved for _, resolved in sandbox.read_calls}
+    assert allowed == {pathlib.Path(path).resolve() for path in compiler_paths.values()}
+
+
+@pytest.mark.parametrize(
+    "program",
+    [
+        "ld",
+        "ar",
+        "ranlib",
+        "strip",
+        "nm",
+        "join",
+        "true",
+        "tbl",
+        "mawk",
+        "paste",
+        "date",
+        "head",
+        "hostname",
+        "arch",
+        "comm",
+        "egrep",
+        "realpath",
+        "split",
+    ],
+)
+def test_compiler_support_paths_resolve_bare_tools_on_host_path(monkeypatch, program):
+    """Resolve bare compiler tools through both the build PATH and the host default PATH."""
+    assert program in spack.installer.sandbox.BUILD_TOOLS
+    monkeypatch.setattr(spack.installer.sandbox, "BUILD_TOOLS", (program,))
+    monkeypatch.setattr(spack.installer.sandbox, "COMPILER_FILES", ())
+    monkeypatch.setattr(
+        spack.installer.sandbox.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=f"{program}\n"),
+    )
+
+    def which(command, path=None):
+        return f"/wrapper/{program}" if path is None else f"/usr/bin/{program}"
+
+    monkeypatch.setattr(spack.installer.sandbox.shutil, "which", which)
+
+    assert spack.installer.sandbox.compiler_support_paths("/usr/bin/g++") == [
+        f"/wrapper/{program}",
+        f"/usr/bin/{program}",
+    ]
+
+
 def test_enable_sandbox_paths(
     config, mock_packages, monkeypatch, temporary_store: spack.store.Store, tmp_path: pathlib.Path
 ):
-    """Test that _enable_sandbox in the installer calls allow_read/allow_write correctly."""
+    """Verify implicit and configured sandbox paths without exposing sibling prefixes."""
     mock_sandbox = MockSandbox()
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
 
@@ -411,7 +479,7 @@ def test_host_runtime_paths_include_network_configuration():
 
 
 def test_sandbox_network_blocking_requires_abi_v4():
-    """Test that blocking network access on an older kernel raises a RuntimeError."""
+    """Verify that network blocking rejects kernels without Landlock ABI v4 support."""
     sandbox = SpyLandlockSandbox(abi_version=3)
 
     with pytest.raises(

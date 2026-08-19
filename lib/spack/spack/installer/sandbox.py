@@ -8,9 +8,11 @@ platform sandbox implementation in :mod:`spack.sandbox`.
 """
 
 import os
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import spack.error
 import spack.paths
@@ -29,12 +31,21 @@ HOST_RUNTIME_READ_PATHS = (
     "/etc/ld.so.conf.d",
     "/proc/cpuinfo",
     "/etc/debian_version",
+    "/etc/group",
+    "/etc/hosts",
+    "/etc/magic",
     "/etc/mime.types",
     "/etc/nsswitch.conf",
+    "/etc/passwd",
     "/etc/pki",
     "/etc/resolv.conf",
     "/etc/ssl",
 )
+#: Host paths required by runtime facilities that create kernel-backed objects.
+#: POSIX prescribes /dev/shm is present and writable for shared memory objects.
+#: If not available, e.g. Python's multiprocessing is compiled without SemLock
+#: support, which causes failures in programs requiring multiprocessing.SemLock.
+HOST_RUNTIME_WRITE_PATHS = ("/dev/shm",)
 #: Host paths required by selected system compilers.
 HOST_COMPILER_READ_PATHS = ("/usr/include",)
 #: Language virtuals whose concrete edges identify selected compiler drivers.
@@ -74,6 +85,90 @@ def prepend_compiler_aliases(spec: spack.spec.Spec, stage_path: str) -> Optional
     return alias_dir
 
 
+#: Subordinate executables that compiler drivers may invoke.
+COMPILER_PROGS = ("cc1", "cc1plus", "f951", "collect2", "lto1", "lto-wrapper", "cpp")
+BINUTILS_PROGS = ("as", "ld", "ar", "ranlib", "strip", "nm")
+STAGING_PROGS = ("tar", "gzip", "bzip2", "xz", "unzip")
+COREUTILS_INSTALL_PROGS = ("cat", "chmod", "cp", "install", "ln", "mkdir", "mv", "rm", "rmdir")
+FILE_PROGS = ("comm", "cut", "head", "join", "ls", "paste", "split", "tail", "touch", "wc")
+COREUTILS_SYS = ("arch", "date", "env", "hostname", "id", "pwd", "sleep", "uname", "ldd")
+COREUTILS_TOOLS = ("basename", "dirname", "echo", "expr", "realpath", "sort", "tr", "uniq")
+COMMON_UTILS = ("cmp", "diff", "file", "find", "mktemp", "git", "md5sum", "true")
+COMMON_TOOLS = ("egrep", "grep", "hexdump", "od", "tbl", "which", "xargs")
+SCRIPT_INTERPRETERS = ("awk", "gawk", "mawk", "nawk", "bash", "perl", "sed")
+BUILD_TOOLS = (
+    COMPILER_PROGS
+    + STAGING_PROGS
+    + BINUTILS_PROGS
+    + COREUTILS_INSTALL_PROGS
+    + FILE_PROGS
+    + COREUTILS_SYS
+    + COREUTILS_TOOLS
+    + SCRIPT_INTERPRETERS
+    + COMMON_UTILS
+    + COMMON_TOOLS
+)
+#: Support files that compiler drivers may pass to subordinate tools.
+COMPILER_FILES = ("liblto_plugin.so",)
+
+
+def compiler_support_paths(compiler_path: str) -> List[str]:
+    """Return support programs and files reported by a selected compiler driver.
+
+    Args:
+        compiler_path: Absolute path to the configured compiler driver.
+
+    Returns:
+        Absolute paths to compiler frontends, assembler/linker programs, and plugins that exist
+        outside the compiler driver's own sandbox rule.
+    """
+    result = []
+    for program in BUILD_TOOLS:
+        try:
+            completed = subprocess.run(
+                [compiler_path, f"-print-prog-name={program}"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            continue
+
+        if completed.returncode != 0:
+            continue
+        reported_path = completed.stdout.strip()
+        if not reported_path or reported_path == program:
+            for search_path in (None, os.defpath):
+                resolved = shutil.which(program, path=search_path)
+                if resolved:
+                    result.append(resolved)
+            continue
+        if os.path.isabs(reported_path):
+            result.append(reported_path)
+
+    for filename in COMPILER_FILES:
+        try:
+            completed = subprocess.run(
+                [compiler_path, f"-print-file-name={filename}"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            continue
+
+        reported_path = completed.stdout.strip()
+        if (
+            completed.returncode == 0
+            and reported_path != filename
+            and os.path.isabs(reported_path)
+        ):
+            result.append(reported_path)
+    return result
+
+
 def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) -> None:
     """Allow compiler paths selected by concrete language edges in a build DAG.
 
@@ -83,6 +178,8 @@ def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) 
     """
     for compiler_path in set(selected_compiler_paths(spec).values()):
         sandbox.allow_read(compiler_path)
+        for program_path in compiler_support_paths(compiler_path):
+            sandbox.allow_read(program_path)
         real_compiler_path = Path(compiler_path).resolve()
         if real_compiler_path.exists() and str(real_compiler_path).startswith("/usr/"):
             for path in HOST_COMPILER_READ_PATHS:
@@ -133,6 +230,8 @@ def enable(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
 
         for path in HOST_RUNTIME_READ_PATHS:
             sandbox.allow_read(path)
+        for path in HOST_RUNTIME_WRITE_PATHS:
+            sandbox.allow_write(path)
         sandbox.allow_read(Path("/bin/sh"))
         allow_compiler_paths(sandbox, spec)
 
