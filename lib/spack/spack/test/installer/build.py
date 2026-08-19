@@ -7,12 +7,18 @@ import pathlib
 
 import pytest
 
-from spack.installer.build import OVERWRITE_GARBAGE_SUFFIX, BinaryCacheMiss, PrefixPivoter
+from spack.installer.base import ExitCode
+from spack.installer.build import (
+    OVERWRITE_GARBAGE_SUFFIX,
+    BinaryCacheMiss,
+    ChildInfo,
+    PrefixPivoter,
+)
 
 
 @pytest.fixture
 def existing_prefix(tmp_path: pathlib.Path) -> pathlib.Path:
-    """Creates a standard existing prefix with content."""
+    """Create an existing prefix containing a file that identifies the original install."""
     prefix = tmp_path / "existing_prefix"
     prefix.mkdir()
     (prefix / "old_file").write_text("old content")
@@ -160,6 +166,38 @@ class TestPrefixPivoter:
         assert (existing_prefix / "old_file").read_text() == "old content"
         assert not (existing_prefix / "partial_file").exists()
         assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_child_info_rolls_back_prefix_after_failed_worker(existing_prefix: pathlib.Path):
+    """Verify that the launcher restores the original prefix after a worker failure."""
+    prefix_pivoter = PrefixPivoter(str(existing_prefix))
+    prefix_pivoter.__enter__()
+    existing_prefix.mkdir()
+    (existing_prefix / "partial_file").write_text("partial content")
+
+    child = object.__new__(ChildInfo)
+    child.prefix_pivoter = prefix_pivoter
+    child.rollback_prefix(ExitCode.BUILD_ERROR)
+
+    assert (existing_prefix / "old_file").read_text() == "old content"
+    assert not (existing_prefix / "partial_file").exists()
+    assert child.prefix_pivoter is None
+
+
+def test_child_info_commits_prefix_after_successful_worker(existing_prefix: pathlib.Path):
+    """Verify that the launcher keeps the replacement prefix after worker success."""
+    prefix_pivoter = PrefixPivoter(str(existing_prefix))
+    prefix_pivoter.__enter__()
+    existing_prefix.mkdir()
+    (existing_prefix / "new_file").write_text("new content")
+
+    child = object.__new__(ChildInfo)
+    child.prefix_pivoter = prefix_pivoter
+    child.commit_prefix()
+
+    assert (existing_prefix / "new_file").read_text() == "new content"
+    assert not (existing_prefix / "old_file").exists()
+    assert child.prefix_pivoter is None
 
 
 class FailingPrefixPivoter(PrefixPivoter):
