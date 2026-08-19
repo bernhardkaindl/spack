@@ -19,6 +19,7 @@ import spack.concretize
 import spack.config
 import spack.installer.sandbox
 import spack.installer_dispatch
+import spack.paths
 import spack.sandbox
 import spack.store
 
@@ -213,6 +214,8 @@ def test_enable_sandbox_paths(
 
     # Verify sbang read
     assert sbang_file.resolve() in allow_read_resolved
+    assert pathlib.Path(spack.paths.prefix).resolve() in allow_read_resolved
+    assert pathlib.Path(spec.package.package_dir).resolve() in allow_read_resolved
     for path in spack.installer.sandbox.HOST_RUNTIME_READ_PATHS:
         resolved = pathlib.Path(path).resolve()
         if resolved.exists():
