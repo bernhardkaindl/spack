@@ -16,9 +16,9 @@ import tempfile
 from typing import List, Tuple
 
 import spack.concretize
+import spack.installer.sandbox
 import spack.sandbox
 import spack.store
-from spack.installer.build import _enable_sandbox
 
 
 class SpyLandlockSandbox(spack.sandbox.LandlockSandbox):
@@ -173,7 +173,7 @@ def test_enable_sandbox_paths(
         "allow_network": True,
     }
 
-    _enable_sandbox(config, spec, str(stage_path))
+    spack.installer.sandbox.enable(config, spec, str(stage_path))
 
     allow_read_resolved = [c[1] for c in mock_sandbox.read_calls]
     for dep in spec.traverse(root=False):
@@ -185,6 +185,11 @@ def test_enable_sandbox_paths(
 
     # Verify sbang read
     assert sbang_file.resolve() in allow_read_resolved
+    for path in spack.installer.sandbox.HOST_RUNTIME_READ_PATHS:
+        resolved = pathlib.Path(path).resolve()
+        if resolved.exists():
+            assert resolved in allow_read_resolved
+    assert pathlib.Path("/bin/sh").resolve() in allow_read_resolved
 
     allow_write_resolved = [c[1] for c in mock_sandbox.write_calls]
     assert pathlib.Path(spec.prefix).parent.resolve() not in allow_write_resolved
