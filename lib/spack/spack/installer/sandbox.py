@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 import spack.error
+import spack.paths
 import spack.sandbox
 import spack.spec
 import spack.store
@@ -59,6 +60,8 @@ def enable(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
     sandbox.allow_write(os.devnull)
 
     # Allow read access to sbang, which might be needed to run build scripts.
+    sandbox.allow_read(spack.paths.prefix)
+    sandbox.allow_read(spec.package.package_dir)
     sandbox.allow_read(os.path.join(spack.store.STORE.unpadded_root, "bin", "sbang"))
     for upstream_db in spack.store.STORE.upstreams or []:
         sandbox.allow_read(os.path.join(upstream_db.root, "bin", "sbang"))
