@@ -105,6 +105,7 @@ class ChildInfo:
         "notifier",
         "log_path",
         "prefix_lock",
+        "prefix_pivoter",
         "state_buffer",
     )
 
@@ -117,6 +118,7 @@ class ChildInfo:
         control_w_conn: IpcChannel,
         notifier: ProcessExitNotifier,
         log_path: str,
+        prefix_pivoter: Optional["PrefixPivoter"] = None,
     ) -> None:
         self.proc = proc
         self.spec = spec
@@ -126,6 +128,7 @@ class ChildInfo:
         self.notifier = notifier
         self.log_path = log_path
         self.prefix_lock: Optional[spack.util.lock.Lock] = None
+        self.prefix_pivoter = prefix_pivoter
         # Buffer for partially received state data from this child. Kept as raw bytes and split on
         # b"\n": the newline byte cannot occur inside a multi-byte UTF-8 sequence, so framing is
         # safe without decoding partial reads.
@@ -138,6 +141,31 @@ class ChildInfo:
             except Exception:
                 pass
         self.prefix_lock = None
+
+    def commit_prefix(self) -> None:
+        """Commit a successful build by discarding its saved original prefix."""
+        if self.prefix_pivoter is None:
+            return
+
+        prefix_pivoter, self.prefix_pivoter = self.prefix_pivoter, None
+        prefix_pivoter.commit()
+
+    def rollback_prefix(self, exit_code: int) -> None:
+        """Roll back a failed build and release ownership of its prefix pivot.
+
+        Args:
+            exit_code: Worker exit code. A build-cache miss always restores the original prefix,
+                even when failed build prefixes would otherwise be kept.
+        """
+        if self.prefix_pivoter is None:
+            return
+
+        prefix_pivoter, self.prefix_pivoter = self.prefix_pivoter, None
+        if exit_code == ExitCode.BUILD_CACHE_MISS:
+            error_type = BinaryCacheMiss
+        else:
+            error_type = RuntimeError
+        prefix_pivoter.rollback(error_type)
 
     def register_with_selector(self, selector: selectors.BaseSelector, build_id: str) -> None:
         """Register output, state, and sentinel channels with the selector."""
@@ -169,6 +197,10 @@ class ChildInfo:
         self.proc.join()
         exit_code = self.proc.exitcode
         assert exit_code is not None, "Finished build should have exit code set"
+        if exit_code == ExitCode.SUCCESS:
+            self.commit_prefix()
+        else:
+            self.rollback_prefix(exit_code)
         if hasattr(self.proc, "close"):  # No known equivalent in Python 3.6
             self.proc.close()
         return exit_code
@@ -235,7 +267,7 @@ def install_from_buildcache(
 
 
 class PrefixPivoter:
-    """Manages the installation prefix of a build."""
+    """Save an existing install prefix and either commit or roll back its replacement."""
 
     def __init__(self, prefix: str, keep_prefix: bool = False) -> None:
         """Initialize the prefix pivoter.
@@ -267,13 +299,25 @@ class PrefixPivoter:
     ) -> None:
         """Exit the context: cleanup on success, restore on failure."""
         if exc_type is None:
-            # Success: remove the backup
-            if self.tmp_prefix is not None:
-                self._rmtree_ignore_errors(self.tmp_prefix)
+            self.commit()
             return
 
-        # Failure handling:
-        if self.keep_prefix and not issubclass(exc_type, BinaryCacheMiss):
+        self.rollback(exc_type)
+
+    def commit(self) -> None:
+        """Commit the new prefix by discarding the saved original prefix."""
+        if self.tmp_prefix is not None:
+            self._rmtree_ignore_errors(self.tmp_prefix)
+
+    def rollback(self, error_type: type) -> None:
+        """Handle a failed build by restoring, removing, or retaining its prefix.
+
+        Args:
+            error_type: Exception type representing the failure. ``BinaryCacheMiss`` bypasses
+                ``keep_prefix`` because it is a scheduling outcome rather than a build failure.
+        """
+
+        if self.keep_prefix and not issubclass(error_type, BinaryCacheMiss):
             # Leave the failed prefix in place, discard the backup. Except for binary cache misses,
             # which is a scheduling failure and not a build failure.
             if self.tmp_prefix is not None:
@@ -416,8 +460,7 @@ def worker_function(
     exit_code = ExitCode.SUCCESS
 
     try:
-        with PrefixPivoter(spec.prefix, request.keep_prefix):
-            _install(request, state_stream, spack.store.STORE)
+        _install(request, state_stream, spack.store.STORE)
     except spack.error.StopPhase:
         exit_code = ExitCode.STOPPED_AT_PHASE
     except ProcessError as e:
@@ -686,7 +729,18 @@ def _install(
 
 
 def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
-    """Start a new build in a child process."""
+    """Pivot the install prefix and start its build in a child process.
+
+    The launcher retains the prefix pivot so it can commit or roll back after the sandboxed
+    worker exits.
+
+    Args:
+        request: Description of the build to launch.
+        jobserver: Shared build jobserver inherited by the child process.
+
+    Returns:
+        Handle that owns the child process, IPC channels, and prefix pivot.
+    """
     spec = request.spec
     channels = create_build_channels()
 
@@ -696,6 +750,8 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
 
     # As a performance optimization, we do not serialize the environment which
     # is slow to serialize and not needed in the build job
+    prefix_pivoter = PrefixPivoter(spec.prefix, request.keep_prefix)
+    prefix_pivoter.__enter__()
     proc = Process(
         target=worker_function,
         args=(
@@ -708,7 +764,11 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
             GlobalStateMarshaler(serialize_env=False),
         ),
     )
-    proc.start()
+    try:
+        proc.start()
+    except BaseException:
+        prefix_pivoter.__exit__(*sys.exc_info())
+        raise
 
     # The parent process does not need the write ends of the main pipes or the read end of control.
     channels.close_child_ends()
@@ -721,6 +781,7 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
         channels.control_w,
         ExitNotifier(proc),
         request.log_path,
+        prefix_pivoter,
     )
 
 
