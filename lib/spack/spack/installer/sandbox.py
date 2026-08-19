@@ -8,9 +8,11 @@ platform sandbox implementation in :mod:`spack.sandbox`.
 """
 
 import os
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
-from typing import Set
+from typing import List, Set
 
 import spack.error
 import spack.paths
@@ -35,6 +37,82 @@ HOST_RUNTIME_READ_PATHS = (
 HOST_COMPILER_READ_PATHS = ("/usr/include",)
 #: Language virtuals whose concrete edges identify selected compiler drivers.
 COMPILER_LANGUAGES = ("c", "cxx", "fortran")
+#: Subordinate executables that compiler drivers may invoke.
+COMPILER_PROGRAMS = ("cc1", "cc1plus", "f951", "collect2", "lto1", "lto-wrapper", "cpp")
+BINUTILS_PROGRAMS = ("as", "ld", "ar", "ranlib", "strip")
+COREUTILS_INSTALL_PROGRAMS = ("chmod", "cp", "install", "ln", "mkdir", "mv", "rm")
+COREUTILS_FILE_PROGRAMS = ("cat", "cut", "ls", "touch", "wc")
+COREUTILS_UTIL_PROGRAMS = ("basename", "dirname", "env", "expr", "pwd", "sort", "tr", "uname")
+BUILD_UTILITIES_PROGRAMS = ("find", "git", "grep", "ldd", "which", "xargs")
+SCRIPT_INTERPRETER_PROGRAMS = ("awk", "bash", "perl", "sed")
+BUILD_PROGRAMS = (
+    COMPILER_PROGRAMS
+    + BINUTILS_PROGRAMS
+    + COREUTILS_INSTALL_PROGRAMS
+    + COREUTILS_FILE_PROGRAMS
+    + COREUTILS_UTIL_PROGRAMS
+    + BUILD_UTILITIES_PROGRAMS
+    + SCRIPT_INTERPRETER_PROGRAMS
+)
+#: Support files that compiler drivers may pass to subordinate tools.
+COMPILER_FILES = ("liblto_plugin.so",)
+
+
+def compiler_support_paths(compiler_path: str) -> List[str]:
+    """Return support programs and files reported by a selected compiler driver.
+
+    Args:
+        compiler_path: Absolute path to the configured compiler driver.
+
+    Returns:
+        Absolute paths to compiler frontends, assembler/linker programs, and plugins that exist
+        outside the compiler driver's own sandbox rule.
+    """
+    result = []
+    for program in BUILD_PROGRAMS:
+        try:
+            completed = subprocess.run(
+                [compiler_path, f"-print-prog-name={program}"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            continue
+
+        if completed.returncode != 0:
+            continue
+        reported_path = completed.stdout.strip()
+        if not reported_path or reported_path == program:
+            for search_path in (None, os.defpath):
+                resolved = shutil.which(program, path=search_path)
+                if resolved:
+                    result.append(resolved)
+            continue
+        if os.path.isabs(reported_path):
+            result.append(reported_path)
+
+    for filename in COMPILER_FILES:
+        try:
+            completed = subprocess.run(
+                [compiler_path, f"-print-file-name={filename}"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        except OSError:
+            continue
+
+        reported_path = completed.stdout.strip()
+        if (
+            completed.returncode == 0
+            and reported_path != filename
+            and os.path.isabs(reported_path)
+        ):
+            result.append(reported_path)
+    return result
 
 
 def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) -> None:
@@ -60,6 +138,8 @@ def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) 
 
     for compiler_path in compiler_paths:
         sandbox.allow_read(compiler_path)
+        for program_path in compiler_support_paths(compiler_path):
+            sandbox.allow_read(program_path)
         real_compiler_path = Path(compiler_path).resolve()
         if real_compiler_path.exists() and str(real_compiler_path).startswith("/usr/"):
             for path in HOST_COMPILER_READ_PATHS:
