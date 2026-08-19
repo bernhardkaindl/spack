@@ -13,7 +13,8 @@ if sys.platform != "linux":
 import os
 import pathlib
 import tempfile
-from typing import List, Tuple
+from types import SimpleNamespace
+from typing import List, Tuple, cast
 
 import spack.concretize
 import spack.config
@@ -21,6 +22,7 @@ import spack.installer.sandbox
 import spack.installer_dispatch
 import spack.paths
 import spack.sandbox
+import spack.spec
 import spack.store
 
 
@@ -162,6 +164,32 @@ class MockSandbox(spack.sandbox.Sandbox):
 
     def apply(self, restrict_filesystem=True, restrict_network=False):
         self.apply_calls.append((restrict_filesystem, restrict_network))
+
+
+def test_allow_selected_compiler_paths(tmp_path: pathlib.Path):
+    """Allow selected C/C++ drivers once while leaving unselected Fortran inaccessible."""
+    compiler_dir = tmp_path / "compiler" / "bin"
+    compiler_dir.mkdir(parents=True)
+    compiler_paths = {
+        language: str(compiler_dir / executable)
+        for language, executable in (("c", "cc"), ("cxx", "c++"), ("fortran", "fc"))
+    }
+    for path in compiler_paths.values():
+        pathlib.Path(path).touch()
+
+    compiler_spec = SimpleNamespace(extra_attributes={"compilers": compiler_paths})
+    selected_edge = SimpleNamespace(spec=compiler_spec, virtuals=("c", "cxx"))
+    node = SimpleNamespace(edges_to_dependencies=lambda: [selected_edge, selected_edge])
+    spec = SimpleNamespace(traverse=lambda: [node])
+    sandbox = MockSandbox()
+
+    spack.installer.sandbox.allow_compiler_paths(sandbox, cast(spack.spec.Spec, spec))
+
+    allowed = [resolved for _, resolved in sandbox.read_calls]
+    assert pathlib.Path(compiler_paths["c"]).resolve() in allowed
+    assert pathlib.Path(compiler_paths["cxx"]).resolve() in allowed
+    assert pathlib.Path(compiler_paths["fortran"]).resolve() not in allowed
+    assert len(allowed) == 2
 
 
 def test_enable_sandbox_paths(
