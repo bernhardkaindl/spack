@@ -19,6 +19,7 @@ import spack.store
 import spack.util.lang
 from spack.installer.install_metadata import InstallMetadataError, publish_install_metadata
 from spack.installer.install_tree import InstallTreeError, install_tree_metadata
+from spack.installer.post_actions import PostActionError, run_post_actions, validate_post_actions
 from spack.solver.concretize_worker import (
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
@@ -398,6 +399,7 @@ def _install_prepared_sandboxed(
     repositories: List[Union[str, spack.repo.Repo]],
     timeout: float,
     log_path: Optional[Path],
+    post_actions: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build and publish trusted metadata inside a parent-owned prefix transaction."""
     response = run_build_phases_sandboxed(
@@ -411,10 +413,12 @@ def _install_prepared_sandboxed(
         log_path=log_path,
     )
     try:
-        metadata = publish_install_metadata(spec, prefix, response["install_tree"])
-    except InstallMetadataError as error:
+        actions = [] if post_actions is None else post_actions
+        action_result = run_post_actions(spec, prefix, actions, response["install_tree"])
+        metadata = publish_install_metadata(spec, prefix, action_result["install_tree"])
+    except (InstallMetadataError, PostActionError) as error:
         raise SandboxedBuildPhaseError(str(error)) from error
-    return {**response, "install_metadata": metadata}
+    return {**response, "post_actions": action_result, "install_metadata": metadata}
 
 
 def install_prepared_registered_sandboxed(
@@ -429,6 +433,7 @@ def install_prepared_registered_sandboxed(
     timeout: float = 120.0,
     keep_failed_prefix: bool = False,
     log_path: Optional[Path] = None,
+    post_actions: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Install at the store projection under its prefix lock and register it."""
     from spack.installer.build import PrefixPivoter
@@ -436,6 +441,11 @@ def install_prepared_registered_sandboxed(
     store = spack.util.lang.ensure_unwrapped(store)
     if not isinstance(store, spack.store.Store):
         raise SandboxedBuildPhaseError("registered install requires a Store")
+    actions = [] if post_actions is None else post_actions
+    try:
+        validate_post_actions(actions)
+    except PostActionError as error:
+        raise SandboxedBuildPhaseError(str(error)) from error
     prefix = Path(store.layout.path_for_spec(spec)).resolve()
     prefix.parent.mkdir(parents=True, exist_ok=True)
     with store.prefix_locker.write_lock(spec):
@@ -449,6 +459,7 @@ def install_prepared_registered_sandboxed(
                 repositories=repositories,
                 timeout=timeout,
                 log_path=log_path,
+                post_actions=post_actions,
             )
             try:
                 store.db.add(spec, explicit=explicit)

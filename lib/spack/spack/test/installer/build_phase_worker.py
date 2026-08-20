@@ -10,11 +10,13 @@ import hashlib
 import io
 import os
 import socket
+import stat
 import tarfile
 from pathlib import Path
 
 import pytest
 
+import spack.config
 import spack.hooks
 import spack.installer.build_phase_worker
 import spack.repo
@@ -443,6 +445,137 @@ def test_install_prepared_rolls_back_database_failure(
 
     assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
     assert not (prefix / "new.txt").exists()
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_runs_typed_permission_action(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
+):
+    """Apply an allowlisted parent permission action before metadata and registration."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-permissions",
+        """    def install(self, spec, prefix):
+        \"\"\"Create modes and a symlink for trusted normalization.\"\"\"
+        import os
+        from pathlib import Path
+        binary = Path(prefix).joinpath("bin")
+        binary.mkdir(mode=0o700)
+        tool = binary.joinpath("tool")
+        tool.write_text("tool")
+        tool.chmod(0o700)
+        binary.joinpath("data").write_text("data")
+        os.symlink("tool", binary.joinpath("tool-link"))
+""",
+    )
+
+    with spack.config.CONFIG.override(
+        "packages:all:permissions:read", "world"
+    ), spack.config.CONFIG.override("packages:all:permissions:write", "user"):
+        response = install_prepared_registered_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            ["install"],
+            store=temporary_store,
+            repositories=repositories,
+            post_actions=["set_permissions"],
+        )
+
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    assert stat.S_IMODE((prefix / "bin").stat().st_mode) == 0o2755
+    assert stat.S_IMODE((prefix / "bin" / "tool").stat().st_mode) == 0o755
+    assert stat.S_IMODE((prefix / "bin" / "data").stat().st_mode) == 0o644
+    assert os.readlink(prefix / "bin" / "tool-link") == "tool"
+    assert response["post_actions"]["actions"] == [
+        {
+            "type": "set_permissions",
+            "entries": 4,
+            "file_mode": 0o755,
+            "directory_mode": 0o2755,
+            "group": None,
+        }
+    ]
+    assert response["install_metadata"]["install_tree"] == install_tree_metadata(prefix)
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_rejects_unknown_post_action(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
+):
+    """Reject an untyped privileged action and restore the previous prefix."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-action-rejected",
+        """    def install(self, spec, prefix):
+        \"\"\"Create output that must roll back after action validation.\"\"\"
+        from pathlib import Path
+        Path(prefix).joinpath("new.txt").write_text("new")
+        Path(self.stage.source_path).joinpath("worker-ran").write_text("worker ran")
+""",
+    )
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    prefix.mkdir(parents=True)
+    (prefix / "original.txt").write_text("original", encoding="utf-8")
+
+    with pytest.raises(SandboxedBuildPhaseError, match="invalid parent post-action list"):
+        install_prepared_registered_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            ["install"],
+            store=temporary_store,
+            repositories=repositories,
+            post_actions=["run_all_hooks"],
+        )
+
+    assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
+    assert not (prefix / "new.txt").exists()
+    assert not (prepared.path / "worker-ran").exists()
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_rejects_unsafe_permission_action(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
+):
+    """Reject unsafe SUID permissions and restore the previous prefix."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-unsafe-permissions",
+        """    def install(self, spec, prefix):
+        \"\"\"Create a SUID file that must not become group writable.\"\"\"
+        from pathlib import Path
+        tool = Path(prefix).joinpath("tool")
+        tool.write_text("tool")
+        tool.chmod(0o4700)
+""",
+    )
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    prefix.mkdir(parents=True)
+    (prefix / "original.txt").write_text("original", encoding="utf-8")
+
+    with spack.config.CONFIG.override(
+        "packages:all:permissions:read", "world"
+    ), spack.config.CONFIG.override("packages:all:permissions:write", "group"):
+        with pytest.raises(SandboxedBuildPhaseError, match="writable SUID"):
+            install_prepared_registered_sandboxed(
+                concrete,
+                plan,
+                prepared,
+                ["install"],
+                store=temporary_store,
+                repositories=repositories,
+                post_actions=["set_permissions"],
+            )
+
+    assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
+    assert not (prefix / "tool").exists()
 
 
 @pytest.mark.use_package_hash
