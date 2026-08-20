@@ -169,23 +169,23 @@ def test_dependency_built_before_dependent(temporary_store, mock_packages):
     [
         (
             "all",
-            {"enable": True, "restrict_filesystem": True, "restrict_network": True},
-            {"enable": True, "restrict_filesystem": True, "restrict_network": True},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem", "network"]}},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem", "network"]}},
         ),
         (
             "root",
-            {"enable": False, "restrict_filesystem": True, "restrict_network": True},
-            {"enable": True, "restrict_filesystem": True, "restrict_network": True},
+            {"enable": False, "defaults": {"policy": "allow", "deny": ["filesystem", "network"]}},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem", "network"]}},
         ),
         (
             "network",
-            {"enable": True, "restrict_filesystem": False, "restrict_network": True},
-            {"enable": True, "restrict_filesystem": False, "restrict_network": True},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["network"]}},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["network"]}},
         ),
         (
             "filesystem",
-            {"enable": True, "restrict_filesystem": True, "restrict_network": False},
-            {"enable": True, "restrict_filesystem": True, "restrict_network": False},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem"]}},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem"]}},
         ),
     ],
 )

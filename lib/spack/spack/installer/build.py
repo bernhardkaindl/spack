@@ -21,7 +21,7 @@ import tempfile
 import traceback
 from gzip import GzipFile
 from multiprocessing import Process
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional
 
 from spack.vendor.typing_extensions import Protocol
 
@@ -368,7 +368,7 @@ class BuildRequest(NamedTuple):
     fake: bool
     install_source: bool
     run_tests: bool
-    sandbox_config: Optional[Dict[str, bool]]
+    sandbox_config: Optional[Dict[str, Any]]
     log_path: str
     stop_before: Optional[str]
     stop_at: Optional[str]

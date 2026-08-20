@@ -47,11 +47,14 @@ def create_installer(
     use_old_installer = spack.config.CONFIG.get("config:installer", "new") == "old"
 
     sandbox_config = spack.config.CONFIG.get("config:sandbox", {})
+    from spack.installer import sandbox as build_sandbox
+
     sandbox_enabled = sandbox is not None or (
         sandbox_config.get("enable", False)
-        and (
-            sandbox_config.get("restrict_filesystem", True)
-            or spack.sandbox.network_restriction_enabled(sandbox_config)
+        and any(
+            any(build_sandbox.resolve_restrictions(sandbox_config, spec))
+            for pkg in packages
+            for spec in pkg.spec.traverse()
         )
     )
     if sandbox_enabled:

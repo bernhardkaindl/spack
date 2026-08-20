@@ -254,6 +254,48 @@ properties: Dict[str, Any] = {
                         "type": "boolean",
                         "description": "Deprecated inverse of restrict_network.",
                     },
+                    "defaults": {
+                        "type": "object",
+                        "description": "Default access policy for sandboxed resources.",
+                        "additionalProperties": False,
+                        "required": ["policy"],
+                        "properties": {
+                            "policy": {"type": "string", "enum": ["allow", "deny"]},
+                            "allow": {
+                                "type": "array",
+                                "items": {"enum": ["all", "network", "filesystem"]},
+                                "uniqueItems": True,
+                            },
+                            "deny": {
+                                "type": "array",
+                                "items": {"enum": ["all", "network", "filesystem"]},
+                                "uniqueItems": True,
+                            },
+                        },
+                    },
+                    "overrides": {
+                        "type": "array",
+                        "description": "Access policy overrides selected by concrete specs.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["spec"],
+                            "anyOf": [{"required": ["allow"]}, {"required": ["deny"]}],
+                            "properties": {
+                                "spec": {"type": "string", "minLength": 1},
+                                "allow": {
+                                    "type": "array",
+                                    "items": {"enum": ["all", "network", "filesystem"]},
+                                    "uniqueItems": True,
+                                },
+                                "deny": {
+                                    "type": "array",
+                                    "items": {"enum": ["all", "network", "filesystem"]},
+                                    "uniqueItems": True,
+                                },
+                            },
+                        },
+                    },
                     "allow_read": {
                         "type": "array",
                         "items": {"type": "string"},

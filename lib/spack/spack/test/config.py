@@ -879,17 +879,39 @@ def test_sandbox_updates_legacy_allow_network(sandbox_config, expected):
     assert data["config"]["sandbox"] == expected
 
 
-def test_sandbox_accepts_independent_restrictions():
+def test_sandbox_accepts_policy_defaults_and_overrides():
     check_schema(
         spack.schema.config.schema,
         """\
 config:
     sandbox:
         enable: true
-        restrict_filesystem: false
-        restrict_network: true
+        defaults:
+            policy: deny
+            allow: []
+            deny: [network, filesystem]
+        overrides:
+        - spec: "py-tensorboard-data-server@0.7.3: +rocm"
+          allow: [network]
+          deny: [filesystem]
 """,
     )
+
+
+def test_sandbox_rejects_unknown_policy_resource(tmp_path):
+    error = get_config_error(
+        str(tmp_path / "config.yaml"),
+        spack.schema.config.schema,
+        """\
+config:
+    sandbox:
+        defaults:
+            policy: deny
+            allow: [processes]
+""",
+    )
+
+    assert "processes" in str(error)
 
 
 def test_sandbox_installer_accepts_strict_policy():

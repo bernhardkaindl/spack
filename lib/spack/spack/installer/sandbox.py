@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import spack.error
 import spack.paths
@@ -110,6 +110,64 @@ BUILD_TOOLS = (
 )
 #: Support files that compiler drivers may pass to subordinate tools.
 COMPILER_FILES = ("liblto_plugin.so",)
+SANDBOX_RESOURCES = ("network", "filesystem")
+
+
+def _apply_policy_rule(restrictions: Dict[str, bool], rule: dict) -> None:
+    """Apply one allow/deny rule, with deny taking precedence within the rule."""
+    allowed = set(rule.get("allow", ()))
+    denied = set(rule.get("deny", ()))
+    if "all" in allowed:
+        allowed.update(SANDBOX_RESOURCES)
+    if "all" in denied:
+        denied.update(SANDBOX_RESOURCES)
+    for resource in allowed & set(SANDBOX_RESOURCES):
+        restrictions[resource] = False
+    for resource in denied & set(SANDBOX_RESOURCES):
+        restrictions[resource] = True
+
+
+def resolve_restrictions(
+    config: dict, spec: Optional[spack.spec.Spec] = None
+) -> Tuple[bool, bool]:
+    """Resolve filesystem and network restrictions for an optional concrete spec."""
+    defaults = config.get("defaults")
+    if defaults is None:
+        restrictions: Dict[str, bool] = {
+            "filesystem": bool(config.get("restrict_filesystem", True)),
+            "network": spack.sandbox.network_restriction_enabled(config),
+        }
+    else:
+        restricted_by_default = defaults.get("policy", "deny") == "deny"
+        restrictions = {
+            "filesystem": restricted_by_default,
+            "network": restricted_by_default,
+        }
+        _apply_policy_rule(restrictions, defaults)
+
+    if "restrict_filesystem" in config:
+        restrictions["filesystem"] = bool(config["restrict_filesystem"])
+    if "restrict_network" in config:
+        restrictions["network"] = bool(config["restrict_network"])
+    elif "allow_network" in config:
+        restrictions["network"] = not bool(config["allow_network"])
+
+    if spec is not None:
+        overridden = set()
+        for override in config.get("overrides", ()):
+            if spec.satisfies(override["spec"]):
+                matched: Dict[str, bool] = restrictions.copy()
+                _apply_policy_rule(matched, override)
+                allowed = set(override.get("allow", ()))
+                denied = set(override.get("deny", ()))
+                resources = (
+                    set(SANDBOX_RESOURCES) if "all" in allowed | denied else allowed | denied
+                )
+                for resource in resources - overridden:
+                    restrictions[resource] = matched[resource]
+                    overridden.add(resource)
+
+    return restrictions["filesystem"], restrictions["network"]
 
 
 def compiler_support_paths(compiler_path: str) -> List[str]:
@@ -197,8 +255,7 @@ def enable(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
     if not config.get("enable", False):
         return
 
-    restrict_filesystem = config.get("restrict_filesystem", True)
-    restrict_network = spack.sandbox.network_restriction_enabled(config)
+    restrict_filesystem, restrict_network = resolve_restrictions(config, spec)
     if not restrict_filesystem and not restrict_network:
         return
 

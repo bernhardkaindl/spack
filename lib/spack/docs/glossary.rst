@@ -490,7 +490,7 @@ For an alphabetic list of every documented keyword and environment variable, see
    sandboxing
       An opt-in Linux build isolation mode that confines a package's :term:`build phase`
       using Landlock, restricting filesystem and (optionally) network access. Configured under
-      ``config:sandbox:`` with independent ``restrict_filesystem`` and ``restrict_network``
+      ``config:sandbox:`` with resource defaults and package-specific policy overrides
       switches; intended for reproducibility and bug containment, not as a strict security
       boundary.
       See :doc:`installing`.

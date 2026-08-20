@@ -752,10 +752,14 @@ class PackageInstaller:
         is_root = dag_hash in self.build_graph.roots
         sandbox_config = None
         if self.sandbox is not None:
+            denied = []
+            if self.sandbox in ("all", "root", "filesystem"):
+                denied.append("filesystem")
+            if self.sandbox in ("all", "root", "network"):
+                denied.append("network")
             sandbox_config = {
                 "enable": self.sandbox != "root" or is_root,
-                "restrict_filesystem": self.sandbox in ("all", "root", "filesystem"),
-                "restrict_network": self.sandbox in ("all", "root", "network"),
+                "defaults": {"policy": "allow", "deny": denied},
             }
         # Both possible sub-processes (cache install, source build) append to the same log file.
         if dag_hash not in self.log_paths:

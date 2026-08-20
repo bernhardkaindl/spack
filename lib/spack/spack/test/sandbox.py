@@ -83,6 +83,35 @@ def test_network_restriction_compatibility(config, expected):
     assert spack.sandbox.network_restriction_enabled(config) is expected
 
 
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ({"defaults": {"policy": "deny"}}, (True, True)),
+        ({"defaults": {"policy": "allow"}}, (False, False)),
+        ({"defaults": {"policy": "allow", "allow": ["all"], "deny": ["network"]}}, (False, True)),
+        (
+            {"defaults": {"policy": "deny", "allow": ["network"], "deny": ["filesystem"]}},
+            (True, False),
+        ),
+    ],
+)
+def test_resolve_sandbox_defaults(config, expected):
+    assert spack.installer.sandbox.resolve_restrictions(config) == expected
+
+
+def test_resolve_sandbox_overrides_use_first_resource_match():
+    spec = spack.spec.Spec("pkg@2.0+shared %gcc@13 ^zlib@1.3")
+    config = {
+        "defaults": {"policy": "deny"},
+        "overrides": [
+            {"spec": "pkg@2: +shared %gcc@13: ^zlib@1:", "allow": ["network"]},
+            {"spec": "pkg@2.0", "allow": ["filesystem"], "deny": ["network"]},
+        ],
+    }
+
+    assert spack.installer.sandbox.resolve_restrictions(config, spec) == (False, False)
+
+
 def test_landlock_sandbox_syscall_args(tmp_path: pathlib.Path):
     """Test that LandlockSandbox passes correct arguments to each syscall."""
     sandbox = SpyLandlockSandbox(abi_version=3)
@@ -282,6 +311,7 @@ def test_allow_direct_compiler_dependency_paths(tmp_path: pathlib.Path):
         "egrep",
         "realpath",
         "split",
+        "md5sum",
     ],
 )
 def test_compiler_support_paths_resolve_bare_tools_on_host_path(monkeypatch, program):
@@ -371,6 +401,10 @@ def test_enable_sandbox_paths(
     assert pathlib.Path(spec.prefix).resolve() in allow_write_resolved
     assert custom_write.resolve() in allow_write_resolved
     assert pathlib.Path(tempfile.gettempdir()).resolve() in allow_write_resolved
+    for path in spack.installer.sandbox.HOST_RUNTIME_WRITE_PATHS:
+        resolved = pathlib.Path(path).resolve()
+        if resolved.exists():
+            assert resolved in allow_write_resolved
 
     assert mock_sandbox.apply_calls == [(True, True)]
 
