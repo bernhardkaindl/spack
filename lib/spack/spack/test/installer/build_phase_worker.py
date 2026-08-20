@@ -7,19 +7,22 @@
 import copy
 import hashlib
 import io
-from pathlib import Path
+import os
 import socket
 import tarfile
+from pathlib import Path
 
 import pytest
 
 import spack.hooks
+import spack.installer.build_phase_worker
 import spack.repo
 from spack.installer.build_phase_worker import (
     SandboxedBuildPhaseError,
     install_prepared_sandboxed,
     run_build_phase_sandboxed,
 )
+from spack.installer.install_tree import InstallTreeError, install_tree_metadata
 from spack.solver.concretize_worker import concretize_one_sandboxed, plan_sources_sandboxed
 from spack.solver.prepared_stage import (
     PreparedStage,
@@ -186,6 +189,87 @@ def test_build_log_does_not_replace_existing_file(
 
     assert log_path.read_text(encoding="utf-8") == "existing"
     assert not (tmp_path / "prefix").exists()
+
+
+@pytest.mark.use_package_hash
+def test_build_response_binds_install_tree(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    """Bind regular files, directories, modes, and symlinks to the build response."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-tree",
+        """    def install(self, spec, prefix):
+        \"\"\"Create representative install-tree entries.\"\"\"
+        import os
+        from pathlib import Path
+        binary = Path(prefix).joinpath("bin")
+        binary.mkdir()
+        executable = binary.joinpath("tool")
+        executable.write_text("tool")
+        executable.chmod(0o755)
+        os.symlink("tool", binary.joinpath("tool-link"))
+""",
+    )
+    prefix = tmp_path / "prefix"
+
+    response = run_build_phase_sandboxed(
+        concrete, plan, prepared, "install", prefix=prefix, repositories=repositories
+    )
+
+    assert response["install_tree"] == install_tree_metadata(prefix)
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_rolls_back_unverified_tree(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
+):
+    """Restore the old prefix when parent and worker install-tree identities differ."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-tree-mismatch",
+        """    def install(self, spec, prefix):
+        \"\"\"Create output that must not commit without parent verification.\"\"\"
+        from pathlib import Path
+        Path(prefix).joinpath("new.txt").write_text("new")
+""",
+    )
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    (prefix / "original.txt").write_text("original", encoding="utf-8")
+
+    def mismatched_install_tree(path):
+        """Return validly shaped metadata that cannot match the worker result."""
+        metadata = install_tree_metadata(path)
+        return {**metadata, "sha256": "0" * 64}
+
+    monkeypatch.setattr(
+        spack.installer.build_phase_worker, "install_tree_metadata", mismatched_install_tree
+    )
+    with pytest.raises(SandboxedBuildPhaseError, match="changed after worker verification"):
+        install_prepared_sandboxed(
+            concrete, plan, prepared, ["install"], prefix=prefix, repositories=repositories
+        )
+
+    assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
+    assert not (prefix / "new.txt").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires POSIX special files")
+def test_install_tree_metadata_rejects_special_files(tmp_path):
+    """Fail closed when an install tree contains an unsupported special file."""
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    (prefix / "regular").write_text("regular", encoding="utf-8")
+    fifo = prefix / "fifo"
+    os.mkfifo(fifo)
+
+    with pytest.raises(InstallTreeError, match="unsupported install-tree entry: fifo"):
+        install_tree_metadata(prefix)
 
 
 @pytest.mark.use_package_hash

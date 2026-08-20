@@ -6,15 +6,14 @@
 
 import json
 import os
-from pathlib import Path
 import re
 import resource
-from types import SimpleNamespace
 import sys
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict
 
-
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_PHASES = 32
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 _PHASE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
@@ -188,6 +187,7 @@ def _run_phases(request: Dict[str, Any], repositories):
     import spack.build_environment
     import spack.builder
     import spack.platforms
+    from spack.installer.install_tree import install_tree_metadata
     from spack.solver.prepared_stage import prepared_stage_digest, source_plan_digest
     from spack.solver.source_plan import validate_source_plan
     from spack.spec import Spec
@@ -237,6 +237,7 @@ def _run_phases(request: Dict[str, Any], repositories):
         "source_plan_sha256": request["source_plan_sha256"],
         "initial_stage_sha256": initial_stage_sha256,
         "final_stage_sha256": prepared_stage_digest(Path(request["prepared_stage"])),
+        "install_tree": install_tree_metadata(Path(request["prefix"])),
     }
 
 

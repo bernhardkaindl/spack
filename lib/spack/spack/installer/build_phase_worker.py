@@ -6,15 +6,16 @@
 
 import hashlib
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import spack.error
 import spack.repo
+from spack.installer.install_tree import InstallTreeError, install_tree_metadata
 from spack.solver.concretize_worker import (
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
@@ -31,8 +32,7 @@ from spack.solver.repository_snapshot import RepositorySnapshotError, repository
 from spack.solver.source_plan import SourcePlanError, validate_source_plan
 from spack.spec import Spec
 
-
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_PHASES = 32
 MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
 _PHASE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
@@ -53,7 +53,10 @@ def _build_log_metadata(path: Path) -> Dict[str, Any]:
     digest = hashlib.sha256()
     size = 0
     with path.open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
             size += len(chunk)
             if size > MAX_BUILD_LOG_BYTES:
                 raise SandboxedBuildPhaseError("worker build log is too large")
@@ -73,6 +76,26 @@ def _repository_identities(repositories: List[Dict[str, Any]]) -> List[Dict[str,
     ]
 
 
+def _validate_install_tree_metadata(metadata: Any) -> None:
+    """Validate bounded install-tree metadata returned by the worker."""
+    if not isinstance(metadata, dict) or set(metadata) != {"sha256", "entries", "bytes"}:
+        raise SandboxedBuildPhaseError("worker returned invalid install-tree metadata")
+    if (
+        not isinstance(metadata["sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is None
+    ):
+        raise SandboxedBuildPhaseError("worker returned invalid install-tree metadata")
+    if (
+        not isinstance(metadata["entries"], int)
+        or isinstance(metadata["entries"], bool)
+        or metadata["entries"] < 1
+        or not isinstance(metadata["bytes"], int)
+        or isinstance(metadata["bytes"], bool)
+        or metadata["bytes"] < 0
+    ):
+        raise SandboxedBuildPhaseError("worker returned invalid install-tree metadata")
+
+
 def _validate_response(
     response: Dict[str, Any],
     *,
@@ -81,6 +104,7 @@ def _validate_response(
     source_plan_sha256: str,
     initial_stage_sha256: str,
     prepared_stage: Path,
+    prefix: Path,
     repositories: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Validate a successful worker response and its post-phase identities."""
@@ -108,6 +132,7 @@ def _validate_response(
         "source_plan_sha256",
         "initial_stage_sha256",
         "final_stage_sha256",
+        "install_tree",
     }
     if set(response) != expected_fields:
         raise SandboxedBuildPhaseError("worker success response has unexpected fields")
@@ -154,6 +179,13 @@ def _validate_response(
         raise SandboxedBuildPhaseError("worker returned an invalid prepared-stage identity")
     if prepared_stage_digest(prepared_stage) != final_stage_sha256:
         raise SandboxedBuildPhaseError("prepared stage changed after worker verification")
+    _validate_install_tree_metadata(response["install_tree"])
+    try:
+        parent_install_tree = install_tree_metadata(prefix)
+    except InstallTreeError as error:
+        raise SandboxedBuildPhaseError(f"cannot verify install tree: {error}") from error
+    if response["install_tree"] != parent_install_tree:
+        raise SandboxedBuildPhaseError("install tree changed after worker verification")
     return response
 
 
@@ -284,6 +316,7 @@ def run_build_phases_sandboxed(
                 source_plan_sha256=plan_sha256,
                 initial_stage_sha256=initial_stage_sha256,
                 prepared_stage=stage_path,
+                prefix=prefix,
                 repositories=repositories_payload,
             )
         return {**validated, "build_log": _build_log_metadata(log_path)}
