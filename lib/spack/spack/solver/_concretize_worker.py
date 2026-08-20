@@ -18,7 +18,7 @@ import sys
 from typing import Any, Dict
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 
 
@@ -126,7 +126,7 @@ def _private_configuration(request: Dict[str, Any]):
     return spack.config.create_from(scope)
 
 
-def _configure_state(request: Dict[str, Any]) -> None:
+def _configure_state(request: Dict[str, Any]):
     for path in request["clingo_paths"]:
         if not isinstance(path, str) or not os.path.isabs(path):
             raise WorkerRequestError("clingo paths must be absolute strings")
@@ -138,6 +138,7 @@ def _configure_state(request: Dict[str, Any]) -> None:
     import spack.repo
     import spack.store
     import spack.util.file_cache
+    from spack.solver.repository_snapshot import repository_digest
 
     spack.config.CONFIG = _private_configuration(request)
     cache = spack.util.file_cache.FileCache(
@@ -146,34 +147,52 @@ def _configure_state(request: Dict[str, Any]) -> None:
     spack.caches.MISC_CACHE = cache
 
     repositories = []
+    identities = []
     for description in request["repositories"]:
         if not isinstance(description, dict) or set(description) != {
             "root",
             "namespace",
             "package_api",
+            "identity",
         }:
             raise WorkerRequestError("invalid repository description")
         root = Path(description["root"])
         if not root.is_absolute():
             raise WorkerRequestError("repository roots must be absolute")
-        repository = spack.repo.Repo(str(root.resolve(strict=True)), cache=cache)
+        root = root.resolve(strict=True)
+        if repository_digest(root) != description["identity"]:
+            raise WorkerRequestError("repository snapshot identity mismatch")
+        repository = spack.repo.Repo(str(root), cache=cache)
         if repository.namespace != description["namespace"]:
             raise WorkerRequestError("repository namespace changed after validation")
         if list(repository.package_api) != description["package_api"]:
             raise WorkerRequestError("repository API changed after validation")
         repositories.append(repository)
+        identities.append(
+            {
+                "namespace": repository.namespace,
+                "package_api": list(repository.package_api),
+                "identity": description["identity"],
+            }
+        )
 
     spack.repo.enable_repo(spack.repo.RepoPath(*repositories))
     spack.store.reinitialize()
+    return identities
 
 
-def _concretize(request: Dict[str, Any]) -> Dict[str, Any]:
+def _concretize(request: Dict[str, Any]):
     import spack.concretize
 
     os.environ["SPACK_CONCRETIZER_REQUIRE_CHECKSUM"] = "yes"
     with contextlib.redirect_stdout(sys.stderr):
         spec = spack.concretize.concretize_one(request["spec"], tests=request["tests"])
-    return spec.to_dict()
+    spec_data = spec.to_dict()
+    package_hashes = [
+        {"dag_hash": node["hash"], "package_hash": node["package_hash"]}
+        for node in spec_data["spec"]["nodes"]
+    ]
+    return spec_data, package_hashes
 
 
 def _response(ok: bool, **kwargs) -> None:
@@ -190,9 +209,9 @@ def main() -> None:
         phase = "sandbox"
         abi_version = _apply_sandbox(request["state_directory"])
         phase = "prepare"
-        _configure_state(request)
+        repositories = _configure_state(request)
         phase = "concretize"
-        spec = _concretize(request)
+        spec, package_hashes = _concretize(request)
         phase = "serialize"
         _response(
             True,
@@ -202,6 +221,8 @@ def main() -> None:
                 "filesystem_restricted": True,
                 "tcp_restricted": True,
             },
+            repositories=repositories,
+            package_hashes=package_hashes,
             spec=spec,
         )
     except BaseException as error:

@@ -31,11 +31,17 @@ import spack.error
 import spack.hash_types as ht
 import spack.repo
 from spack.active_environment import active_environment
+from spack.solver.repository_snapshot import (
+    RepositorySnapshotError,
+    create_repository_snapshot,
+    repository_digest,
+    snapshot_root,
+)
 from spack.spec import Spec
 from spack.version.common import is_git_version
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 2 * 1024 * 1024
@@ -116,20 +122,30 @@ def _configuration_payload() -> Dict[str, Any]:
     return result
 
 
-def _repository_payload(repositories: List[Union[str, spack.repo.Repo]]) -> List[Dict[str, Any]]:
+def _repository_payload(
+    repositories: List[Union[str, spack.repo.Repo]], snapshot_base: Path
+) -> List[Dict[str, Any]]:
     result = []
-    for repository in repositories:
+    for index, repository in enumerate(repositories):
         repo = (
             repository
             if isinstance(repository, spack.repo.Repo)
             else spack.repo.from_path(repository)
         )
-        root = str(Path(repo.root).resolve(strict=True))
+        source = Path(repo.root).resolve(strict=True)
+        root = snapshot_root(snapshot_base, index, repo.namespace, repo.package_api)
+        try:
+            identity = create_repository_snapshot(source, root)
+        except RepositorySnapshotError as error:
+            raise SandboxedConcretizationError(
+                f"cannot snapshot repository {repo.namespace}: {error}"
+            ) from error
         result.append(
             {
-                "root": root,
+                "root": str(root),
                 "namespace": repo.namespace,
                 "package_api": list(repo.package_api),
+                "identity": identity,
             }
         )
     if not result:
@@ -209,6 +225,11 @@ def _validate_spec_payload(spec_data: Any) -> None:
         dag_hash = node.get("hash")
         if not isinstance(dag_hash, str) or not re.fullmatch(r"[a-z2-7]{32}", dag_hash):
             raise SandboxedConcretizationError("worker returned an invalid DAG hash")
+        package_hash = node.get("package_hash")
+        if not isinstance(package_hash, str) or not re.fullmatch(
+            r"[a-z2-7]{52}={4}", package_hash
+        ):
+            raise SandboxedConcretizationError("worker returned an invalid package hash")
         if dag_hash in hashes:
             raise SandboxedConcretizationError("worker returned duplicate DAG hashes")
         hashes.add(dag_hash)
@@ -260,7 +281,9 @@ def _validate_spec_payload(spec_data: Any) -> None:
         raise SandboxedConcretizationError("worker returned a disconnected spec graph")
 
 
-def _validate_success(response: Dict[str, Any], requested: Spec) -> Spec:
+def _validate_success(
+    response: Dict[str, Any], requested: Spec, repositories: List[Dict[str, Any]]
+) -> Spec:
     if response.get("protocol_version") != PROTOCOL_VERSION:
         raise SandboxedConcretizationError("worker returned an unsupported protocol version")
     if response.get("ok") is not True:
@@ -273,7 +296,14 @@ def _validate_success(response: Dict[str, Any], requested: Spec) -> Spec:
         raise SandboxedConcretizationError(
             f"worker failed during {phase} ({error_type}): {message}"
         )
-    if set(response) != {"protocol_version", "ok", "sandbox", "spec"}:
+    if set(response) != {
+        "protocol_version",
+        "ok",
+        "sandbox",
+        "repositories",
+        "package_hashes",
+        "spec",
+    }:
         raise SandboxedConcretizationError("worker success response has unexpected fields")
     sandbox = response["sandbox"]
     if not isinstance(sandbox, dict) or set(sandbox) != {
@@ -291,8 +321,33 @@ def _validate_success(response: Dict[str, Any], requested: Spec) -> Spec:
         or sandbox["tcp_restricted"] is not True
     ):
         raise SandboxedConcretizationError("worker did not apply the required restrictions")
+    expected_repositories = [
+        {
+            "namespace": repository["namespace"],
+            "package_api": repository["package_api"],
+            "identity": repository["identity"],
+        }
+        for repository in repositories
+    ]
+    if response["repositories"] != expected_repositories:
+        raise SandboxedConcretizationError("worker returned inconsistent repository identities")
+    for repository in repositories:
+        try:
+            identity = repository_digest(Path(repository["root"]))
+        except RepositorySnapshotError as error:
+            raise SandboxedConcretizationError(
+                f"cannot verify repository snapshot: {error}"
+            ) from error
+        if identity != repository["identity"]:
+            raise SandboxedConcretizationError("repository snapshot changed during concretization")
     spec_data = response["spec"]
     _validate_spec_payload(spec_data)
+    expected_package_hashes = [
+        {"dag_hash": node["hash"], "package_hash": node["package_hash"]}
+        for node in spec_data["spec"]["nodes"]
+    ]
+    if response["package_hashes"] != expected_package_hashes:
+        raise SandboxedConcretizationError("worker returned inconsistent package hash provenance")
     try:
         spec = Spec.from_dict(spec_data)
     except Exception as error:
@@ -335,16 +390,21 @@ def concretize_one_sandboxed(
         raise SandboxedConcretizationError("hash references are unsupported by this PoC")
     if any("dev_path" in node.variants for node in requested.traverse()):
         raise SandboxedConcretizationError("develop specs are unsupported by this PoC")
-    with tempfile.TemporaryDirectory(prefix="spack-concretize-sandbox-") as state_directory:
+    with tempfile.TemporaryDirectory(prefix="spack-concretize-sandbox-") as workspace:
+        state_directory = os.path.join(workspace, "state")
+        os.mkdir(state_directory, mode=0o700)
         for name in ("cache", "config", "store", "stage", "source-cache", "tmp"):
             os.mkdir(os.path.join(state_directory, name), mode=0o700)
+        repositories_payload = _repository_payload(
+            repositories, Path(workspace) / "repositories"
+        )
         request = {
             "protocol_version": PROTOCOL_VERSION,
             "operation": "concretize_one",
             "spec": spec_string,
             "tests": tests,
             "configuration": _configuration_payload(),
-            "repositories": _repository_payload(repositories),
+            "repositories": repositories_payload,
             "clingo_paths": _clingo_paths(),
             "state_directory": state_directory,
         }
@@ -385,4 +445,4 @@ def concretize_one_sandboxed(
             raise SandboxedConcretizationError(
                 f"worker exited with status {process.returncode}: {detail}"
             )
-        return _validate_success(_load_response(stdout), requested)
+        return _validate_success(_load_response(stdout), requested, repositories_payload)

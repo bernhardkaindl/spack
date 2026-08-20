@@ -9,16 +9,54 @@ import sys
 import pytest
 
 import spack.sandbox
+import spack.solver.concretize_worker as concretize_worker_module
 from spack.solver.concretize_worker import (
     SandboxedConcretizationError,
     _load_response,
     concretize_one_sandboxed,
+)
+from spack.solver.repository_snapshot import (
+    RepositorySnapshotError,
+    create_repository_snapshot,
+    repository_digest,
+    snapshot_root,
 )
 
 
 def _prepend_recipe_code(repo_builder, package, code):
     recipe = Path(repo_builder._recipe_filename(package))
     recipe.write_text(f"{code}\n{recipe.read_text(encoding='utf-8')}", encoding="utf-8")
+
+
+def test_repository_snapshot_has_deterministic_identity(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "repo.yaml").write_text("repo: {}\n", encoding="utf-8")
+    (source / "packages").mkdir()
+    (source / "packages" / "package.py").write_text("value = 1\n", encoding="utf-8")
+    (source / ".git").mkdir()
+    (source / ".git" / "HEAD").write_text("ignored\n", encoding="utf-8")
+    (source / "__pycache__").mkdir()
+    (source / "__pycache__" / "package.pyc").write_bytes(b"ignored")
+    destination = snapshot_root(tmp_path / "snapshots", 0, "test.nested", (2, 0))
+
+    identity = create_repository_snapshot(source, destination)
+
+    assert destination == tmp_path / "snapshots" / "0" / "spack_repo" / "test" / "nested"
+    assert identity == repository_digest(destination)
+    assert not (destination / ".git").exists()
+    (source / "packages" / "package.py").write_text("value = 2\n", encoding="utf-8")
+    assert repository_digest(destination) == identity
+
+
+def test_repository_snapshot_rejects_symlinks(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "target").write_text("content\n", encoding="utf-8")
+    (source / "link").symlink_to("target")
+
+    with pytest.raises(RepositorySnapshotError, match="symlink"):
+        create_repository_snapshot(source, tmp_path / "snapshot")
 
 
 def test_response_rejects_duplicate_keys():
@@ -43,6 +81,112 @@ def test_concretize_one_sandboxed_round_trip(
     assert concrete.name == "sandbox-root"
     assert concrete["sandbox-dependency"].concrete
     assert concrete.namespace == repo_builder.namespace
+
+
+def test_concretization_uses_snapshot_after_source_changes(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-snapshot-source")
+    recipe = Path(repo_builder._recipe_filename("sandbox-snapshot-source"))
+    create_snapshot = concretize_worker_module.create_repository_snapshot
+
+    def create_then_mutate(source, destination):
+        identity = create_snapshot(source, destination)
+        recipe.write_text("raise RuntimeError('source repository was used')\n", encoding="utf-8")
+        return identity
+
+    monkeypatch.setattr(
+        concretize_worker_module, "create_repository_snapshot", create_then_mutate
+    )
+
+    concrete = concretize_one_sandboxed(
+        "sandbox-snapshot-source@1.0", repositories=[repo_builder.root, mock_packages_repo]
+    )
+
+    assert concrete.concrete
+
+
+def test_recipe_import_cannot_modify_repository_snapshot(
+    concretize_scope, mock_packages_repo, repo_builder
+):
+    repo_builder.add_package("sandbox-snapshot-write")
+    _prepend_recipe_code(
+        repo_builder,
+        "sandbox-snapshot-write",
+        "from pathlib import Path\nPath(__file__).write_text('modified')",
+    )
+
+    with pytest.raises(SandboxedConcretizationError, match="Permission denied"):
+        concretize_one_sandboxed(
+            "sandbox-snapshot-write@1.0",
+            repositories=[repo_builder.root, mock_packages_repo],
+        )
+
+
+def test_repository_identity_mismatch_fails_before_concretization(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-manifest-mismatch")
+    create_snapshot = concretize_worker_module.create_repository_snapshot
+
+    def create_with_wrong_identity(source, destination):
+        create_snapshot(source, destination)
+        return "0" * 64
+
+    monkeypatch.setattr(
+        concretize_worker_module, "create_repository_snapshot", create_with_wrong_identity
+    )
+
+    with pytest.raises(SandboxedConcretizationError, match="snapshot identity mismatch"):
+        concretize_one_sandboxed(
+            "sandbox-manifest-mismatch@1.0",
+            repositories=[repo_builder.root, mock_packages_repo],
+        )
+
+
+def test_worker_binds_ordered_repository_identities(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-overlay-order")
+    validate_success = concretize_worker_module._validate_success
+    observed = []
+
+    def validate_and_record(response, requested, repositories):
+        observed.extend(response["repositories"])
+        return validate_success(response, requested, repositories)
+
+    monkeypatch.setattr(concretize_worker_module, "_validate_success", validate_and_record)
+
+    concrete = concretize_one_sandboxed(
+        "sandbox-overlay-order@1.0", repositories=[repo_builder.root, mock_packages_repo]
+    )
+
+    assert concrete.concrete
+    assert [identity["namespace"] for identity in observed] == [
+        repo_builder.namespace,
+        mock_packages_repo.namespace,
+    ]
+    assert all(len(identity["identity"]) == 64 for identity in observed)
+
+
+def test_parent_rejects_inconsistent_package_hash_provenance(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-package-hash")
+    load_response = concretize_worker_module._load_response
+
+    def load_with_altered_package_hash(data):
+        response = load_response(data)
+        if response.get("ok"):
+            response["package_hashes"][0]["package_hash"] = "a" * 52 + "===="
+        return response
+
+    monkeypatch.setattr(concretize_worker_module, "_load_response", load_with_altered_package_hash)
+
+    with pytest.raises(SandboxedConcretizationError, match="package hash provenance"):
+        concretize_one_sandboxed(
+            "sandbox-package-hash@1.0", repositories=[repo_builder.root, mock_packages_repo]
+        )
 
 
 def test_recipe_import_cannot_write_outside_private_state(
