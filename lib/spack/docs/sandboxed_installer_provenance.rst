@@ -88,6 +88,34 @@ A signed attestation must define canonical bytes, signer identity, key distribut
 It should reference the provenance digest rather than add unbounded or environment-specific data to ``sandbox_provenance.json``.
 Signing the current local manifest alone would not establish all of these semantics.
 
+Experimental command
+--------------------
+
+``spack sandbox-install`` is the explicit developer entry point for the complete worker-based workflow.
+It composes sandboxed concretization, sandboxed SourcePlan creation, trusted source preparation, confined build phases, allowlisted parent actions, metadata publication, and database registration.
+It does not alter or intercept ``spack install``.
+Parent prefix transactions apply only to Spack-managed installations; external prefixes such as ``/usr`` are never pivoted or mutated.
+
+The command requires at least one ordered ``--repository`` path.
+Network and local source authority is denied by default and must be granted with repeatable ``--source-origin`` and ``--file-root`` arguments.
+Repository snapshots remain enabled by default; ``--no-repository-snapshots`` explicitly selects the weaker live-repository mode.
+Build phases and parent actions cross typed interfaces through repeatable ``--phase`` and ``--post-action`` arguments.
+Failure at any step aborts the workflow; by default a failed registered install restores the prior prefix and leaves the database unchanged, while ``--keep-failed-prefix`` retains the failed replacement for debugging.
+
+For example:
+
+.. code-block:: console
+
+   $ spack sandbox-install zlib@1.3.1 \
+      --repository /path/to/packages \
+      --source-origin https://zlib.net \
+      --phase install
+
+The command currently inherits the SourcePlan v1 restrictions: one fixed SHA-256 URL source, no resources or patches, and no mutable VCS source.
+It is Linux-only because the worker requires Landlock filesystem and TCP restrictions.
+It is intended for development and trust-boundary evaluation, not as a compatibility replacement for normal installation.
+Command tests must verify authority parsing, ordered argument transport, temporary-stage lifetime, and registration inputs, while the worker integration suite remains responsible for real confinement, rollback, and provenance behavior.
+
 Extending the worker-based installer
 ------------------------------------
 
