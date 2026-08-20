@@ -187,7 +187,7 @@ def test_run_prepared_build_phase_with_resource(
     )
 
     assert response["source_plan_sha256"] == source_plan_digest(plan)
-    assert plan["schema_version"] == 3
+    assert plan["schema_version"] == 4
     assert [resource["name"] for resource in plan["resources"]] == ["headers"]
     assert (prefix / "resource.txt").read_text(encoding="utf-8") == "prepared source\n"
 
@@ -243,6 +243,78 @@ def test_run_prepared_build_phase_with_repository_patch(
     assert len(plan["patches"]) == 1
     assert (prepared.path / "message").read_text(encoding="utf-8") == "after\n"
     assert (prefix / "message").read_text(encoding="utf-8") == "after\n"
+
+
+@pytest.mark.use_package_hash
+@pytest.mark.requires_executables("patch")
+def test_run_prepared_build_phase_with_url_patch(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
+):
+    """Fetch a worker-planned URL patch and bind it to the concrete recipe before building."""
+    source = tmp_path / "source.tar.gz"
+    patch_path = tmp_path / "fix.patch"
+    checksum = _write_source_archive(
+        source, source_files={"project/message": (b"before\n", 0o644)}
+    )
+    patch_content = b"--- message\n+++ message\n@@ -1 +1 @@\n-before\n+after\n"
+    patch_path.write_bytes(patch_content)
+    _add_build_recipe(
+        repo_builder,
+        "sandbox-build-url-patch",
+        source.as_uri(),
+        checksum,
+        f'''    patch(
+        {patch_path.as_uri()!r},
+        sha256={hashlib.sha256(patch_content).hexdigest()!r},
+        level=0,
+    )
+
+    def install(self, spec, prefix):
+        """Install content transformed by the trusted-fetched URL patch."""
+        from pathlib import Path
+        source = Path(self.stage.source_path).joinpath("message")
+        Path(prefix).joinpath("message").write_text(source.read_text())
+''',
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+    concrete = concretize_one_sandboxed("sandbox-build-url-patch@1.0", repositories=repositories)
+    plan = plan_sources_sandboxed(concrete, repositories=repositories)
+    prepared = prepare_stage(
+        plan,
+        tmp_path / "prepared",
+        expected_provenance=plan["provenance"],
+        fetch_policy=SourceFetchPolicy(file_roots=(tmp_path,)),
+    )
+
+    def reject_parent_package_import(*args, **kwargs):
+        raise AssertionError("trusted parent imported recipe code")
+
+    monkeypatch.setattr(spack.repo.PATH, "get_pkg_class", reject_parent_package_import)
+    prefix = tmp_path / "prefix"
+    response = run_build_phase_sandboxed(
+        concrete, plan, prepared, "install", prefix=prefix, repositories=repositories
+    )
+
+    assert response["source_plan_sha256"] == source_plan_digest(plan)
+    assert plan["patches"][0]["kind"] == "url"
+    assert (prefix / "message").read_text(encoding="utf-8") == "after\n"
+
+    tampered = copy.deepcopy(plan)
+    tampered["patches"][0]["url"] = (tmp_path / "unrelated.patch").as_uri()
+    tampered_prepared = PreparedStage(
+        path=prepared.path,
+        source_plan_sha256=source_plan_digest(tampered),
+        content_sha256=prepared.content_sha256,
+    )
+    with pytest.raises(SandboxedBuildPhaseError, match="patches do not match"):
+        run_build_phase_sandboxed(
+            concrete,
+            tampered,
+            tampered_prepared,
+            "install",
+            prefix=tmp_path / "tampered-prefix",
+            repositories=repositories,
+        )
 
 
 @pytest.mark.use_package_hash

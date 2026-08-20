@@ -188,6 +188,7 @@ def _run_phases(request: Dict[str, Any], repositories):
     import spack.builder
     import spack.patch
     import spack.platforms
+    import spack.util.url
     from spack.installer.install_tree import install_tree_metadata
     from spack.solver.prepared_stage import prepared_stage_digest, source_plan_digest
     from spack.solver.source_plan import validate_source_plan
@@ -220,21 +221,37 @@ def _run_phases(request: Dict[str, Any], repositories):
         raise WorkerRequestError("package-defined patch methods are unsupported")
     recipe_patches = []
     for patch in spec.patches:
-        if type(patch) is not spack.patch.FilePatch:
-            raise WorkerRequestError("source plan supports only repository-local file patches")
-        recipe_patches.append(
-            {
-                "owner": patch.owner,
-                "sha256": patch.sha256,
-                "level": patch.level,
-                "working_dir": patch.working_dir,
-                "reverse": patch.reverse,
-            }
-        )
-    planned_patches = [
-        {key: patch[key] for key in ("owner", "sha256", "level", "working_dir", "reverse")}
-        for patch in request["source_plan"]["patches"]
-    ]
+        description = {
+            "owner": patch.owner,
+            "sha256": patch.sha256,
+            "level": patch.level,
+            "working_dir": patch.working_dir,
+            "reverse": patch.reverse,
+        }
+        if type(patch) is spack.patch.FilePatch:
+            description["kind"] = "inline"
+        elif type(patch) is spack.patch.UrlPatch:
+            description.update(
+                {
+                    "kind": "url",
+                    "url": patch.url,
+                    "archive_sha256": patch.archive_sha256,
+                    "extension": (
+                        spack.util.url.extension_from_path(patch.url)
+                        if patch.archive_sha256
+                        else None
+                    ),
+                }
+            )
+        else:
+            raise WorkerRequestError("source plan supports only file patches")
+        recipe_patches.append(description)
+    planned_patches = []
+    for patch in request["source_plan"]["patches"]:
+        keys = ("kind", "owner", "sha256", "level", "working_dir", "reverse")
+        if patch["kind"] == "url":
+            keys += ("url", "archive_sha256", "extension")
+        planned_patches.append({key: patch[key] for key in keys})
     if planned_patches != recipe_patches:
         raise WorkerRequestError("source plan patches do not match the concrete recipe")
     package.stage = SimpleNamespace(

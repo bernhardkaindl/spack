@@ -71,6 +71,20 @@ def patch_description(content=b"--- a/file\n+++ b/file\n@@ -1 +1 @@\n-before\n+a
     }
 
 
+def url_patch_description():
+    return {
+        "kind": "url",
+        "owner": "test.patch-owner",
+        "sha256": "e" * 64,
+        "level": 1,
+        "working_dir": ".",
+        "reverse": False,
+        "url": "https://example.com/fix.patch",
+        "archive_sha256": None,
+        "extension": None,
+    }
+
+
 def test_validate_fixed_url_source_plan(source_plan):
     assert validate_source_plan(source_plan) is source_plan
     assert (
@@ -134,6 +148,40 @@ def test_validate_inline_patch_source_plan(source_plan):
     source_plan["patches"] = [patch_description()]
 
     assert validate_source_plan(source_plan) is source_plan
+
+
+def test_validate_url_patch_source_plan(source_plan):
+    source_plan["schema_version"] = 4
+    source_plan["patches"] = [url_patch_description()]
+
+    assert validate_source_plan(source_plan) is source_plan
+
+
+def test_validate_compressed_url_patch_source_plan(source_plan):
+    source_plan["schema_version"] = 4
+    patch = url_patch_description()
+    patch.update(url="https://example.com/fix.tar.gz", archive_sha256="f" * 64, extension="tar.gz")
+    source_plan["patches"] = [patch]
+
+    assert validate_source_plan(source_plan) is source_plan
+
+
+def test_source_plan_rejects_unsupported_compressed_url_patch(source_plan):
+    source_plan["schema_version"] = 4
+    patch = url_patch_description()
+    patch.update(url="https://example.com/fix.patch.Z", archive_sha256="f" * 64, extension="Z")
+    source_plan["patches"] = [patch]
+
+    with pytest.raises(SourcePlanError, match="compressed URL patch extension"):
+        validate_source_plan(source_plan)
+
+
+def test_source_plan_v3_rejects_url_patch(source_plan):
+    source_plan["schema_version"] = 3
+    source_plan["patches"] = [url_patch_description()]
+
+    with pytest.raises(SourcePlanError, match="patch kind"):
+        validate_source_plan(source_plan)
 
 
 @pytest.mark.parametrize(
@@ -292,7 +340,7 @@ def test_source_plan_for_url_resource(concretize_scope, mock_packages_repo, repo
         concrete = spack.concretize.concretize_one("source-plan-resource@1.0")
         plan = source_plan_for_spec(concrete, repositories)
 
-    assert plan["schema_version"] == 3
+    assert plan["schema_version"] == 4
     assert plan["resources"] == [resource_description()]
 
 
@@ -330,7 +378,7 @@ def test_source_plan_for_repository_patch(concretize_scope, mock_packages_repo, 
 
 
 @pytest.mark.use_package_hash
-def test_source_plan_rejects_url_patch(concretize_scope, mock_packages_repo, repo_builder):
+def test_source_plan_for_url_patch(concretize_scope, mock_packages_repo, repo_builder):
     repo_builder.add_package("source-plan-url-patch")
     recipe = Path(repo_builder._recipe_filename("source-plan-url-patch"))
     recipe.write_text(
@@ -343,11 +391,52 @@ def test_source_plan_rejects_url_patch(concretize_scope, mock_packages_repo, rep
         + '")\n',
         encoding="utf-8",
     )
+    repositories = [
+        {"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}
+    ]
 
     with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
         concrete = spack.concretize.concretize_one("source-plan-url-patch@1.0")
-        with pytest.raises(SourcePlanError, match="repository-local"):
-            source_plan_for_spec(concrete, [])
+        plan = source_plan_for_spec(concrete, repositories)
+
+    assert plan["patches"] == [
+        {**url_patch_description(), "owner": f"{repo_builder.namespace}.source-plan-url-patch"}
+    ]
+
+
+@pytest.mark.use_package_hash
+def test_source_plan_for_compressed_url_patch(concretize_scope, mock_packages_repo, repo_builder):
+    repo_builder.add_package("source-plan-compressed-patch")
+    recipe = Path(repo_builder._recipe_filename("source-plan-compressed-patch"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-compressed-patch-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n'
+        + '    patch("https://example.com/fix.tar.gz", sha256="'
+        + "e" * 64
+        + '", archive_sha256="'
+        + "f" * 64
+        + '")\n',
+        encoding="utf-8",
+    )
+    repositories = [
+        {"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}
+    ]
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-compressed-patch@1.0")
+        plan = source_plan_for_spec(concrete, repositories)
+
+    assert plan["patches"] == [
+        {
+            **url_patch_description(),
+            "owner": f"{repo_builder.namespace}.source-plan-compressed-patch",
+            "url": "https://example.com/fix.tar.gz",
+            "archive_sha256": "f" * 64,
+            "extension": "tar.gz",
+        }
+    ]
 
 
 @pytest.mark.use_package_hash

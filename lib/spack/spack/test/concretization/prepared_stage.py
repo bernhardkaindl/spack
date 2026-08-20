@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import base64
+import gzip
 import hashlib
 import http.server
 import io
@@ -103,6 +104,35 @@ def add_patch(
     return plan
 
 
+def add_url_patch(
+    plan,
+    url: str,
+    sha256: str,
+    *,
+    archive_sha256=None,
+    extension=None,
+    owner="test.package",
+    level=0,
+    working_dir=".",
+    reverse=False,
+):
+    plan["schema_version"] = 4
+    plan["patches"].append(
+        {
+            "kind": "url",
+            "owner": owner,
+            "sha256": sha256,
+            "level": level,
+            "working_dir": working_dir,
+            "reverse": reverse,
+            "url": url,
+            "archive_sha256": archive_sha256,
+            "extension": extension,
+        }
+    )
+    return plan
+
+
 def write_tar(archive: Path, entries):
     with tarfile.open(archive, "w:gz") as output:
         for name, contents, entry_type in entries:
@@ -190,6 +220,140 @@ def test_prepare_stage_rolls_back_failed_patch_set(tmp_path, provenance, fetch_p
 
     assert not (tmp_path / "prepared").exists()
     assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_fetches_and_applies_url_patch(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    patch_path = tmp_path / "fix.patch"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    content = b"--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n"
+    patch_path.write_bytes(content)
+    plan = source_plan(archive, provenance)
+    add_url_patch(plan, patch_path.as_uri(), hashlib.sha256(content).hexdigest())
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    assert (prepared.path / "file").read_text(encoding="utf-8") == "after\n"
+    assert prepared.source_plan_sha256 == source_plan_digest(plan)
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_fetches_and_applies_compressed_url_patch(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    patch_archive = tmp_path / "fix.tar.gz"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    content = "--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n"
+    write_tar(patch_archive, [("fix.patch", content, tarfile.REGTYPE)])
+    plan = source_plan(archive, provenance)
+    add_url_patch(
+        plan,
+        patch_archive.as_uri(),
+        hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        archive_sha256=hashlib.sha256(patch_archive.read_bytes()).hexdigest(),
+        extension="tar.gz",
+    )
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    assert (prepared.path / "file").read_text(encoding="utf-8") == "after\n"
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_fetches_and_applies_gzip_url_patch(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    patch_archive = tmp_path / "fix.patch.gz"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    content = b"--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n"
+    with gzip.open(patch_archive, "wb") as output:
+        output.write(content)
+    plan = source_plan(archive, provenance)
+    add_url_patch(
+        plan,
+        patch_archive.as_uri(),
+        hashlib.sha256(content).hexdigest(),
+        archive_sha256=hashlib.sha256(patch_archive.read_bytes()).hexdigest(),
+        extension="gz",
+    )
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    assert (prepared.path / "file").read_text(encoding="utf-8") == "after\n"
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_rolls_back_bad_expanded_url_patch_checksum(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    patch_archive = tmp_path / "fix.tar.gz"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    content = "--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n"
+    write_tar(patch_archive, [("fix.patch", content, tarfile.REGTYPE)])
+    plan = source_plan(archive, provenance)
+    add_url_patch(
+        plan,
+        patch_archive.as_uri(),
+        "0" * 64,
+        archive_sha256=hashlib.sha256(patch_archive.read_bytes()).hexdigest(),
+        extension="tar.gz",
+    )
+
+    with pytest.raises(PreparedStageError, match="payload checksum"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_rolls_back_malformed_url_patch(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    patch_path = tmp_path / "fix.patch"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    content = b"not a unified diff\n"
+    patch_path.write_bytes(content)
+    plan = source_plan(archive, provenance)
+    add_url_patch(plan, patch_path.as_uri(), hashlib.sha256(content).hexdigest())
+
+    with pytest.raises(PreparedStageError, match="invalid URL patch payload"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_applies_aggregate_url_patch_size_limit(
+    tmp_path, provenance, fetch_policy, monkeypatch
+):
+    archive = tmp_path / "source.tar.gz"
+    patch_path = tmp_path / "fix.patch"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    content = b"--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n"
+    patch_path.write_bytes(content)
+    plan = source_plan(archive, provenance)
+    add_url_patch(plan, patch_path.as_uri(), hashlib.sha256(content).hexdigest())
+    monkeypatch.setattr(prepared_stage_module, "MAX_PATCH_BYTES_TOTAL", len(content) - 1)
+
+    with pytest.raises(PreparedStageError, match="aggregate size limit"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
 
 
 def test_prepare_stage_rejects_resource_conflict_transactionally(

@@ -4,9 +4,9 @@
 
 """Validation for declarative source plans produced by confined recipe workers.
 
-The current schema supports checksummed URL sources and simply placed URL resources. Validation
-is recipe-free so a trusted parent can reject malformed worker output without importing package
-code.
+The current schema supports checksummed URL sources, simply placed URL resources, and bounded
+file patches. Validation is recipe-free so a trusted parent can reject malformed worker output
+without importing package code.
 """
 
 import base64
@@ -21,14 +21,36 @@ import spack.error
 import spack.fetch_strategy
 import spack.hash_types as ht
 import spack.patch
+import spack.util.url
 
-SOURCE_PLAN_SCHEMA_VERSION = 3
+SOURCE_PLAN_SCHEMA_VERSION = 4
 MAX_SOURCE_URLS = 32
 MAX_RESOURCES = 32
 MAX_PATCHES = 32
 MAX_PATCH_BYTES = 48 * 1024
 MAX_PATCH_BYTES_TOTAL = 512 * 1024
 MAX_SOURCE_PLAN_STRING = 4096
+SUPPORTED_PATCH_ARCHIVE_EXTENSIONS = frozenset(
+    (
+        "tar",
+        "tar.gz",
+        "tgz",
+        "tar.bz2",
+        "tbz2",
+        "tbz",
+        "tar.xz",
+        "txz",
+        "TAR",
+        "TAR.gz",
+        "TAR.bz2",
+        "TAR.xz",
+        "zip",
+        "whl",
+        "gz",
+        "bz2",
+        "xz",
+    )
+)
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _DAG_HASH = re.compile(r"[a-z2-7]{32}")
@@ -91,8 +113,26 @@ def _relative_path(
 
 
 def _patch_for_plan(patch: Any) -> Dict[str, Any]:
+    common = {
+        "owner": patch.owner,
+        "sha256": patch.sha256,
+        "level": patch.level,
+        "working_dir": patch.working_dir,
+        "reverse": patch.reverse,
+    }
+    if type(patch) is spack.patch.UrlPatch:
+        extension = spack.util.url.extension_from_path(patch.url) if patch.archive_sha256 else None
+        if patch.archive_sha256 and extension not in SUPPORTED_PATCH_ARCHIVE_EXTENSIONS:
+            raise SourcePlanError("unsupported compressed URL patch extension")
+        return {
+            "kind": "url",
+            **common,
+            "url": patch.url,
+            "archive_sha256": patch.archive_sha256,
+            "extension": extension,
+        }
     if type(patch) is not spack.patch.FilePatch or patch.path is None:
-        raise SourcePlanError("only repository-local file patches are supported")
+        raise SourcePlanError("only repository-local and URL file patches are supported")
     try:
         with open(patch.path, "rb") as stream:
             content = stream.read(MAX_PATCH_BYTES + 1)
@@ -106,11 +146,7 @@ def _patch_for_plan(patch: Any) -> Dict[str, Any]:
     targets = _validate_unified_diff(content, patch.level)
     return {
         "kind": "inline",
-        "owner": patch.owner,
-        "sha256": sha256,
-        "level": patch.level,
-        "working_dir": patch.working_dir,
-        "reverse": patch.reverse,
+        **common,
         "targets": targets,
         "content_base64": base64.b64encode(content).decode("ascii"),
     }
@@ -284,7 +320,12 @@ def validate_source_plan(
     }:
         raise SourcePlanError("source plan has unexpected fields")
     schema_version = plan["schema_version"]
-    if type(schema_version) is not int or schema_version not in (1, 2, SOURCE_PLAN_SCHEMA_VERSION):
+    if type(schema_version) is not int or schema_version not in (
+        1,
+        2,
+        3,
+        SOURCE_PLAN_SCHEMA_VERSION,
+    ):
         raise SourcePlanError("unsupported source plan schema")
 
     provenance = plan["provenance"]
@@ -353,27 +394,26 @@ def validate_source_plan(
                 f"source plan patches are unsupported by version {schema_version}"
             )
     else:
-        _validate_patches(patches)
+        _validate_patches(patches, allow_url=schema_version >= 4)
     return plan
 
 
-def _validate_patches(patches: Any) -> None:
+def _validate_patches(patches: Any, *, allow_url: bool) -> None:
     if not isinstance(patches, list) or len(patches) > MAX_PATCHES:
         raise SourcePlanError("invalid source plan patches")
     total_bytes = 0
     for patch in patches:
-        if not isinstance(patch, dict) or set(patch) != {
-            "kind",
-            "owner",
-            "sha256",
-            "level",
-            "working_dir",
-            "reverse",
-            "targets",
-            "content_base64",
-        }:
+        if not isinstance(patch, dict):
             raise SourcePlanError("invalid source plan patch")
-        if patch["kind"] != "inline":
+        common_fields = {"kind", "owner", "sha256", "level", "working_dir", "reverse"}
+        kind = patch.get("kind")
+        if kind == "inline":
+            if set(patch) != common_fields | {"targets", "content_base64"}:
+                raise SourcePlanError("invalid source plan patch")
+        elif kind == "url" and allow_url:
+            if set(patch) != common_fields | {"url", "archive_sha256", "extension"}:
+                raise SourcePlanError("invalid source plan patch")
+        else:
             raise SourcePlanError("unsupported patch kind")
         _string(patch["owner"], "patch owner", pattern=_IDENTIFIER)
         sha256 = _string(patch["sha256"], "patch SHA-256", pattern=_SHA256)
@@ -383,6 +423,19 @@ def _validate_patches(patches: Any) -> None:
         _relative_path(patch["working_dir"], "patch working directory", allow_dot=True)
         if not isinstance(patch["reverse"], bool):
             raise SourcePlanError("invalid patch reverse policy")
+        if kind == "url":
+            _url(patch["url"])
+            archive_sha256 = patch["archive_sha256"]
+            if archive_sha256 is not None:
+                _string(archive_sha256, "patch archive SHA-256", pattern=_SHA256)
+            extension = patch["extension"]
+            if extension is not None:
+                _string(extension, "patch archive extension", pattern=_EXTENSION)
+            if archive_sha256 is None and extension is not None:
+                raise SourcePlanError("uncompressed URL patch cannot have an archive extension")
+            if archive_sha256 is not None and extension not in SUPPORTED_PATCH_ARCHIVE_EXTENSIONS:
+                raise SourcePlanError("unsupported compressed URL patch extension")
+            continue
         targets = patch["targets"]
         if (
             not isinstance(targets, list)
@@ -390,7 +443,7 @@ def _validate_patches(patches: Any) -> None:
             or len(targets) > 256
             or len(set(targets)) != len(targets)
         ):
-            raise SourcePlanError("invalid patch targets")
+            raise SourcePlanError("invalid source plan patch")
         for target in targets:
             _relative_path(target, "patch target")
         encoded = patch["content_base64"]

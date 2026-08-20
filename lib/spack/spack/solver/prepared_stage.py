@@ -5,8 +5,11 @@
 """Trusted preparation of source plans without importing recipe code."""
 
 import base64
+import bz2
+import gzip
 import hashlib
 import json
+import lzma
 import os
 import shutil
 import signal
@@ -24,11 +27,18 @@ from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import spack.error
 import spack.util.web
-from spack.solver.source_plan import validate_source_plan
+from spack.solver.source_plan import (
+    MAX_PATCH_BYTES,
+    MAX_PATCH_BYTES_TOTAL,
+    SourcePlanError,
+    _validate_unified_diff,
+    validate_source_plan,
+)
 
 MAX_ARCHIVE_ENTRIES = 100000
 MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
 MAX_EXPANDED_BYTES = 16 * 1024 * 1024 * 1024
+MAX_PATCH_DOWNLOAD_BYTES = 4 * 1024 * 1024
 PATCH_PROTOCOL_VERSION = 1
 PATCH_TIMEOUT_SECONDS = 120
 MAX_PATCH_WORKER_RESPONSE_BYTES = 64 * 1024
@@ -86,6 +96,8 @@ class _PreparationBudget:
     entries: int = 0
     downloaded_bytes: int = 0
     expanded_bytes: int = 0
+    max_entries: Optional[int] = None
+    max_expanded_bytes: Optional[int] = None
 
     def add_download(self, size: int) -> None:
         self.downloaded_bytes += size
@@ -96,10 +108,17 @@ class _PreparationBudget:
         if size < 0:
             raise PreparedStageError("archive entry has an invalid size")
         self.entries += 1
-        self.expanded_bytes += size
-        if self.entries > MAX_ARCHIVE_ENTRIES:
+        entry_limit = self.max_entries if self.max_entries is not None else MAX_ARCHIVE_ENTRIES
+        if self.entries > entry_limit:
             raise PreparedStageError("archives contain too many entries")
-        if self.expanded_bytes > MAX_EXPANDED_BYTES:
+        self.add_expanded(size)
+
+    def add_expanded(self, size: int) -> None:
+        self.expanded_bytes += size
+        expanded_limit = (
+            self.max_expanded_bytes if self.max_expanded_bytes is not None else MAX_EXPANDED_BYTES
+        )
+        if self.expanded_bytes > expanded_limit:
             raise PreparedStageError("archives expand beyond the size limit")
 
 
@@ -165,6 +184,8 @@ def _fetch(
     destination: Path,
     policy: SourceFetchPolicy,
     budget: _PreparationBudget,
+    *,
+    max_bytes: Optional[int] = None,
 ) -> Path:
     for url in source["urls"]:
         policy.validate(url)
@@ -180,12 +201,16 @@ def _fetch(
                 url, headers={"User-Agent": spack.util.web.SPACK_USER_AGENT, "Accept": "*/*"}
             )
             digest = hashlib.sha256()
+            downloaded = 0
             with opener.open(request) as response, open(destination, "xb") as output:
                 while True:
                     chunk = response.read(64 * 1024)
                     if not chunk:
                         break
                     budget.add_download(len(chunk))
+                    downloaded += len(chunk)
+                    if max_bytes is not None and downloaded > max_bytes:
+                        raise PreparedStageError("download exceeds the item size limit")
                     digest.update(chunk)
                     output.write(chunk)
             if digest.hexdigest() != source["sha256"]:
@@ -261,6 +286,45 @@ def _extract_archive(
         except tarfile.TarError as error:
             raise PreparedStageError(f"unsupported or invalid source archive: {error}") from error
     raise PreparedStageError(f"unsupported source archive extension: {extension}")
+
+
+def _extract_single_file_compression(
+    archive: Path, destination: Path, extension: str, budget: _PreparationBudget
+) -> None:
+    opener = {"gz": gzip.open, "bz2": bz2.open, "xz": lzma.open}[extension]
+    budget.add_archive_entry(0)
+    try:
+        with opener(archive, "rb") as source, open(destination, "xb") as output:
+            while True:
+                chunk = source.read(64 * 1024)
+                if not chunk:
+                    break
+                budget.add_expanded(len(chunk))
+                output.write(chunk)
+    except (EOFError, OSError, lzma.LZMAError) as error:
+        raise PreparedStageError(f"invalid compressed URL patch: {error}") from error
+
+
+def _extract_url_patch(
+    archive: Path, destination: Path, extension: str, budget: _PreparationBudget
+) -> Path:
+    if extension in ("gz", "bz2", "xz"):
+        payload = destination / "patch"
+        _extract_single_file_compression(archive, payload, extension, budget)
+        return payload
+    archive_extension = {
+        "whl": "zip",
+        "tbz": "tar.bz2",
+        "TAR": "tar",
+        "TAR.gz": "tar.gz",
+        "TAR.bz2": "tar.bz2",
+        "TAR.xz": "tar.xz",
+    }.get(extension, extension)
+    _extract_archive(archive, destination, archive_extension, budget)
+    entries = list(destination.iterdir())
+    if len(entries) != 1 or not entries[0].is_file() or entries[0].is_symlink():
+        raise PreparedStageError("compressed URL patch must contain exactly one regular file")
+    return entries[0]
 
 
 def _publish_extracted_archive(container: Path, destination: Path) -> None:
@@ -350,7 +414,13 @@ def _kill_process_group(process: subprocess.Popen) -> None:
     process.wait()
 
 
-def _apply_patches(patches: Any, source: Path, workspace: Path) -> None:
+def _apply_patches(
+    patches: Any,
+    source: Path,
+    workspace: Path,
+    fetch_policy: SourceFetchPolicy,
+    budget: _PreparationBudget,
+) -> None:
     if not patches:
         return
     patch_executable = shutil.which("patch")
@@ -360,9 +430,54 @@ def _apply_patches(patches: Any, source: Path, workspace: Path) -> None:
     state = workspace / "patch-state"
     state.mkdir(mode=0o700)
     descriptions = []
+    total_patch_bytes = 0
     for index, patch in enumerate(patches):
         path = state / str(index)
-        content = base64.b64decode(patch["content_base64"], validate=True)
+        if patch["kind"] == "inline":
+            content = base64.b64decode(patch["content_base64"], validate=True)
+            targets = patch["targets"]
+        else:
+            patch_source = {
+                "kind": "url",
+                "urls": [patch["url"]],
+                "sha256": patch["archive_sha256"] or patch["sha256"],
+                "expand": patch["archive_sha256"] is not None,
+                "extension": patch["extension"],
+            }
+            download = workspace / "downloads" / f"patch-{index}"
+            download.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            archive = _fetch(
+                patch_source,
+                download,
+                fetch_policy,
+                budget,
+                max_bytes=(
+                    MAX_PATCH_DOWNLOAD_BYTES
+                    if patch["archive_sha256"] is not None
+                    else MAX_PATCH_BYTES
+                ),
+            )
+            payload = archive
+            if patch["archive_sha256"] is not None:
+                extracted = workspace / "patches" / str(index)
+                extracted.mkdir(mode=0o700, parents=True)
+                patch_budget = _PreparationBudget(
+                    max_entries=1, max_expanded_bytes=MAX_PATCH_BYTES
+                )
+                payload = _extract_url_patch(archive, extracted, patch["extension"], patch_budget)
+            with open(payload, "rb") as stream:
+                content = stream.read(MAX_PATCH_BYTES + 1)
+            if not content or len(content) > MAX_PATCH_BYTES:
+                raise PreparedStageError("URL patch payload exceeds the size limit")
+            if hashlib.sha256(content).hexdigest() != patch["sha256"]:
+                raise PreparedStageError("URL patch payload checksum does not match")
+            try:
+                targets = _validate_unified_diff(content, patch["level"])
+            except SourcePlanError as error:
+                raise PreparedStageError(f"invalid URL patch payload: {error}") from error
+        total_patch_bytes += len(content)
+        if total_patch_bytes > MAX_PATCH_BYTES_TOTAL:
+            raise PreparedStageError("patch payloads exceed the aggregate size limit")
         with open(path, "xb") as stream:
             stream.write(content)
         descriptions.append(
@@ -372,7 +487,7 @@ def _apply_patches(patches: Any, source: Path, workspace: Path) -> None:
                 "level": patch["level"],
                 "working_dir": patch["working_dir"],
                 "reverse": patch["reverse"],
-                "targets": patch["targets"],
+                "targets": targets,
             }
         )
     request = {
@@ -460,7 +575,11 @@ def prepare_stage(
 ) -> PreparedStage:
     """Fetch, verify, and safely expand a validated fixed-URL source plan."""
     validate_source_plan(plan, expected_provenance=expected_provenance)
-    for source in [plan["source"]] + [resource["source"] for resource in plan["resources"]]:
+    planned_sources = [plan["source"]] + [resource["source"] for resource in plan["resources"]]
+    planned_sources.extend(
+        {"urls": [patch["url"]]} for patch in plan["patches"] if patch["kind"] == "url"
+    )
+    for source in planned_sources:
         for url in source["urls"]:
             fetch_policy.validate(url)
     destination = destination.resolve()
@@ -479,7 +598,7 @@ def prepare_stage(
             plan["source"], temporary, workspace / "downloads" / "source", fetch_policy, budget
         )
         _prepare_resources(plan["resources"], temporary, workspace, fetch_policy, budget)
-        _apply_patches(plan["patches"], temporary, workspace)
+        _apply_patches(plan["patches"], temporary, workspace, fetch_policy, budget)
         temporary.rename(destination)
     except BaseException:
         raise

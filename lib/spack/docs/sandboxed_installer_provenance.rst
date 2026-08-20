@@ -92,7 +92,7 @@ SourcePlan resources
 --------------------
 
 SourcePlan version 2 added bounded immutable URL resources.
-New plans use version 3, while versions 1 and 2 remain valid for existing provenance records.
+New plans use version 4, while versions 1 through 3 remain valid for existing provenance records.
 Each resource has an identifier, the same fixed-URL source descriptor used for the main source, and relative ``destination`` and ``placement`` paths.
 The recipe worker may emit at most 32 resources and 32 unique candidate URLs per source descriptor.
 Every source and resource requires a SHA-256 checksum; mutable VCS fetchers and fetch options remain rejected.
@@ -131,9 +131,20 @@ The later confined build worker independently compares patch owner, checksum, le
 This prevents a syntactically valid but unrelated patch plan from being consumed by a recipe.
 The persisted SourcePlan and prepared-stage digests bind both the patch inputs and resulting source tree into install provenance.
 
-URL and compressed patches remain unsupported because they add fetch-authority, archive, and two-checksum semantics that should reuse the trusted source-fetch policy in a separate milestone.
+SourcePlan version 4 adds immutable URL patches.
+The planning worker emits the URL and expanded patch SHA-256; compressed patches also carry a distinct archive SHA-256 and normalized archive extension.
+The trusted parent authorizes every patch URL together with source and resource URLs before issuing any request, and redirects remain subject to the same ``SourceFetchPolicy``.
+Plain downloads are limited to 48 KiB.
+Compressed downloads are limited to four MiB, must expand to exactly one regular file of at most 48 KiB, and are also charged to the plan-wide four GiB download budget.
+The trusted parent verifies the archive checksum before extraction and the expanded checksum before unified-diff parsing.
+
+Supported compressed patch formats are tar, gzip-compressed tar, bzip2-compressed tar, xz-compressed tar, their common abbreviated extensions, zip/whl, and single-file gzip, bzip2, and xz.
+Legacy ``.Z`` and compressed URLs without a recognized extension fail closed because they would require another trusted decompressor contract or content-based format selection.
+Derived targets are passed to the same Landlock patch worker used for repository-local patches.
+The build worker additionally compares URL, archive checksum, and extension against the concrete recipe's ``UrlPatch`` before executing phases.
+
 Package-defined ``patch()`` methods remain unsupported because they are arbitrary recipe code rather than declarative patch inputs; supporting them safely requires an explicit confined pre-build lifecycle contract.
-Tests cover malformed and non-unified payloads, Git preambles, target binding, traversal, checksum and option validation, ordered and reverse application, working directories, transactional rollback, real recipe consumption, and build-worker rejection of patch metadata not bound to the concrete recipe.
+Tests cover malformed and non-unified payloads, Git preambles, target binding, traversal, checksum and option validation, ordered and reverse application, working directories, URL authority, plain and compressed downloads, separate archive and expanded checksums, bounded decompression, transactional rollback, real recipe consumption, and build-worker rejection of patch metadata not bound to the concrete recipe.
 
 Experimental command
 --------------------
@@ -158,8 +169,8 @@ For example:
       --source-origin https://zlib.net \
       --phase install
 
-The command supports SourcePlan version 3 fixed SHA-256 URL sources, simply placed URL resources, and bounded repository-local unified-diff patches.
-It does not support URL or compressed patches, package-defined ``patch()`` methods, implicit or dictionary resource placement, mutable VCS sources, custom fetchers, or fetch options.
+The command supports SourcePlan version 4 fixed SHA-256 URL sources, simply placed URL resources, and bounded repository-local or URL unified-diff patches.
+It does not support ``.Z`` or extensionless compressed patches, package-defined ``patch()`` methods, implicit or dictionary resource placement, mutable VCS sources, custom fetchers, or fetch options.
 It is Linux-only because the worker requires Landlock filesystem and TCP restrictions.
 It is intended for development and trust-boundary evaluation, not as a compatibility replacement for normal installation.
 Command tests must verify authority parsing, ordered argument transport, temporary-stage lifetime, and registration inputs, while the worker integration suite remains responsible for real confinement, rollback, and provenance behavior.
