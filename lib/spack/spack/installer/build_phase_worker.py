@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import spack.error
 import spack.repo
+from spack.installer.install_metadata import InstallMetadataError, publish_install_metadata
 from spack.installer.install_tree import InstallTreeError, install_tree_metadata
 from spack.solver.concretize_worker import (
     MAX_REQUEST_BYTES,
@@ -373,7 +374,7 @@ def install_prepared_sandboxed(
     prefix = prefix.resolve()
     prefix.parent.mkdir(parents=True, exist_ok=True)
     with PrefixPivoter(str(prefix), keep_prefix=keep_failed_prefix):
-        return run_build_phases_sandboxed(
+        response = run_build_phases_sandboxed(
             spec,
             source_plan,
             prepared_stage,
@@ -383,3 +384,8 @@ def install_prepared_sandboxed(
             timeout=timeout,
             log_path=log_path,
         )
+        try:
+            metadata = publish_install_metadata(spec, prefix, response["install_tree"])
+        except InstallMetadataError as error:
+            raise SandboxedBuildPhaseError(str(error)) from error
+        return {**response, "install_metadata": metadata}

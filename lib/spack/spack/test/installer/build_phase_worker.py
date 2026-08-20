@@ -17,6 +17,8 @@ import pytest
 import spack.hooks
 import spack.installer.build_phase_worker
 import spack.repo
+import spack.spec
+import spack.verify
 from spack.installer.build_phase_worker import (
     SandboxedBuildPhaseError,
     install_prepared_sandboxed,
@@ -270,6 +272,75 @@ def test_install_tree_metadata_rejects_special_files(tmp_path):
 
     with pytest.raises(InstallTreeError, match="unsupported install-tree entry: fifo"):
         install_tree_metadata(prefix)
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_publishes_trusted_metadata(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
+):
+    """Publish database- and verification-compatible metadata without parent recipe import."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-metadata",
+        """    def install(self, spec, prefix):
+        \"\"\"Create one installed file for the trusted manifest.\"\"\"
+        from pathlib import Path
+        Path(prefix).joinpath("installed.txt").write_text("installed")
+""",
+    )
+
+    def reject_parent_package_import(*args, **kwargs):
+        """Fail if trusted metadata publication resolves a package class."""
+        raise AssertionError("trusted parent imported recipe code")
+
+    monkeypatch.setattr(spack.repo.PATH, "get_pkg_class", reject_parent_package_import)
+    prefix = tmp_path / "prefix"
+    response = install_prepared_sandboxed(
+        concrete, plan, prepared, ["install"], prefix=prefix, repositories=repositories
+    )
+
+    metadata = response["install_metadata"]
+    assert metadata["spec_path"] == ".spack/spec.json"
+    assert metadata["manifest_path"] == ".spack/install_manifest.json"
+    assert metadata["install_tree"] == install_tree_metadata(prefix)
+    installed_spec = spack.spec.Spec.from_json((prefix / metadata["spec_path"]).read_text())
+    assert installed_spec.dag_hash() == concrete.dag_hash()
+    installed_spec.set_prefix(str(prefix))
+    assert not spack.verify.check_spec_manifest(installed_spec).has_errors()
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_rejects_package_metadata(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    """Roll back when a package attempts to occupy the trusted metadata directory."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-metadata-conflict",
+        """    def install(self, spec, prefix):
+        \"\"\"Create a reserved metadata path that the parent must reject.\"\"\"
+        from pathlib import Path
+        metadata = Path(prefix).joinpath(".spack")
+        metadata.mkdir()
+        metadata.joinpath("untrusted").write_text("untrusted")
+        Path(prefix).joinpath("installed.txt").write_text("installed")
+""",
+    )
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    (prefix / "original.txt").write_text("original", encoding="utf-8")
+
+    with pytest.raises(SandboxedBuildPhaseError, match="cannot publish install metadata"):
+        install_prepared_sandboxed(
+            concrete, plan, prepared, ["install"], prefix=prefix, repositories=repositories
+        )
+
+    assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
+    assert not (prefix / ".spack").exists()
 
 
 @pytest.mark.use_package_hash
