@@ -30,7 +30,7 @@ METADATA_DIRECTORY = ".spack"
 SPEC_FILE = "spec.json"
 MANIFEST_FILE = "install_manifest.json"
 PROVENANCE_FILE = "sandbox_provenance.json"
-PROVENANCE_SCHEMA_VERSION = 1
+PROVENANCE_SCHEMA_VERSION = 2
 MAX_PROVENANCE_BYTES = 1024 * 1024
 MAX_PROVENANCE_PHASES = 32
 MAX_PROVENANCE_LOG_BYTES = 64 * 1024 * 1024
@@ -95,10 +95,12 @@ def validate_install_provenance(spec: Spec, provenance: Dict[str, Any]) -> Dict[
     """Validate persisted provenance and bind it to a concrete Spec."""
     if not isinstance(spec, Spec) or not spec.concrete:
         raise InstallMetadataError("install provenance requires a concrete Spec")
+    schema_version = provenance.get("schema_version") if isinstance(provenance, dict) else None
     if (
         not isinstance(provenance, dict)
         or set(provenance) != {"schema_version", "spec", "source_plan", "build", "parent"}
-        or provenance.get("schema_version") != PROVENANCE_SCHEMA_VERSION
+        or type(schema_version) is not int
+        or schema_version not in (1, PROVENANCE_SCHEMA_VERSION)
     ):
         raise InstallMetadataError("invalid sandbox install provenance")
     try:
@@ -112,7 +114,7 @@ def validate_install_provenance(spec: Spec, provenance: Dict[str, Any]) -> Dict[
             raise InstallMetadataError("install provenance does not match the concrete spec")
 
         build = provenance["build"]
-        if not isinstance(build, dict) or set(build) != {
+        expected_build_fields = {
             "protocol_version",
             "phases",
             "sandbox",
@@ -121,8 +123,13 @@ def validate_install_provenance(spec: Spec, provenance: Dict[str, Any]) -> Dict[
             "prepared_stage",
             "install_tree",
             "log",
-        }:
+        }
+        if provenance["schema_version"] >= 2:
+            expected_build_fields.add("patch_method")
+        if not isinstance(build, dict) or set(build) != expected_build_fields:
             raise InstallMetadataError("invalid provenance build record")
+        if provenance["schema_version"] >= 2 and not isinstance(build["patch_method"], bool):
+            raise InstallMetadataError("invalid provenance patch-method record")
         if (
             not isinstance(build["protocol_version"], int)
             or isinstance(build["protocol_version"], bool)
@@ -236,6 +243,7 @@ def create_install_provenance(
             "build": {
                 "protocol_version": build["protocol_version"],
                 "phases": build["phases"],
+                "patch_method": build["patch_method"],
                 "sandbox": build["sandbox"],
                 "repositories": build["repositories"],
                 "source_plan_sha256": build["source_plan_sha256"],

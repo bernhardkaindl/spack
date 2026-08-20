@@ -143,8 +143,27 @@ Legacy ``.Z`` and compressed URLs without a recognized extension fail closed bec
 Derived targets are passed to the same Landlock patch worker used for repository-local patches.
 The build worker additionally compares URL, archive checksum, and extension against the concrete recipe's ``UrlPatch`` before executing phases.
 
-Package-defined ``patch()`` methods remain unsupported because they are arbitrary recipe code rather than declarative patch inputs; supporting them safely requires an explicit confined pre-build lifecycle contract.
 Tests cover malformed and non-unified payloads, Git preambles, target binding, traversal, checksum and option validation, ordered and reverse application, working directories, URL authority, plain and compressed downloads, separate archive and expanded checksums, bounded decompression, transactional rollback, real recipe consumption, and build-worker rejection of patch metadata not bound to the concrete recipe.
+
+Package patch methods
+---------------------
+
+Package-defined ``patch()`` methods use the same ``run_patch_method`` helper as normal ``PackageBase.do_patch()``.
+The normal path remains responsible for staging, declarative patch application, retry markers, and restaging; the shared helper preserves its custom-method behavior by changing to ``stage.source_path``, invoking the selected multimethod, and treating ``NoSuchMethodError`` as not applicable.
+
+The worker-based installer invokes that helper exactly once after it verifies the concrete spec, repository identity, package hash, SourcePlan, prepared-stage digest, and declarative patch binding, and before it creates the builder or runs any selected phase.
+All requested phases execute in the same fresh worker, so a multi-phase install does not repeat the method.
+The package receives the same concrete spec and configured build environment used by its build phases.
+Its stage facade intentionally exposes only ``path`` and ``source_path``; methods that fetch, expand, restage, or destroy a normal ``Stage`` are unavailable because those operations remain trusted-parent responsibilities.
+
+Recipe code is already under Landlock when the method runs.
+It can read host and dependency paths but can write only the prepared source tree, install prefix, and private worker state, and it cannot open TCP connections.
+A method failure aborts the worker and the parent-owned prefix transaction; the prepared-stage digest prevents reuse as an unmodified input after any source-tree mutation.
+Build-worker protocol version 5 reports whether a matching method completed, and new install provenance version 2 persists that boolean as ``build.patch_method``.
+The recipe package hash binds the method implementation; SourcePlan needs no arbitrary-code descriptor or schema revision.
+The recipe-free verifier continues to accept version 1 provenance records, which predate this field.
+
+Tests cover successful method execution before install, declarative-before-method ordering, parent recipe-import isolation, conditional multimethod no-op behavior, denied writes outside the Landlock allowlist, structured failure, the persisted execution flag, and legacy provenance validation.
 
 Experimental command
 --------------------
@@ -169,8 +188,8 @@ For example:
       --source-origin https://zlib.net \
       --phase install
 
-The command supports SourcePlan version 4 fixed SHA-256 URL sources, simply placed URL resources, and bounded repository-local or URL unified-diff patches.
-It does not support ``.Z`` or extensionless compressed patches, package-defined ``patch()`` methods, implicit or dictionary resource placement, mutable VCS sources, custom fetchers, or fetch options.
+The command supports SourcePlan version 4 fixed SHA-256 URL sources, simply placed URL resources, bounded repository-local or URL unified-diff patches, and package-defined ``patch()`` methods.
+It does not support ``.Z`` or extensionless compressed patches, implicit or dictionary resource placement, mutable VCS sources, custom fetchers, or fetch options.
 It is Linux-only because the worker requires Landlock filesystem and TCP restrictions.
 It is intended for development and trust-boundary evaluation, not as a compatibility replacement for normal installation.
 Command tests must verify authority parsing, ordered argument transport, temporary-stage lifetime, and registration inputs, while the worker integration suite remains responsible for real confinement, rollback, and provenance behavior.

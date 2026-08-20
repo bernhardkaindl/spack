@@ -13,7 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_PHASES = 32
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 _PHASE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
@@ -186,6 +186,7 @@ def _run_phases(request: Dict[str, Any], repositories):
     """Verify build provenance and execute declared phases under confinement."""
     import spack.build_environment
     import spack.builder
+    import spack.multimethod
     import spack.patch
     import spack.platforms
     import spack.util.url
@@ -217,8 +218,6 @@ def _run_phases(request: Dict[str, Any], repositories):
     package = spec.package
     if package.content_hash() != root["package_hash"]:
         raise WorkerRequestError("package hash does not match the verified repository")
-    if callable(getattr(package, "patch", None)):
-        raise WorkerRequestError("package-defined patch methods are unsupported")
     recipe_patches = []
     for patch in spec.patches:
         description = {
@@ -258,6 +257,14 @@ def _run_phases(request: Dict[str, Any], repositories):
         path=request["prepared_stage"], source_path=request["prepared_stage"]
     )
     spack.build_environment.setup_package(package, dirty=False)
+    patch_method = False
+    if callable(getattr(package, "patch", None)):
+        try:
+            from spack.package_base import run_patch_method
+
+            patch_method = run_patch_method(package)
+        except spack.multimethod.NoSuchMethodError:
+            pass
     builder = spack.builder.create(package)
     phases = {phase.name: phase for phase in builder}
     selected = []
@@ -273,6 +280,7 @@ def _run_phases(request: Dict[str, Any], repositories):
         "phases": request["phases"],
         "dag_hash": root["hash"],
         "package_hash": root["package_hash"],
+        "patch_method": patch_method,
         "source_plan_sha256": request["source_plan_sha256"],
         "initial_stage_sha256": initial_stage_sha256,
         "final_stage_sha256": prepared_stage_digest(Path(request["prepared_stage"])),

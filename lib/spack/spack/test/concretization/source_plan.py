@@ -440,7 +440,7 @@ def test_source_plan_for_compressed_url_patch(concretize_scope, mock_packages_re
 
 
 @pytest.mark.use_package_hash
-def test_source_plan_rejects_package_patch_method(
+def test_source_plan_accepts_package_patch_method(
     concretize_scope, mock_packages_repo, repo_builder
 ):
     repo_builder.add_package("source-plan-patch-method")
@@ -457,8 +457,12 @@ def test_source_plan_rejects_package_patch_method(
 
     with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
         concrete = spack.concretize.concretize_one("source-plan-patch-method@1.0")
-        with pytest.raises(SourcePlanError, match="patch methods"):
-            source_plan_for_spec(concrete, [])
+        plan = source_plan_for_spec(
+            concrete,
+            [{"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}],
+        )
+
+    assert plan["patches"] == []
 
 
 @pytest.mark.use_package_hash

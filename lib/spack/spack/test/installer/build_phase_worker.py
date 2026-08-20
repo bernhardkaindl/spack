@@ -138,6 +138,149 @@ def test_run_prepared_build_phase_sandboxed(
 
 
 @pytest.mark.use_package_hash
+def test_run_prepared_build_phase_with_package_patch_method(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
+):
+    """Run the normal package patch method once under confinement before build phases."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-build-patch-method",
+        """    def patch(self):
+        from pathlib import Path
+        path = Path(self.stage.source_path).joinpath("README")
+        path.write_text(path.read_text().replace("prepared", "patched"))
+
+    def install(self, spec, prefix):
+        from pathlib import Path
+        source = Path(self.stage.source_path).joinpath("README")
+        Path(prefix).joinpath("message").write_text(source.read_text())
+""",
+    )
+
+    def reject_parent_package_import(*args, **kwargs):
+        raise AssertionError("trusted parent imported recipe code")
+
+    monkeypatch.setattr(spack.repo.PATH, "get_pkg_class", reject_parent_package_import)
+    response = run_build_phase_sandboxed(
+        concrete, plan, prepared, "install", prefix=tmp_path / "prefix", repositories=repositories
+    )
+
+    assert response["patch_method"] is True
+    assert (tmp_path / "prefix" / "message").read_text(encoding="utf-8") == "patched source\n"
+
+
+@pytest.mark.use_package_hash
+@pytest.mark.requires_executables("patch")
+def test_declarative_patch_runs_before_package_patch_method(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    source = tmp_path / "source.tar.gz"
+    checksum = _write_source_archive(
+        source, source_files={"project/message": (b"before\n", 0o644)}
+    )
+    _add_build_recipe(
+        repo_builder,
+        "sandbox-build-combined-patch",
+        source.as_uri(),
+        checksum,
+        """    patch("fix.patch", level=0)
+
+    def patch(self):
+        from pathlib import Path
+        path = Path(self.stage.source_path).joinpath("message")
+        path.write_text(path.read_text().replace("declarative", "method"))
+
+    def install(self, spec, prefix):
+        from pathlib import Path
+        source = Path(self.stage.source_path).joinpath("message")
+        Path(prefix).joinpath("message").write_text(source.read_text())
+""",
+    )
+    recipe = Path(repo_builder._recipe_filename("sandbox-build-combined-patch"))
+    recipe.with_name("fix.patch").write_text(
+        "--- message\n+++ message\n@@ -1 +1 @@\n-before\n+declarative\n", encoding="utf-8"
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+    concrete = concretize_one_sandboxed(
+        "sandbox-build-combined-patch@1.0", repositories=repositories
+    )
+    plan = plan_sources_sandboxed(concrete, repositories=repositories)
+    prepared = prepare_stage(
+        plan,
+        tmp_path / "prepared",
+        expected_provenance=plan["provenance"],
+        fetch_policy=SourceFetchPolicy(file_roots=(tmp_path,)),
+    )
+
+    response = run_build_phase_sandboxed(
+        concrete, plan, prepared, "install", prefix=tmp_path / "prefix", repositories=repositories
+    )
+
+    assert response["patch_method"] is True
+    assert (tmp_path / "prefix" / "message").read_text(encoding="utf-8") == "method\n"
+
+
+@pytest.mark.use_package_hash
+def test_package_patch_multimethod_without_match_is_not_applied(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-build-conditional-patch-method",
+        """    @when("@2:")
+    def patch(self):
+        raise RuntimeError("must not run")
+
+    def install(self, spec, prefix):
+        from pathlib import Path
+        Path(prefix).joinpath("installed").write_text("installed")
+""",
+    )
+
+    response = run_build_phase_sandboxed(
+        concrete, plan, prepared, "install", prefix=tmp_path / "prefix", repositories=repositories
+    )
+
+    assert response["patch_method"] is False
+
+
+@pytest.mark.use_package_hash
+def test_package_patch_method_cannot_write_outside_sandbox(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    outside = tmp_path / "outside"
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-build-confined-patch-method",
+        f"""    def patch(self):
+        from pathlib import Path
+        Path({str(outside)!r}).write_text("escaped")
+
+    def install(self, spec, prefix):
+        pass
+""",
+    )
+
+    with pytest.raises(SandboxedBuildPhaseError, match="PermissionError"):
+        run_build_phase_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            "install",
+            prefix=tmp_path / "prefix",
+            repositories=repositories,
+        )
+
+    assert not outside.exists()
+
+
+@pytest.mark.use_package_hash
 def test_run_prepared_build_phase_with_resource(
     concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
 ):
@@ -595,7 +738,7 @@ def test_install_prepared_publishes_trusted_metadata(
     assert read_install_provenance(prefix) == provenance
     assert validate_install_provenance(concrete, provenance) == provenance
     assert verify_install_provenance(concrete, prefix) == provenance
-    assert provenance["schema_version"] == 1
+    assert provenance["schema_version"] == 2
     assert provenance["spec"] == {
         "dag_hash": concrete.dag_hash(),
         "package_hash": response["package_hash"],
@@ -603,6 +746,7 @@ def test_install_prepared_publishes_trusted_metadata(
     assert provenance["source_plan"] == plan
     assert provenance["build"]["protocol_version"] == response["protocol_version"]
     assert provenance["build"]["phases"] == ["install"]
+    assert provenance["build"]["patch_method"] is False
     assert provenance["build"]["sandbox"] == response["sandbox"]
     assert provenance["build"]["repositories"] == plan["provenance"]["repositories"]
     assert provenance["build"]["source_plan_sha256"] == response["source_plan_sha256"]
@@ -631,6 +775,16 @@ def test_install_prepared_publishes_trusted_metadata(
     tampered["parent"]["actions"] = ["arbitrary_hook"]
     with pytest.raises(InstallMetadataError, match="post-action"):
         validate_install_provenance(concrete, tampered)
+
+    legacy = copy.deepcopy(provenance)
+    legacy["schema_version"] = 1
+    del legacy["build"]["patch_method"]
+    assert validate_install_provenance(concrete, legacy) == legacy
+
+    invalid_version = copy.deepcopy(legacy)
+    invalid_version["schema_version"] = True
+    with pytest.raises(InstallMetadataError, match="invalid sandbox install provenance"):
+        validate_install_provenance(concrete, invalid_version)
 
     provenance_path = prefix / metadata["provenance_path"]
     provenance_path.write_text("{}", encoding="utf-8")

@@ -506,6 +506,14 @@ class DisableRedistribute:
         self.binary = binary
 
 
+def run_patch_method(package) -> bool:
+    """Run a package-defined patch method from the staged source directory."""
+    with fsys.working_dir(package.stage.source_path):
+        package.patch()
+    tty.msg("Ran patch() for {0}".format(package.name))
+    return True
+
+
 class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
     """This is the universal base class for all Spack packages.
 
@@ -1776,10 +1784,7 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
 
         if has_patch_fun:
             try:
-                with fsys.working_dir(self.stage.source_path):
-                    self.patch()
-                tty.msg("Ran patch() for {0}".format(self.name))
-                patched = True
+                patched = run_patch_method(self) or patched
             except spack.multimethod.NoSuchMethodError:
                 # We are running a multimethod without a default case.
                 # If there's no default it means we don't need to patch.

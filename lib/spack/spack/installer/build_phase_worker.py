@@ -49,7 +49,7 @@ from spack.solver.repository_snapshot import RepositorySnapshotError, repository
 from spack.solver.source_plan import SourcePlanError, validate_source_plan
 from spack.spec import Spec
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 MAX_PHASES = 32
 MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
 _PHASE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
@@ -134,6 +134,7 @@ def _validate_response(
         "phases",
         "dag_hash",
         "package_hash",
+        "patch_method",
         "source_plan_sha256",
         "initial_stage_sha256",
         "final_stage_sha256",
@@ -177,6 +178,8 @@ def _validate_response(
         or response["initial_stage_sha256"] != initial_stage_sha256
     ):
         raise SandboxedBuildPhaseError("worker returned inconsistent build provenance")
+    if not isinstance(response["patch_method"], bool):
+        raise SandboxedBuildPhaseError("worker returned invalid patch-method provenance")
     final_stage_sha256 = response["final_stage_sha256"]
     if not isinstance(final_stage_sha256, str) or not re.fullmatch(
         r"[0-9a-f]{64}", final_stage_sha256

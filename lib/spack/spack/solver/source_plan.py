@@ -286,8 +286,6 @@ def source_plan_for_spec(spec, repositories: Any) -> Dict[str, Any]:
                 "placement": resource.placement,
             }
         )
-    if callable(getattr(package, "patch", None)):
-        raise SourcePlanError("package-defined patch methods are unsupported")
     if len(spec.patches) > MAX_PATCHES:
         raise SourcePlanError("source plan has too many patches")
     patches = [_patch_for_plan(patch) for patch in spec.patches]
