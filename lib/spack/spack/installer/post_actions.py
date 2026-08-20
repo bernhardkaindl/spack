@@ -7,7 +7,7 @@
 import os
 import stat
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import spack.error
 import spack.hooks.sbang
@@ -16,6 +16,7 @@ from spack.installer.install_tree import (
     MAX_INSTALL_TREE_ENTRIES,
     InstallTreeError,
     install_tree_metadata,
+    verified_hardlink_inodes,
 )
 from spack.spec import Spec
 
@@ -30,10 +31,14 @@ class PostActionError(spack.error.SpackError):
     """Raised when a trusted parent post-action cannot be applied safely."""
 
 
-def _reject_hardlinked_file(path: Path, prefix: Path, info: os.stat_result) -> None:
-    if info.st_nlink != 1:
+def _reject_external_hardlink(
+    path: Path, prefix: Path, info: os.stat_result, internal_hardlinks: Dict[Tuple[int, int], int]
+) -> None:
+    if info.st_nlink != 1 and internal_hardlinks.get((info.st_dev, info.st_ino)) != info.st_nlink:
         raise PostActionError(
-            "refusing hard-linked install-tree entry: {0}".format(path.relative_to(prefix))
+            "refusing external hardlink from install-tree entry: {0}".format(
+                path.relative_to(prefix)
+            )
         )
 
 
@@ -71,7 +76,9 @@ def validate_sbang_path(sbang_path: Path) -> bytes:
     return shebang
 
 
-def _sbang(prefix: Path, sbang_path: Path) -> Dict[str, Any]:
+def _sbang(
+    prefix: Path, sbang_path: Path, internal_hardlinks: Dict[Tuple[int, int], int]
+) -> Dict[str, Any]:
     """Rewrite overlong executable shebangs to an explicit store sbang path."""
     if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "pread", "pwrite")):
         raise PostActionError("sbang rewriting requires no-follow positional file I/O")
@@ -91,7 +98,7 @@ def _sbang(prefix: Path, sbang_path: Path) -> Dict[str, Any]:
                 continue
             if not info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
                 continue
-            _reject_hardlinked_file(path, prefix, info)
+            _reject_external_hardlink(path, prefix, info, internal_hardlinks)
             flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
             descriptor = os.open(path, flags)
             try:
@@ -143,7 +150,9 @@ def _validate_permission_mode(mode: int) -> None:
         raise PostActionError("refusing world-writable SGID install-tree entry")
 
 
-def _set_permissions(spec: Spec, prefix: Path) -> Dict[str, Any]:
+def _set_permissions(
+    spec: Spec, prefix: Path, internal_hardlinks: Dict[Tuple[int, int], int]
+) -> Dict[str, Any]:
     """Apply configured modes and group without following symbolic links."""
     if not hasattr(os, "fchmod") or not hasattr(os, "O_NOFOLLOW"):
         raise PostActionError(
@@ -183,7 +192,7 @@ def _set_permissions(spec: Spec, prefix: Path) -> Dict[str, Any]:
         if stat.S_ISDIR(info.st_mode):
             mode = directory_mode
         elif stat.S_ISREG(info.st_mode):
-            _reject_hardlinked_file(path, prefix, info)
+            _reject_external_hardlink(path, prefix, info, internal_hardlinks)
             mode = file_mode
             if not info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
                 mode &= ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -247,14 +256,15 @@ def run_post_actions(
     try:
         if install_tree_metadata(prefix) != expected_install_tree:
             raise PostActionError("install tree changed before parent post-actions")
+        internal_hardlinks = verified_hardlink_inodes(prefix)
         results = []
         for action in actions:
             if action == SBANG:
                 if sbang_path is None:
                     raise PostActionError("sbang post-action requires an explicit store path")
-                results.append(_sbang(prefix, sbang_path))
+                results.append(_sbang(prefix, sbang_path, internal_hardlinks))
             elif action == SET_PERMISSIONS:
-                results.append(_set_permissions(spec, prefix))
+                results.append(_set_permissions(spec, prefix, internal_hardlinks))
         final_install_tree = install_tree_metadata(prefix)
     except (InstallTreeError, OSError, KeyError) as error:
         raise PostActionError(f"cannot apply parent post-actions: {error}") from error

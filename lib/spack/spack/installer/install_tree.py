@@ -9,7 +9,7 @@ import json
 import os
 import stat
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import spack.error
 
@@ -18,6 +18,55 @@ MAX_INSTALL_TREE_ENTRIES = 1_000_000
 
 class InstallTreeError(spack.error.SpackError):
     """Raised when an install tree cannot be represented safely."""
+
+
+def verified_hardlink_inodes(root: Path) -> Dict[Tuple[int, int], int]:
+    """Return internal regular-file hardlinks and reject links outside the tree."""
+    root = Path(os.path.abspath(root))
+    try:
+        root_info = root.lstat()
+    except OSError as error:
+        raise InstallTreeError(f"cannot inspect install-tree root: {error}") from error
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise InstallTreeError("install-tree root must be a directory")
+    links = {}
+    entries = 1
+
+    def visit(directory: Path, relative: PurePosixPath) -> None:
+        nonlocal entries
+        with os.scandir(directory) as children:
+            for child_entry in sorted(children, key=lambda item: item.name):
+                entries += 1
+                if entries > MAX_INSTALL_TREE_ENTRIES:
+                    raise InstallTreeError("install tree exceeds the entry limit")
+                info = child_entry.stat(follow_symlinks=False)
+                child = relative / child_entry.name
+                if stat.S_ISDIR(info.st_mode):
+                    visit(Path(child_entry.path), child)
+                elif stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                    key = (info.st_dev, info.st_ino)
+                    count, expected, first = links.get(key, (0, info.st_nlink, child))
+                    if info.st_nlink != expected:
+                        raise InstallTreeError(
+                            "hardlink count changed while inspecting install tree: {0}".format(
+                                child
+                            )
+                        )
+                    links[key] = (count + 1, expected, first)
+
+    try:
+        visit(root, PurePosixPath())
+    except OSError as error:
+        raise InstallTreeError(f"cannot inspect install tree: {error}") from error
+
+    verified = {}
+    for key, (count, expected, first) in links.items():
+        if count != expected:
+            raise InstallTreeError(
+                "regular file has hardlinks outside install tree: {0}".format(first)
+            )
+        verified[key] = expected
+    return verified
 
 
 def install_tree_metadata(root: Path) -> Dict[str, Any]:
@@ -33,6 +82,9 @@ def install_tree_metadata(root: Path) -> Dict[str, Any]:
     identity = hashlib.sha256()
     entries = 0
     total_bytes = 0
+    hardlinks = {}
+    observed_hardlinks = {}
+    internal_hardlinks = verified_hardlink_inodes(root)
 
     def add(record: Dict[str, Any]) -> None:
         """Add one canonical entry record to the tree identity."""
@@ -61,6 +113,20 @@ def install_tree_metadata(root: Path) -> Dict[str, Any]:
                     continue
                 if not stat.S_ISREG(info.st_mode):
                     raise InstallTreeError(f"unsupported install-tree entry: {child}")
+                key = (info.st_dev, info.st_ino)
+                if info.st_nlink > 1:
+                    expected_links = internal_hardlinks.get(key)
+                    if expected_links != info.st_nlink:
+                        raise InstallTreeError(
+                            f"hardlink count changed while inspecting install tree: {child}"
+                        )
+                    observed_hardlinks[key] = observed_hardlinks.get(key, 0) + 1
+                    first = hardlinks.get(key)
+                    if first is not None:
+                        total_bytes += info.st_size
+                        add({"path": str(child), "type": "hardlink", "target": first})
+                        continue
+                    hardlinks[key] = str(child)
                 content = hashlib.sha256()
                 flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
                 with os.fdopen(os.open(path, flags), "rb") as stream:
@@ -69,6 +135,7 @@ def install_tree_metadata(root: Path) -> Dict[str, Any]:
                         info.st_dev,
                         info.st_ino,
                         info.st_mode,
+                        info.st_nlink,
                         info.st_size,
                         info.st_mtime_ns,
                     )
@@ -76,6 +143,7 @@ def install_tree_metadata(root: Path) -> Dict[str, Any]:
                         opened.st_dev,
                         opened.st_ino,
                         opened.st_mode,
+                        opened.st_nlink,
                         opened.st_size,
                         opened.st_mtime_ns,
                     )
@@ -90,6 +158,7 @@ def install_tree_metadata(root: Path) -> Dict[str, Any]:
                         final.st_dev,
                         final.st_ino,
                         final.st_mode,
+                        final.st_nlink,
                         final.st_size,
                         final.st_mtime_ns,
                     ) != expected:
@@ -110,6 +179,8 @@ def install_tree_metadata(root: Path) -> Dict[str, Any]:
     add({"path": ".", "type": "directory", "mode": stat.S_IMODE(root_info.st_mode)})
     try:
         visit(root, PurePosixPath())
+        if observed_hardlinks != internal_hardlinks:
+            raise InstallTreeError("hardlink topology changed while inspecting install tree")
     except OSError as error:
         raise InstallTreeError(f"cannot inspect install tree: {error}") from error
     return {"sha256": identity.hexdigest(), "entries": entries, "bytes": total_bytes}

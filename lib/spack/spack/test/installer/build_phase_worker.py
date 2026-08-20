@@ -279,6 +279,36 @@ def test_install_tree_metadata_rejects_special_files(tmp_path):
         install_tree_metadata(prefix)
 
 
+def test_install_tree_metadata_binds_internal_hardlinks(tmp_path):
+    """Represent internal hardlinks canonically without hashing their contents twice."""
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    original = prefix / "original"
+    original.write_text("content", encoding="utf-8")
+    os.link(original, prefix / "alias")
+
+    linked = install_tree_metadata(prefix)
+    (prefix / "alias").unlink()
+    (prefix / "alias").write_text("content", encoding="utf-8")
+    copied = install_tree_metadata(prefix)
+
+    assert linked["entries"] == copied["entries"] == 3
+    assert linked["bytes"] == copied["bytes"] == 14
+    assert linked["sha256"] != copied["sha256"]
+
+
+def test_install_tree_metadata_rejects_external_hardlink(tmp_path):
+    """Reject a regular-file inode with a link outside the install tree."""
+    outside = tmp_path / "outside"
+    outside.write_text("content", encoding="utf-8")
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    os.link(outside, prefix / "linked")
+
+    with pytest.raises(InstallTreeError, match="hardlinks outside install tree"):
+        install_tree_metadata(prefix)
+
+
 @pytest.mark.use_package_hash
 def test_install_prepared_publishes_trusted_metadata(
     concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
@@ -604,7 +634,7 @@ def test_install_prepared_rejects_hardlinked_post_action_file(
     prefix.mkdir(parents=True)
     (prefix / "original.txt").write_text("original", encoding="utf-8")
 
-    with pytest.raises(SandboxedBuildPhaseError, match="hard-linked install-tree entry"):
+    with pytest.raises(SandboxedBuildPhaseError, match="hardlinks outside install tree"):
         install_prepared_registered_sandboxed(
             concrete,
             plan,
@@ -618,6 +648,44 @@ def test_install_prepared_rejects_hardlinked_post_action_file(
     assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
     assert not (prefix / "script").exists()
     assert (prepared.path / "victim").read_text(encoding="utf-8").startswith("#!/iii")
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_allows_internal_hardlinked_post_action_file(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
+):
+    """Apply parent mutations once to a verified in-prefix hardlink group."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-internal-hardlink",
+        """    def install(self, spec, prefix):
+        import os
+        from pathlib import Path
+        tool = Path(prefix).joinpath("tool")
+        tool.write_text("#!/" + "i" * 300 + "\\noutput\\n")
+        tool.chmod(0o700)
+        os.link(str(tool), str(Path(prefix).joinpath("tool-alias")))
+""",
+    )
+
+    response = install_prepared_registered_sandboxed(
+        concrete,
+        plan,
+        prepared,
+        ["install"],
+        store=temporary_store,
+        repositories=repositories,
+        post_actions=["sbang", "set_permissions"],
+    )
+
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    tool = prefix / "tool"
+    alias = prefix / "tool-alias"
+    assert tool.stat().st_ino == alias.stat().st_ino
+    assert tool.read_text(encoding="utf-8").startswith("#!/bin/sh ")
+    assert response["install_metadata"]["install_tree"] == install_tree_metadata(prefix)
 
 
 @pytest.mark.use_package_hash
