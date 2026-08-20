@@ -111,6 +111,55 @@ def test_validate_implicit_resource_placement(source_plan):
     assert validate_source_plan(source_plan) is source_plan
 
 
+def test_validate_resource_mapping_placement(source_plan):
+    source_plan["schema_version"] = 6
+    resource = resource_description()
+    resource["placement"] = [
+        {"source": "include/api.h", "destination": "headers/api.h"},
+        {"source": "lib", "destination": "vendor/lib"},
+    ]
+    source_plan["resources"] = [resource]
+
+    assert validate_source_plan(source_plan) is source_plan
+
+
+@pytest.mark.parametrize(
+    "schema_version,placement,match",
+    [
+        (5, [{"source": "include", "destination": "headers"}], "placement"),
+        (6, [], "placement"),
+        (6, [{"source": "../include", "destination": "headers"}], "source"),
+        (6, [{"source": "include", "destination": ""}], "destination"),
+        (
+            6,
+            [
+                {"source": "include", "destination": "headers"},
+                {"source": "include/api.h", "destination": "api.h"},
+            ],
+            "sources overlap",
+        ),
+        (
+            6,
+            [
+                {"source": "include", "destination": "headers"},
+                {"source": "lib", "destination": "headers/lib"},
+            ],
+            "destinations overlap",
+        ),
+    ],
+)
+def test_source_plan_rejects_invalid_resource_mapping(
+    source_plan, schema_version, placement, match
+):
+    source_plan["schema_version"] = schema_version
+    resource = resource_description()
+    resource["placement"] = placement
+    source_plan["resources"] = [resource]
+
+    with pytest.raises(SourcePlanError, match=match):
+        validate_source_plan(source_plan)
+
+
 def test_legacy_source_plan_rejects_implicit_resource_placement(source_plan):
     source_plan["schema_version"] = 4
     resource = resource_description()
@@ -359,7 +408,8 @@ def test_source_plan_for_url_resource(concretize_scope, mock_packages_repo, repo
         concrete = spack.concretize.concretize_one("source-plan-resource@1.0")
         plan = source_plan_for_spec(concrete, repositories)
 
-    assert plan["schema_version"] == 5
+    assert plan["schema_version"] == 6
+    assert plan["source"]["urls"] == ["https://example.com/source-plan-resource-1.0.tar.gz"]
     assert plan["resources"] == [resource_description()]
 
 
@@ -391,7 +441,7 @@ def test_source_plan_for_implicit_resource_placement(
         concrete = spack.concretize.concretize_one("source-plan-implicit-resource@1.0")
         plan = source_plan_for_spec(concrete, repositories)
 
-    assert plan["schema_version"] == 5
+    assert plan["schema_version"] == 6
     assert plan["resources"][0]["placement"] is None
 
 
@@ -517,7 +567,7 @@ def test_source_plan_accepts_package_patch_method(
 
 
 @pytest.mark.use_package_hash
-def test_source_plan_rejects_resource_dictionary_placement(
+def test_source_plan_normalizes_resource_dictionary_placement(
     concretize_scope, mock_packages_repo, repo_builder
 ):
     repo_builder.add_package("source-plan-resource-dict")
@@ -531,16 +581,24 @@ def test_source_plan_rejects_resource_dictionary_placement(
         + '        name="headers",\n'
         + '        url="https://example.com/headers.tar.gz",\n'
         + f"        sha256={'e' * 64!r},\n"
-        + '        placement={"include": "headers"},\n'
+        + '        placement={"include/api.h": "headers/api.h", "lib": "vendor/lib"},\n'
         + '        when="@1.0",\n'
         + "    )\n",
         encoding="utf-8",
     )
 
+    repositories = [
+        {"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}
+    ]
+
     with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
         concrete = spack.concretize.concretize_one("source-plan-resource-dict@1.0")
-        with pytest.raises(SourcePlanError, match="string or null"):
-            source_plan_for_spec(concrete, [])
+        plan = source_plan_for_spec(concrete, repositories)
+
+    assert plan["resources"][0]["placement"] == [
+        {"source": "include/api.h", "destination": "headers/api.h"},
+        {"source": "lib", "destination": "vendor/lib"},
+    ]
 
 
 @pytest.mark.use_package_hash

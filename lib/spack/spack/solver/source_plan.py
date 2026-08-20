@@ -23,9 +23,10 @@ import spack.hash_types as ht
 import spack.patch
 import spack.util.url
 
-SOURCE_PLAN_SCHEMA_VERSION = 5
+SOURCE_PLAN_SCHEMA_VERSION = 6
 MAX_SOURCE_URLS = 32
 MAX_RESOURCES = 32
+MAX_RESOURCE_PLACEMENTS = 256
 MAX_PATCHES = 32
 MAX_PATCH_BYTES = 48 * 1024
 MAX_PATCH_BYTES_TOTAL = 512 * 1024
@@ -110,6 +111,30 @@ def _relative_path(
     ):
         raise SourcePlanError(f"invalid {description}")
     return path
+
+
+def _paths_overlap(first: str, second: str) -> bool:
+    first_parts = PurePosixPath(first).parts
+    second_parts = PurePosixPath(second).parts
+    return (
+        first_parts == second_parts[: len(first_parts)]
+        or second_parts == first_parts[: len(second_parts)]
+    )
+
+
+def _resource_placement_for_plan(placement: Any) -> Any:
+    if placement is None or isinstance(placement, str):
+        return placement
+    if not isinstance(placement, dict) or not placement:
+        raise SourcePlanError("resource placement must be a string, mapping, or null")
+    if any(
+        not isinstance(source, str) or not isinstance(destination, str)
+        for source, destination in placement.items()
+    ):
+        raise SourcePlanError("resource placement mapping paths must be strings")
+    return [
+        {"source": source, "destination": destination} for source, destination in placement.items()
+    ]
 
 
 def _patch_for_plan(patch: Any) -> Dict[str, Any]:
@@ -276,20 +301,17 @@ def source_plan_for_spec(spec, repositories: Any) -> Dict[str, Any]:
         raise SourcePlanError("source plan has too many resources")
     resources = []
     for resource in needed_resources:
-        if resource.placement is None:
-            source = _source_for_fetcher(resource.fetcher, "resource")
-            if not source["expand"]:
+        placement = _resource_placement_for_plan(resource.placement)
+        resource_source = _source_for_fetcher(resource.fetcher, "resource")
+        if placement is None:
+            if not resource_source["expand"]:
                 raise SourcePlanError("implicit placement requires an expanding resource")
-        elif isinstance(resource.placement, str) and resource.placement:
-            source = _source_for_fetcher(resource.fetcher, "resource")
-        else:
-            raise SourcePlanError("resource placement must be a string or null")
         resources.append(
             {
                 "name": resource.name,
-                "source": source,
+                "source": resource_source,
                 "destination": resource.destination,
-                "placement": resource.placement,
+                "placement": placement,
             }
         )
     if len(spec.patches) > MAX_PATCHES:
@@ -329,6 +351,7 @@ def validate_source_plan(
         2,
         3,
         4,
+        5,
         SOURCE_PLAN_SCHEMA_VERSION,
     ):
         raise SourcePlanError("unsupported source plan schema")
@@ -377,6 +400,7 @@ def validate_source_plan(
         if not isinstance(resources, list) or len(resources) > MAX_RESOURCES:
             raise SourcePlanError("invalid source plan resources")
         names = []
+        placement_entries = 0
         for resource in resources:
             if not isinstance(resource, dict) or set(resource) != {
                 "name",
@@ -392,8 +416,39 @@ def validate_source_plan(
             if placement is None:
                 if schema_version < 5 or resource["source"]["expand"] is not True:
                     raise SourcePlanError("invalid implicit resource placement")
-            else:
+            elif isinstance(placement, str):
                 _relative_path(placement, "resource placement")
+            elif schema_version >= 6 and isinstance(placement, list) and placement:
+                placement_entries += len(placement)
+                if placement_entries > MAX_RESOURCE_PLACEMENTS:
+                    raise SourcePlanError("source plan has too many resource placements")
+                sources = []
+                destinations = []
+                for mapping in placement:
+                    if not isinstance(mapping, dict) or set(mapping) != {"source", "destination"}:
+                        raise SourcePlanError("invalid resource placement mapping")
+                    sources.append(
+                        _relative_path(
+                            mapping["source"], "resource placement source", allow_empty=True
+                        )
+                    )
+                    destinations.append(
+                        _relative_path(mapping["destination"], "resource placement destination")
+                    )
+                if any(
+                    _paths_overlap(first, second)
+                    for index, first in enumerate(sources)
+                    for second in sources[index + 1 :]
+                ):
+                    raise SourcePlanError("resource placement sources overlap")
+                if any(
+                    _paths_overlap(first, second)
+                    for index, first in enumerate(destinations)
+                    for second in destinations[index + 1 :]
+                ):
+                    raise SourcePlanError("resource placement destinations overlap")
+            else:
+                raise SourcePlanError("invalid resource placement")
         if len(set(names)) != len(names):
             raise SourcePlanError("resource names must be unique")
 

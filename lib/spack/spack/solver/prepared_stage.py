@@ -26,6 +26,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import spack.error
+import spack.util.url
 import spack.util.web
 from spack.solver.source_plan import (
     MAX_PATCH_BYTES,
@@ -362,9 +363,41 @@ def _prepare_source(
         finally:
             shutil.rmtree(container, ignore_errors=True)
     else:
-        filename = Path(urllib.parse.urlsplit(source["urls"][0]).path).name or "source"
+        filename = spack.util.url.default_download_filename(source["urls"][0])
         shutil.copy2(archive, destination / filename)
     return None
+
+
+def _place_resource_mapping(resource_root: Path, root: Path, resource: Any) -> None:
+    copies = []
+    for mapping in resource["placement"]:
+        source = resource_root / mapping["source"]
+        target = root / resource["destination"] / mapping["destination"]
+        if not source.exists():
+            raise PreparedStageError(
+                f"resource placement source does not exist: {mapping['source']}"
+            )
+        if source.is_symlink() or not (source.is_file() or source.is_dir()):
+            raise PreparedStageError(f"unsupported resource placement source: {mapping['source']}")
+        if target.exists() or target.is_symlink():
+            raise PreparedStageError(
+                f"resource placement already exists: {target.relative_to(root)}"
+            )
+        for parent in target.parents:
+            if parent == root:
+                break
+            if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                raise PreparedStageError(
+                    f"resource placement parent is not a directory: {parent.relative_to(root)}"
+                )
+        copies.append((source, target))
+
+    for source, target in copies:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            shutil.copytree(source, target, copy_function=shutil.copy2)
+        else:
+            shutil.copy2(source, target)
 
 
 def _prepare_resources(
@@ -385,6 +418,9 @@ def _prepare_resources(
             budget,
         )
         placement = resource["placement"]
+        if isinstance(placement, list):
+            _place_resource_mapping(resource_root, root, resource)
+            continue
         if placement is None:
             if implicit_placement is None:
                 raise PreparedStageError(

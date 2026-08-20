@@ -330,7 +330,7 @@ def test_run_prepared_build_phase_with_resource(
     )
 
     assert response["source_plan_sha256"] == source_plan_digest(plan)
-    assert plan["schema_version"] == 5
+    assert plan["schema_version"] == 6
     assert [resource["name"] for resource in plan["resources"]] == ["headers"]
     assert (prefix / "resource.txt").read_text(encoding="utf-8") == "prepared source\n"
 
@@ -380,6 +380,59 @@ def test_run_prepared_build_phase_with_implicit_resource_placement(
 
     assert response["source_plan_sha256"] == source_plan_digest(plan)
     assert plan["resources"][0]["placement"] is None
+    assert (tmp_path / "prefix" / "resource.txt").read_text(encoding="utf-8") == (
+        "prepared source\n"
+    )
+
+
+@pytest.mark.use_package_hash
+def test_run_prepared_build_phase_with_resource_mapping(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    source = tmp_path / "source.tar.gz"
+    resource = tmp_path / "resource.tar.gz"
+    source_checksum = _write_source_archive(source)
+    resource_checksum = _write_source_archive(resource)
+    _add_build_recipe(
+        repo_builder,
+        "sandbox-build-resource-mapping",
+        source.as_uri(),
+        source_checksum,
+        f"""    resource(
+        name="headers",
+        url={resource.as_uri()!r},
+        sha256={resource_checksum!r},
+        destination="vendor",
+        placement={{"README": "mapped/resource.txt"}},
+        when="@1.0",
+    )
+
+    def install(self, spec, prefix):
+        from pathlib import Path
+        source = Path(self.stage.source_path).joinpath("vendor", "mapped", "resource.txt")
+        Path(prefix).joinpath("resource.txt").write_text(source.read_text())
+""",
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+    concrete = concretize_one_sandboxed(
+        "sandbox-build-resource-mapping@1.0", repositories=repositories
+    )
+    plan = plan_sources_sandboxed(concrete, repositories=repositories)
+    prepared = prepare_stage(
+        plan,
+        tmp_path / "prepared",
+        expected_provenance=plan["provenance"],
+        fetch_policy=SourceFetchPolicy(file_roots=(tmp_path,)),
+    )
+
+    response = run_build_phase_sandboxed(
+        concrete, plan, prepared, "install", prefix=tmp_path / "prefix", repositories=repositories
+    )
+
+    assert response["source_plan_sha256"] == source_plan_digest(plan)
+    assert plan["resources"][0]["placement"] == [
+        {"source": "README", "destination": "mapped/resource.txt"}
+    ]
     assert (tmp_path / "prefix" / "resource.txt").read_text(encoding="utf-8") == (
         "prepared source\n"
     )

@@ -92,8 +92,8 @@ SourcePlan resources
 --------------------
 
 SourcePlan version 2 added bounded immutable URL resources.
-New plans use version 5, while versions 1 through 4 remain valid for existing provenance records.
-Each resource has an identifier, the same fixed-URL source descriptor used for the main source, a relative ``destination``, and an explicit relative or implicit ``placement``.
+New plans use version 6, while versions 1 through 5 remain valid for existing provenance records.
+Each resource has an identifier, the same fixed-URL source descriptor used for the main source, a relative ``destination``, and a string, implicit, or ordered mapping ``placement``.
 The recipe worker may emit at most 32 resources and 32 unique candidate URLs per source descriptor.
 Every source and resource requires a SHA-256 checksum; mutable VCS fetchers and fetch options remain rejected.
 
@@ -107,9 +107,14 @@ Version 2 supports only an explicit nonempty string ``placement``.
 Version 5 adds implicit placement for expanding resources whose archive contains exactly one top-level directory and no sibling entries.
 The trusted parent records the validated top-level directory name while stripping that directory during extraction and places the resource under ``destination/<top-level-directory>``, matching normal ``ResourceStage.srcdir`` behavior without exposing a private staging path.
 Flat, multi-root, hidden-sibling, and non-expanding resources fail closed when placement is omitted because they have no unambiguous relative placement name.
-Dictionary placement remains unsupported because it projects multiple selected paths and requires separate overlap, merge-order, and conflict semantics.
+Version 6 serializes recipe dictionary placement as an ordered list of exact ``source`` and ``destination`` records, preserving recipe insertion order without relying on JSON object-key behavior.
+A plan may contain at most 256 mapping records across all resources.
+Sources select regular files or directories under the safely extracted resource root; for non-expanding resources, the selectable filename is derived with the same ``default_download_filename`` rule as normal ``Stage`` handling, including sanitized query text.
+Empty source paths select the complete resource root, while destinations must be nonempty normalized relative paths.
+Source or destination duplicates and ancestor overlaps within a mapping are rejected, and every source plus every final destination is prevalidated before that resource copies any content.
+Missing sources, unsupported entries, existing destinations, and conflicts with earlier resources abort the complete unpublished prepared-tree transaction.
 
-Tests cover recipe-worker serialization, malformed descriptors, traversal, duplicate names, explicit and implicit placement, legacy-schema rejection, ambiguous-layout rollback, authority prevalidation, aggregate limits, placement conflicts, prepared-tree identity, and consumption by the confined build worker without a parent recipe import.
+Tests cover recipe-worker serialization, malformed descriptors, traversal, duplicate names, string, implicit, and mapped placement, legacy-schema rejection, mapping overlap and query-bearing filename handling, ambiguous-layout rollback, authority prevalidation, aggregate limits, placement conflicts, prepared-tree identity, and consumption by the confined build worker without a parent recipe import.
 
 SourcePlan patches
 ------------------
@@ -190,8 +195,8 @@ For example:
       --source-origin https://zlib.net \
       --phase install
 
-The command supports SourcePlan version 5 fixed SHA-256 URL sources, explicitly or implicitly placed URL resources, bounded repository-local or URL unified-diff patches, and package-defined ``patch()`` methods.
-It does not support ``.Z`` or extensionless compressed patches, dictionary resource placement, ambiguous implicit resource layouts, mutable VCS sources, custom fetchers, or fetch options.
+The command supports SourcePlan version 6 fixed SHA-256 URL sources, string, implicit, or dictionary-placed URL resources, bounded repository-local or URL unified-diff patches, and package-defined ``patch()`` methods.
+It does not support ``.Z`` or extensionless compressed patches, ambiguous implicit resource layouts, mutable VCS sources, custom fetchers, or fetch options.
 It is Linux-only because the worker requires Landlock filesystem and TCP restrictions.
 It is intended for development and trust-boundary evaluation, not as a compatibility replacement for normal installation.
 Command tests must verify authority parsing, ordered argument transport, temporary-stage lifetime, and registration inputs, while the worker integration suite remains responsible for real confinement, rollback, and provenance behavior.

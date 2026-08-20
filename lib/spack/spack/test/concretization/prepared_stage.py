@@ -59,7 +59,13 @@ def source_plan(archive: Path, provenance, *, extension="tar.gz", expand=True):
 
 
 def add_resource(
-    plan, archive: Path, *, destination="vendor", placement="headers", extension="tar.gz"
+    plan,
+    archive: Path,
+    *,
+    destination="vendor",
+    placement="headers",
+    extension="tar.gz",
+    expand=True,
 ):
     plan["schema_version"] = 2
     plan["resources"].append(
@@ -69,7 +75,7 @@ def add_resource(
                 "kind": "url",
                 "urls": [archive.as_uri()],
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-                "expand": True,
+                "expand": expand,
                 "extension": extension,
             },
             "destination": destination,
@@ -181,6 +187,123 @@ def test_prepare_stage_fetches_and_places_resource(tmp_path, provenance, fetch_p
     assert header.read_text(encoding="utf-8") == "#define VALUE 1\n"
     assert prepared.source_plan_sha256 == source_plan_digest(plan)
     assert prepared.content_sha256 == prepared_stage_digest(prepared.path)
+
+
+def test_prepare_stage_places_resource_mapping(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "headers.tar.gz"
+    write_tar(archive, [("project/configure", "#!/bin/sh\n", tarfile.REGTYPE)])
+    write_tar(
+        resource,
+        [
+            ("resource/include/library.h", "#define VALUE 1\n", tarfile.REGTYPE),
+            ("resource/lib/library.txt", "library\n", tarfile.REGTYPE),
+        ],
+    )
+    placement = [
+        {"source": "include/library.h", "destination": "headers/library.h"},
+        {"source": "lib", "destination": "vendor/lib"},
+    ]
+    plan = add_resource(source_plan(archive, provenance), resource, placement=placement)
+    plan["schema_version"] = 6
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    assert (prepared.path / "vendor" / "headers" / "library.h").read_text() == (
+        "#define VALUE 1\n"
+    )
+    assert (prepared.path / "vendor" / "vendor" / "lib" / "library.txt").read_text() == (
+        "library\n"
+    )
+
+
+def test_prepare_stage_maps_no_expand_query_filename(tmp_path, provenance):
+    class ResourceHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"extension\n")
+
+        def log_message(self, format, *args):
+            pass
+
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "extension-functions.c"
+    write_tar(archive, [("project/configure", "#!/bin/sh\n", tarfile.REGTYPE)])
+    resource.write_text("extension\n", encoding="utf-8")
+    plan = add_resource(
+        source_plan(archive, provenance),
+        resource,
+        placement=[
+            {"source": "extension-functions.c?get=25", "destination": "extension-functions.c"}
+        ],
+        extension=None,
+        expand=False,
+    )
+    plan["schema_version"] = 6
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ResourceHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    plan["resources"][0]["source"]["urls"] = [
+        f"http://127.0.0.1:{server.server_port}/extension-functions.c?get=25"
+    ]
+    try:
+        prepared = prepare_stage(
+            plan,
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=SourceFetchPolicy(
+                file_roots=(tmp_path,), http_origins=frozenset({("127.0.0.1", server.server_port)})
+            ),
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+    assert (prepared.path / "vendor" / "extension-functions.c").read_text() == "extension\n"
+
+
+def test_prepare_stage_prevalidates_resource_mapping_transactionally(
+    tmp_path, provenance, fetch_policy, monkeypatch
+):
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "headers.tar.gz"
+    write_tar(archive, [("project/vendor/existing", "main\n", tarfile.REGTYPE)])
+    write_tar(
+        resource,
+        [
+            ("resource/first", "first\n", tarfile.REGTYPE),
+            ("resource/second", "second\n", tarfile.REGTYPE),
+        ],
+    )
+    plan = add_resource(
+        source_plan(archive, provenance),
+        resource,
+        placement=[
+            {"source": "first", "destination": "first"},
+            {"source": "second", "destination": "existing"},
+        ],
+    )
+    plan["schema_version"] = 6
+    copied = []
+    original_copy2 = prepared_stage_module.shutil.copy2
+
+    def record_copy(source, destination, *args, **kwargs):
+        copied.append((source, destination))
+        return original_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(prepared_stage_module.shutil, "copy2", record_copy)
+
+    with pytest.raises(PreparedStageError, match="placement already exists"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert copied == []
+    assert not (tmp_path / "prepared").exists()
 
 
 def test_prepare_stage_uses_resource_top_level_directory_for_implicit_placement(
