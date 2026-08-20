@@ -13,8 +13,13 @@ import tarfile
 
 import pytest
 
+import spack.hooks
 import spack.repo
-from spack.installer.build_phase_worker import SandboxedBuildPhaseError, run_build_phase_sandboxed
+from spack.installer.build_phase_worker import (
+    SandboxedBuildPhaseError,
+    install_prepared_sandboxed,
+    run_build_phase_sandboxed,
+)
 from spack.solver.concretize_worker import concretize_one_sandboxed, plan_sources_sandboxed
 from spack.solver.prepared_stage import (
     PreparedStage,
@@ -293,3 +298,150 @@ def test_build_phase_recomputes_package_hash(
             prefix=tmp_path / "prefix",
             repositories=repositories,
         )
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_sandboxed_commits_ordered_phases(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
+):
+    """Commit a replacement prefix after all confined phases succeed in order."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-commit",
+        """    def configure(self, spec, prefix):
+        \"\"\"Record the first confined phase.\"\"\"
+        from pathlib import Path
+        Path(prefix).joinpath("order.txt").write_text("configure\\n")
+
+    def install(self, spec, prefix):
+        \"\"\"Record the second confined phase.\"\"\"
+        from pathlib import Path
+        with Path(prefix).joinpath("order.txt").open("a") as stream:
+            stream.write("install\\n")
+
+class GenericBuilder(Builder):
+    \"\"\"Adapt the generated package to two ordered phases.\"\"\"
+    phases = ("configure", "install")
+
+    def configure(self, pkg, spec, prefix):
+        \"\"\"Forward configure to the package implementation.\"\"\"
+        pkg.configure(spec, prefix)
+
+    def install(self, pkg, spec, prefix):
+        \"\"\"Forward install to the package implementation.\"\"\"
+        pkg.install(spec, prefix)
+""",
+    )
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    (prefix / "original.txt").write_text("original", encoding="utf-8")
+
+    def reject_global_hook(*args, **kwargs):
+        """Fail if untyped global install hooks run in the parent."""
+        raise AssertionError("global install hook crossed the typed boundary")
+
+    monkeypatch.setattr(spack.hooks, "pre_install", reject_global_hook)
+    monkeypatch.setattr(spack.hooks, "post_install", reject_global_hook)
+    response = install_prepared_sandboxed(
+        concrete,
+        plan,
+        prepared,
+        ["configure", "install"],
+        prefix=prefix,
+        repositories=repositories,
+    )
+
+    assert response["phases"] == ["configure", "install"]
+    assert (prefix / "order.txt").read_text(encoding="utf-8") == "configure\ninstall\n"
+    assert not (prefix / "original.txt").exists()
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_sandboxed_rolls_back_failed_phases(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    """Restore an existing prefix when a later confined phase fails."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-rollback",
+        """    def configure(self, spec, prefix):
+        \"\"\"Create partial output before the failing phase.\"\"\"
+        from pathlib import Path
+        Path(prefix).joinpath("partial.txt").write_text("partial")
+
+    def install(self, spec, prefix):
+        \"\"\"Fail so the parent must restore the original prefix.\"\"\"
+        raise RuntimeError("install failed")
+
+class GenericBuilder(Builder):
+    \"\"\"Adapt the generated package to two ordered phases.\"\"\"
+    phases = ("configure", "install")
+
+    def configure(self, pkg, spec, prefix):
+        \"\"\"Forward configure to the package implementation.\"\"\"
+        pkg.configure(spec, prefix)
+
+    def install(self, pkg, spec, prefix):
+        \"\"\"Forward install to the package implementation.\"\"\"
+        pkg.install(spec, prefix)
+""",
+    )
+    prefix = tmp_path / "prefix"
+    prefix.mkdir()
+    (prefix / "original.txt").write_text("original", encoding="utf-8")
+
+    with pytest.raises(SandboxedBuildPhaseError, match="install failed"):
+        install_prepared_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            ["configure", "install"],
+            prefix=prefix,
+            repositories=repositories,
+        )
+
+    assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
+    assert not (prefix / "partial.txt").exists()
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_sandboxed_prevalidates_all_phases(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    """Reject an unknown later phase before an earlier phase can mutate state."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-prevalidate",
+        """    def configure(self, spec, prefix):
+        \"\"\"Create a marker only if phase prevalidation is incomplete.\"\"\"
+        from pathlib import Path
+        Path(self.stage.source_path).joinpath("configured.txt").write_text("configured")
+
+class GenericBuilder(Builder):
+    \"\"\"Expose configure while leaving the requested missing phase undeclared.\"\"\"
+    phases = ("configure",)
+
+    def configure(self, pkg, spec, prefix):
+        \"\"\"Forward configure to the package implementation.\"\"\"
+        pkg.configure(spec, prefix)
+""",
+    )
+
+    with pytest.raises(SandboxedBuildPhaseError, match="does not declare phase: missing"):
+        install_prepared_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            ["configure", "missing"],
+            prefix=tmp_path / "prefix",
+            repositories=repositories,
+        )
+
+    assert not (prepared.path / "configured.txt").exists()
+    assert not (tmp_path / "prefix").exists()

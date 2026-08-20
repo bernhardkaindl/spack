@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-"""Experimental launcher for one phase over a trusted prepared source tree."""
+"""Experimental launcher for build phases over a trusted prepared source tree."""
 
 import os
 from pathlib import Path
@@ -32,7 +32,8 @@ from spack.solver.source_plan import SourcePlanError, validate_source_plan
 from spack.spec import Spec
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+MAX_PHASES = 32
 _PHASE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
 
 
@@ -61,7 +62,7 @@ def _repository_identities(repositories: List[Dict[str, Any]]) -> List[Dict[str,
 def _validate_response(
     response: Dict[str, Any],
     *,
-    phase: str,
+    phases: List[str],
     spec_data: Dict[str, Any],
     source_plan_sha256: str,
     initial_stage_sha256: str,
@@ -87,7 +88,7 @@ def _validate_response(
         "ok",
         "sandbox",
         "repositories",
-        "phase",
+        "phases",
         "dag_hash",
         "package_hash",
         "source_plan_sha256",
@@ -125,7 +126,7 @@ def _validate_response(
             raise SandboxedBuildPhaseError("repository contents changed during the build phase")
     root = spec_data["spec"]["nodes"][0]
     if (
-        response["phase"] != phase
+        response["phases"] != phases
         or response["dag_hash"] != root["hash"]
         or response["package_hash"] != root["package_hash"]
         or response["source_plan_sha256"] != source_plan_sha256
@@ -142,24 +143,30 @@ def _validate_response(
     return response
 
 
-def run_build_phase_sandboxed(
+def run_build_phases_sandboxed(
     spec: Spec,
     source_plan: Dict[str, Any],
     prepared_stage: PreparedStage,
-    phase: str,
+    phases: List[str],
     *,
     prefix: Path,
     repositories: List[Union[str, spack.repo.Repo]],
     timeout: float = 120.0,
 ) -> Dict[str, Any]:
-    """Run one declared build phase in a fresh Landlock-confined process."""
+    """Run ordered declared build phases in one fresh Landlock-confined process."""
     if not isinstance(spec, Spec) or not spec.concrete:
         raise SandboxedBuildPhaseError("build phase requires a concrete Spec")
     architecture = spec.architecture
     if architecture is None:
         raise SandboxedBuildPhaseError("build phase requires a concrete architecture")
-    if not isinstance(phase, str) or _PHASE.fullmatch(phase) is None:
-        raise SandboxedBuildPhaseError("invalid build phase name")
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or len(phases) > MAX_PHASES
+        or len(set(phases)) != len(phases)
+        or any(not isinstance(phase, str) or _PHASE.fullmatch(phase) is None for phase in phases)
+    ):
+        raise SandboxedBuildPhaseError("invalid build phase list")
     spec_data = spec.to_dict()
     try:
         _validate_spec_payload(spec_data)
@@ -203,7 +210,7 @@ def run_build_phase_sandboxed(
             "prepared_stage": str(stage_path),
             "prepared_stage_sha256": initial_stage_sha256,
             "prefix": str(prefix),
-            "phase": phase,
+            "phases": phases,
             "repositories": repositories_payload,
             "platform": architecture.platform,
             "state_directory": str(state_directory),
@@ -228,7 +235,7 @@ def run_build_phase_sandboxed(
                 _kill_process_group(process)
             if timeout_error is not None:
                 raise SandboxedBuildPhaseError(
-                    f"sandboxed build phase timed out after {timeout:g} seconds"
+                    f"sandboxed build phases timed out after {timeout:g} seconds"
                 ) from timeout_error
             stdout_file.seek(0)
             stdout = stdout_file.read(MAX_RESPONSE_BYTES + 1)
@@ -246,10 +253,65 @@ def run_build_phase_sandboxed(
         response = _load_response(stdout)
         return _validate_response(
             response,
-            phase=phase,
+            phases=phases,
             spec_data=spec_data,
             source_plan_sha256=plan_sha256,
             initial_stage_sha256=initial_stage_sha256,
             prepared_stage=stage_path,
             repositories=repositories_payload,
+        )
+
+
+def run_build_phase_sandboxed(
+    spec: Spec,
+    source_plan: Dict[str, Any],
+    prepared_stage: PreparedStage,
+    phase: str,
+    *,
+    prefix: Path,
+    repositories: List[Union[str, spack.repo.Repo]],
+    timeout: float = 120.0,
+) -> Dict[str, Any]:
+    """Run one declared build phase in a fresh Landlock-confined process."""
+    response = run_build_phases_sandboxed(
+        spec,
+        source_plan,
+        prepared_stage,
+        [phase],
+        prefix=prefix,
+        repositories=repositories,
+        timeout=timeout,
+    )
+    return {**response, "phase": phase}
+
+
+def install_prepared_sandboxed(
+    spec: Spec,
+    source_plan: Dict[str, Any],
+    prepared_stage: PreparedStage,
+    phases: List[str],
+    *,
+    prefix: Path,
+    repositories: List[Union[str, spack.repo.Repo]],
+    timeout: float = 120.0,
+    keep_failed_prefix: bool = False,
+) -> Dict[str, Any]:
+    """Run confined phases with parent-owned atomic prefix commit or rollback.
+
+    This additive API intentionally does not run global hooks or update the store database. Those
+    privileged parent actions require a separate typed integration boundary.
+    """
+    from spack.installer.build import PrefixPivoter
+
+    prefix = prefix.resolve()
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    with PrefixPivoter(str(prefix), keep_prefix=keep_failed_prefix):
+        return run_build_phases_sandboxed(
+            spec,
+            source_plan,
+            prepared_stage,
+            phases,
+            prefix=prefix,
+            repositories=repositories,
+            timeout=timeout,
         )

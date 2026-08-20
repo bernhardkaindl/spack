@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-"""Fresh-exec entry point for one experimental prepared-stage build phase."""
+"""Fresh-exec entry point for experimental prepared-stage build phases."""
 
 import json
 import os
@@ -14,7 +14,8 @@ import sys
 from typing import Any, Dict
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+MAX_PHASES = 32
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 _PHASE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
 
@@ -61,7 +62,7 @@ def _read_request() -> Dict[str, Any]:
         "prepared_stage",
         "prepared_stage_sha256",
         "prefix",
-        "phase",
+        "phases",
         "repositories",
         "platform",
         "state_directory",
@@ -78,8 +79,15 @@ def _read_request() -> Dict[str, Any]:
             or re.fullmatch(r"[0-9a-f]{64}", request[key]) is None
         ):
             raise WorkerRequestError(f"invalid {key}")
-    if not isinstance(request["phase"], str) or _PHASE.fullmatch(request["phase"]) is None:
-        raise WorkerRequestError("invalid phase")
+    phases = request["phases"]
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or len(phases) > MAX_PHASES
+        or len(set(phases)) != len(phases)
+        or any(not isinstance(phase, str) or _PHASE.fullmatch(phase) is None for phase in phases)
+    ):
+        raise WorkerRequestError("invalid phase list")
     if not isinstance(request["repositories"], list) or not request["repositories"]:
         raise WorkerRequestError("repositories must be a non-empty list")
     if not isinstance(request["platform"], str) or not request["platform"]:
@@ -175,8 +183,8 @@ def _configure_state(request: Dict[str, Any]):
     return identities
 
 
-def _run_phase(request: Dict[str, Any], repositories):
-    """Verify build provenance and execute one declared phase under confinement."""
+def _run_phases(request: Dict[str, Any], repositories):
+    """Verify build provenance and execute declared phases under confinement."""
     import spack.build_environment
     import spack.builder
     import spack.platforms
@@ -213,13 +221,17 @@ def _run_phase(request: Dict[str, Any], repositories):
     spack.build_environment.setup_package(package, dirty=False)
     builder = spack.builder.create(package)
     phases = {phase.name: phase for phase in builder}
-    selected = phases.get(request["phase"])
-    if selected is None:
-        raise WorkerRequestError(f"package does not declare phase: {request['phase']}")
+    selected = []
+    for phase_name in request["phases"]:
+        phase = phases.get(phase_name)
+        if phase is None:
+            raise WorkerRequestError(f"package does not declare phase: {phase_name}")
+        selected.append(phase)
     os.chdir(request["prepared_stage"])
-    selected.execute()
+    for phase in selected:
+        phase.execute()
     return {
-        "phase": request["phase"],
+        "phases": request["phases"],
         "dag_hash": root["hash"],
         "package_hash": root["package_hash"],
         "source_plan_sha256": request["source_plan_sha256"],
@@ -246,7 +258,7 @@ def main() -> None:
         phase = "verify"
         repositories = _configure_state(request)
         phase = "build"
-        result = _run_phase(request, repositories)
+        result = _run_phases(request, repositories)
         phase = "serialize"
         _response(
             True,
