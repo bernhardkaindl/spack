@@ -23,7 +23,7 @@ import sys
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Mapping, Union
 
 # os.O_PATH is only defined on linux. Appease mypy with our own O_PATH.
 if sys.platform == "linux":
@@ -44,6 +44,15 @@ LANDLOCK_RULE_PATH_BENEATH = 1
 LANDLOCK_ACCESS_NET_BIND_TCP = 1 << 0
 LANDLOCK_ACCESS_NET_CONNECT_TCP = 1 << 1
 LANDLOCK_RESTRICT_SELF_TSYNC = 1 << 3
+
+
+def network_restriction_enabled(config: Mapping[str, object]) -> bool:
+    """Return whether network access should be restricted for a sandbox config."""
+    if "restrict_network" in config:
+        return bool(config["restrict_network"])
+    if "allow_network" in config:
+        return not bool(config["allow_network"])
+    return True
 
 
 class FSAccess(enum.IntFlag):
@@ -109,7 +118,7 @@ class Sandbox(ABC):
     def _allow_write(self, original: Path, resolved: Path): ...
 
     @abstractmethod
-    def apply(self, block_network: bool = False): ...
+    def apply(self, restrict_filesystem: bool = True, restrict_network: bool = False): ...
 
 
 def _get_write_flags(abi_version: int) -> int:
@@ -219,26 +228,32 @@ class LandlockSandbox(Sandbox):
             "prctl(PR_SET_NO_NEW_PRIVS)",
         )
 
-    def apply(self, block_network: bool = False):
+    def apply(self, restrict_filesystem: bool = True, restrict_network: bool = False):
+        if not restrict_filesystem and not restrict_network:
+            return
+
         # Network access requires ABI v4
-        if block_network and self.abi_version < 4:
+        if restrict_network and self.abi_version < 4:
             raise SandboxError(
                 f"Blocking network access requires Landlock ABI v4+ (kernel 6.7+), "
                 f"but this kernel only supports ABI v{self.abi_version}."
             )
         net_flags = (
-            LANDLOCK_ACCESS_NET_CONNECT_TCP | LANDLOCK_ACCESS_NET_BIND_TCP if block_network else 0
+            LANDLOCK_ACCESS_NET_CONNECT_TCP | LANDLOCK_ACCESS_NET_BIND_TCP
+            if restrict_network
+            else 0
         )
         try:
-            self._apply(net_flags)
+            self._apply(restrict_filesystem, net_flags)
         except OSError as e:
             raise SandboxError(f"Failed to apply build sandbox: {e}") from e
 
-    def _apply(self, net_flags: int) -> None:
-        ruleset_fd = self._syscall_create_ruleset(self.write_flags | self.read_flags, net_flags)
+    def _apply(self, restrict_filesystem: bool, net_flags: int) -> None:
+        fs_flags = self.write_flags | self.read_flags if restrict_filesystem else 0
+        ruleset_fd = self._syscall_create_ruleset(fs_flags, net_flags)
 
         try:
-            for path, flags in self.path_rules.items():
+            for path, flags in self.path_rules.items() if restrict_filesystem else ():
                 try:
                     # use O_PATH to get an fd w/o needing permissions, and O_NOFOLLOW to avoid
                     # TOCTOU issues after we've called resolve() on the path.

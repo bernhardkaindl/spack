@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-from typing import TYPE_CHECKING, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Union
 
 from spack.vendor.typing_extensions import Literal
 
@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     import spack.installer
     import spack.old_installer
     import spack.package_base
+    from spack.installer.base import SandboxMode
 
 
 def create_installer(
@@ -34,6 +35,7 @@ def create_installer(
     stop_at: Optional[str] = None,
     stop_before: Optional[str] = None,
     tests: Union[bool, List[str], Set[str]] = False,
+    sandbox: Optional["SandboxMode"] = None,
     unsigned: Optional[bool] = None,
     verbose: bool = False,
     concurrent_packages: Optional[int] = None,
@@ -44,10 +46,18 @@ def create_installer(
     """Create an installer based on the current configuration and feature support."""
     use_old_installer = spack.config.CONFIG.get("config:installer", "new") == "old"
 
-    if spack.config.CONFIG.get("config:sandbox:enable", False):
+    sandbox_config = spack.config.CONFIG.get("config:sandbox", {})
+    sandbox_enabled = sandbox is not None or (
+        sandbox_config.get("enable", False)
+        and (
+            sandbox_config.get("restrict_filesystem", True)
+            or spack.sandbox.network_restriction_enabled(sandbox_config)
+        )
+    )
+    if sandbox_enabled:
         if use_old_installer:
             raise spack.sandbox.SandboxError(
-                "config:sandbox:enable is only supported with config:installer:new"
+                "sandboxing is only supported with config:installer:new"
             )
         # Probe sandbox support now so builds don't fail later inside a subprocess.
         spack.sandbox.get_sandbox()
@@ -57,8 +67,7 @@ def create_installer(
     else:
         from spack.installer import PackageInstaller  # type: ignore
 
-    return PackageInstaller(
-        packages,
+    installer_kwargs: Dict[str, Any] = dict(
         dirty=dirty,
         explicit=explicit,
         overwrite=overwrite,
@@ -82,3 +91,6 @@ def create_installer(
         dependencies_policy=dependencies_policy,
         create_reports=create_reports,
     )
+    if not use_old_installer:
+        installer_kwargs["sandbox"] = sandbox
+    return PackageInstaller(packages, **installer_kwargs)
