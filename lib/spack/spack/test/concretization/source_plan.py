@@ -234,14 +234,13 @@ def test_validate_compressed_url_patch_source_plan(source_plan):
     assert validate_source_plan(source_plan) is source_plan
 
 
-def test_source_plan_rejects_unsupported_compressed_url_patch(source_plan):
+def test_source_plan_accepts_unix_compress_url_patch(source_plan):
     source_plan["schema_version"] = 4
     patch = url_patch_description()
     patch.update(url="https://example.com/fix.patch.Z", archive_sha256="f" * 64, extension="Z")
     source_plan["patches"] = [patch]
 
-    with pytest.raises(SourcePlanError, match="compressed URL patch extension"):
-        validate_source_plan(source_plan)
+    assert validate_source_plan(source_plan) is source_plan
 
 
 def test_source_plan_v3_rejects_url_patch(source_plan):

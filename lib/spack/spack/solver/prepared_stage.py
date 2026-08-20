@@ -306,12 +306,47 @@ def _extract_single_file_compression(
         raise PreparedStageError(f"invalid compressed URL patch: {error}") from error
 
 
+def _extract_unix_compress(archive: Path, destination: Path, budget: _PreparationBudget) -> None:
+    gzip_executable = shutil.which("gzip")
+    if gzip_executable is None:
+        raise PreparedStageError("gzip executable is required for .Z URL patches")
+    gzip_executable = str(Path(gzip_executable).resolve(strict=True))
+    budget.add_archive_entry(0)
+    process = subprocess.Popen(
+        (gzip_executable, "-cd", "--", str(archive)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=True,
+    )
+    try:
+        assert process.stdout is not None
+        with process.stdout, open(destination, "xb") as output:
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                budget.add_expanded(len(chunk))
+                output.write(chunk)
+        if process.wait() != 0:
+            raise PreparedStageError("invalid .Z-compressed URL patch")
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        if process.poll() is None:
+            _kill_process_group(process)
+        raise
+
+
 def _extract_url_patch(
     archive: Path, destination: Path, extension: str, budget: _PreparationBudget
 ) -> Path:
     if extension in ("gz", "bz2", "xz"):
         payload = destination / "patch"
         _extract_single_file_compression(archive, payload, extension, budget)
+        return payload
+    if extension == "Z":
+        payload = destination / "patch"
+        _extract_unix_compress(archive, payload, budget)
         return payload
     archive_extension = {
         "whl": "zip",

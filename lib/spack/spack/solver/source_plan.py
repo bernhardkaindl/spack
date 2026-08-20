@@ -50,6 +50,7 @@ SUPPORTED_PATCH_ARCHIVE_EXTENSIONS = frozenset(
         "gz",
         "bz2",
         "xz",
+        "Z",
     )
 )
 

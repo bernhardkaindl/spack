@@ -474,6 +474,83 @@ def test_prepare_stage_fetches_and_applies_gzip_url_patch(tmp_path, provenance, 
     assert (prepared.path / "file").read_text(encoding="utf-8") == "after\n"
 
 
+@pytest.mark.requires_executables("gzip")
+def test_extract_unix_compress_url_patch(tmp_path):
+    archive = Path(__file__).parent.parent / "data" / "compression" / "Foo.Z"
+    destination = tmp_path / "payload"
+    budget = prepared_stage_module._PreparationBudget(
+        max_entries=1, max_expanded_bytes=prepared_stage_module.MAX_PATCH_BYTES
+    )
+
+    prepared_stage_module._extract_unix_compress(archive, destination, budget)
+
+    assert destination.read_bytes() == b"TEST\n"
+
+
+@pytest.mark.requires_executables("gzip")
+def test_extract_unix_compress_url_patch_enforces_size_limit(tmp_path):
+    archive = Path(__file__).parent.parent / "data" / "compression" / "Foo.Z"
+    destination = tmp_path / "payload"
+    budget = prepared_stage_module._PreparationBudget(max_entries=1, max_expanded_bytes=3)
+
+    with pytest.raises(PreparedStageError, match="expand beyond"):
+        prepared_stage_module._extract_unix_compress(archive, destination, budget)
+
+    assert not destination.exists()
+
+
+def test_extract_unix_compress_url_patch_requires_gzip(tmp_path, monkeypatch):
+    archive = Path(__file__).parent.parent / "data" / "compression" / "Foo.Z"
+    destination = tmp_path / "payload"
+    budget = prepared_stage_module._PreparationBudget(max_entries=1, max_expanded_bytes=1024)
+    monkeypatch.setattr(prepared_stage_module.shutil, "which", lambda executable: None)
+
+    with pytest.raises(PreparedStageError, match="gzip executable is required"):
+        prepared_stage_module._extract_unix_compress(archive, destination, budget)
+
+    assert not destination.exists()
+
+
+@pytest.mark.requires_executables("gzip")
+def test_extract_unix_compress_url_patch_rejects_invalid_input(tmp_path):
+    archive = tmp_path / "invalid.Z"
+    destination = tmp_path / "payload"
+    archive.write_bytes(b"not compressed")
+    budget = prepared_stage_module._PreparationBudget(max_entries=1, max_expanded_bytes=1024)
+
+    with pytest.raises(PreparedStageError, match="invalid .Z-compressed URL patch"):
+        prepared_stage_module._extract_unix_compress(archive, destination, budget)
+
+    assert not destination.exists()
+
+
+@pytest.mark.requires_executables("gzip")
+def test_prepare_stage_rolls_back_malformed_unix_compress_url_patch(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    patch_archive = tmp_path / "fix.patch.Z"
+    fixture = Path(__file__).parent.parent / "data" / "compression" / "Foo.Z"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    patch_archive.write_bytes(fixture.read_bytes())
+    plan = source_plan(archive, provenance)
+    add_url_patch(
+        plan,
+        patch_archive.as_uri(),
+        hashlib.sha256(b"TEST\n").hexdigest(),
+        archive_sha256=hashlib.sha256(patch_archive.read_bytes()).hexdigest(),
+        extension="Z",
+    )
+
+    with pytest.raises(PreparedStageError, match="invalid URL patch payload"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
 @pytest.mark.requires_executables("patch")
 def test_prepare_stage_rolls_back_bad_expanded_url_patch_checksum(
     tmp_path, provenance, fetch_policy

@@ -145,8 +145,10 @@ Plain downloads are limited to 48 KiB.
 Compressed downloads are limited to four MiB, must expand to exactly one regular file of at most 48 KiB, and are also charged to the plan-wide four GiB download budget.
 The trusted parent verifies the archive checksum before extraction and the expanded checksum before unified-diff parsing.
 
-Supported compressed patch formats are tar, gzip-compressed tar, bzip2-compressed tar, xz-compressed tar, their common abbreviated extensions, zip/whl, and single-file gzip, bzip2, and xz.
-Legacy ``.Z`` and compressed URLs without a recognized extension fail closed because they would require another trusted decompressor contract or content-based format selection.
+Supported compressed patch formats are tar, gzip-compressed tar, bzip2-compressed tar, xz-compressed tar, their common abbreviated extensions, zip/whl, single-file gzip, bzip2, and xz, and legacy UNIX-compress ``.Z`` files.
+For ``.Z``, the trusted parent resolves the host ``gzip`` executable to an absolute path and invokes exactly ``gzip -cd -- <archive>`` without a shell, while streaming stdout into the private workspace under the same 48 KiB expanded-patch limit.
+Missing tools, nonzero exits, oversized output, checksum mismatches, and malformed expanded patches abort preparation before publication.
+Compressed URLs without a recognized extension remain unsupported because they require content-based format selection.
 Derived targets are passed to the same Landlock patch worker used for repository-local patches.
 The build worker additionally compares URL, archive checksum, and extension against the concrete recipe's ``UrlPatch`` before executing phases.
 
@@ -195,8 +197,8 @@ For example:
       --source-origin https://zlib.net \
       --phase install
 
-The command supports SourcePlan version 6 fixed SHA-256 URL sources, string, implicit, or dictionary-placed URL resources, bounded repository-local or URL unified-diff patches, and package-defined ``patch()`` methods.
-It does not support ``.Z`` or extensionless compressed patches, ambiguous implicit resource layouts, mutable VCS sources, custom fetchers, or fetch options.
+The command supports SourcePlan version 6 fixed SHA-256 URL sources, string, implicit, or dictionary-placed URL resources, bounded repository-local or URL unified-diff patches (including ``.Z`` compression), and package-defined ``patch()`` methods.
+It does not support extensionless compressed patches, ambiguous implicit resource layouts, mutable VCS sources, custom fetchers, or fetch options.
 It is Linux-only because the worker requires Landlock filesystem and TCP restrictions.
 It is intended for development and trust-boundary evaluation, not as a compatibility replacement for normal installation.
 Command tests must verify authority parsing, ordered argument transport, temporary-stage lifetime, and registration inputs, while the worker integration suite remains responsible for real confinement, rollback, and provenance behavior.
