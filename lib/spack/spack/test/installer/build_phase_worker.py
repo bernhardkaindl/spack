@@ -115,6 +115,80 @@ def test_run_prepared_build_phase_sandboxed(
 
 
 @pytest.mark.use_package_hash
+def test_build_output_uses_dedicated_bounded_log(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    """Keep recipe stdout and stderr out of the JSON response and identify the build log."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-build-log",
+        """    def install(self, spec, prefix):
+        \"\"\"Emit output that must not corrupt the worker protocol.\"\"\"
+        import sys
+        from pathlib import Path
+        print("phase stdout")
+        print("phase stderr", file=sys.stderr)
+        Path(prefix).joinpath("installed.txt").write_text("installed")
+""",
+    )
+    log_path = tmp_path / "build.log"
+
+    response = run_build_phase_sandboxed(
+        concrete,
+        plan,
+        prepared,
+        "install",
+        prefix=tmp_path / "prefix",
+        repositories=repositories,
+        log_path=log_path,
+    )
+
+    contents = log_path.read_bytes()
+    assert b"phase stdout" in contents
+    assert b"phase stderr" in contents
+    assert response["build_log"] == {
+        "path": str(log_path),
+        "size": len(contents),
+        "sha256": hashlib.sha256(contents).hexdigest(),
+    }
+
+
+@pytest.mark.use_package_hash
+def test_build_log_does_not_replace_existing_file(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    """Reject an existing parent log path before creating the build prefix."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-build-log-existing",
+        """    def install(self, spec, prefix):
+        \"\"\"Provide a phase that must not run when log creation fails.\"\"\"
+        pass
+""",
+    )
+    log_path = tmp_path / "build.log"
+    log_path.write_text("existing", encoding="utf-8")
+
+    with pytest.raises(SandboxedBuildPhaseError, match="cannot create build log"):
+        run_build_phase_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            "install",
+            prefix=tmp_path / "prefix",
+            repositories=repositories,
+            log_path=log_path,
+        )
+
+    assert log_path.read_text(encoding="utf-8") == "existing"
+    assert not (tmp_path / "prefix").exists()
+
+
+@pytest.mark.use_package_hash
 def test_build_phase_rejects_modified_prepared_stage(
     concretize_scope, mock_packages_repo, repo_builder, tmp_path
 ):

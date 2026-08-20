@@ -4,20 +4,20 @@
 
 """Experimental launcher for build phases over a trusted prepared source tree."""
 
+import hashlib
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import spack.error
 import spack.repo
 from spack.solver.concretize_worker import (
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
-    MAX_STDERR_BYTES,
     SandboxedConcretizationError,
     _json_bytes,
     _kill_process_group,
@@ -32,8 +32,9 @@ from spack.solver.source_plan import SourcePlanError, validate_source_plan
 from spack.spec import Spec
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_PHASES = 32
+MAX_BUILD_LOG_BYTES = 64 * 1024 * 1024
 _PHASE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
 
 
@@ -41,10 +42,23 @@ class SandboxedBuildPhaseError(spack.error.SpackError):
     """Raised when the prepared-stage build worker fails."""
 
 
-def _worker_command() -> List[str]:
+def _worker_command(response_fd: int) -> List[str]:
     """Return an isolated Python command for the fresh build-phase worker."""
     worker = Path(__file__).with_name("_build_phase_worker.py")
-    return [sys.executable, "-I", "-S", "-B", str(worker)]
+    return [sys.executable, "-I", "-S", "-B", str(worker), str(response_fd)]
+
+
+def _build_log_metadata(path: Path) -> Dict[str, Any]:
+    """Return trusted identity metadata for one bounded build log."""
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_BUILD_LOG_BYTES:
+                raise SandboxedBuildPhaseError("worker build log is too large")
+            digest.update(chunk)
+    return {"path": str(path), "size": size, "sha256": digest.hexdigest()}
 
 
 def _repository_identities(repositories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -152,8 +166,9 @@ def run_build_phases_sandboxed(
     prefix: Path,
     repositories: List[Union[str, spack.repo.Repo]],
     timeout: float = 120.0,
+    log_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Run ordered declared build phases in one fresh Landlock-confined process."""
+    """Run ordered declared build phases and capture output in a parent-owned log."""
     if not isinstance(spec, Spec) or not spec.concrete:
         raise SandboxedBuildPhaseError("build phase requires a concrete Spec")
     architecture = spec.architecture
@@ -183,83 +198,99 @@ def run_build_phases_sandboxed(
     if prefix.exists():
         raise SandboxedBuildPhaseError("build prefix must not already exist")
     prefix.parent.mkdir(parents=True, exist_ok=True)
-    prefix.mkdir(mode=0o700)
-
-    with tempfile.TemporaryDirectory(prefix="spack-build-phase-sandbox-") as workspace:
-        state_directory = Path(workspace) / "state"
-        state_directory.mkdir(mode=0o700)
-        for name in ("cache", "config", "stage", "store", "tmp"):
-            (state_directory / name).mkdir(mode=0o700)
-        repositories_payload = _repository_payload(repositories, Path(workspace) / "repositories")
-        identities = _repository_identities(repositories_payload)
-        root = spec_data["spec"]["nodes"][0]
-        expected_provenance = {
-            "dag_hash": root["hash"],
-            "package_hash": root["package_hash"],
-            "repositories": identities,
-        }
-        try:
-            validate_source_plan(source_plan, expected_provenance=expected_provenance)
-        except SourcePlanError as error:
-            raise SandboxedBuildPhaseError(f"invalid source plan: {error}") from error
-        request = {
-            "protocol_version": PROTOCOL_VERSION,
-            "spec": spec_data,
-            "source_plan": source_plan,
-            "source_plan_sha256": plan_sha256,
-            "prepared_stage": str(stage_path),
-            "prepared_stage_sha256": initial_stage_sha256,
-            "prefix": str(prefix),
-            "phases": phases,
-            "repositories": repositories_payload,
-            "platform": architecture.platform,
-            "state_directory": str(state_directory),
-        }
-        request_bytes = _json_bytes(request, MAX_REQUEST_BYTES)
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-            process = subprocess.Popen(
-                _worker_command(),
-                stdin=subprocess.PIPE,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                close_fds=True,
-                start_new_session=True,
-                env=_sanitized_environment(str(state_directory)),
-            )
-            timeout_error = None
-            try:
-                process.communicate(request_bytes, timeout=timeout)
-            except subprocess.TimeoutExpired as error:
-                timeout_error = error
-            finally:
-                _kill_process_group(process)
-            if timeout_error is not None:
-                raise SandboxedBuildPhaseError(
-                    f"sandboxed build phases timed out after {timeout:g} seconds"
-                ) from timeout_error
-            stdout_file.seek(0)
-            stdout = stdout_file.read(MAX_RESPONSE_BYTES + 1)
-            stderr_file.seek(0)
-            stderr = stderr_file.read(MAX_STDERR_BYTES + 1)
-        if len(stdout) > MAX_RESPONSE_BYTES:
-            raise SandboxedBuildPhaseError("worker response is too large")
-        if len(stderr) > MAX_STDERR_BYTES:
-            raise SandboxedBuildPhaseError("worker diagnostic output is too large")
-        if process.returncode != 0 and not stdout:
-            detail = stderr.decode("utf-8", errors="replace")[-2000:].strip()
-            raise SandboxedBuildPhaseError(
-                f"worker exited with status {process.returncode}: {detail}"
-            )
-        response = _load_response(stdout)
-        return _validate_response(
-            response,
-            phases=phases,
-            spec_data=spec_data,
-            source_plan_sha256=plan_sha256,
-            initial_stage_sha256=initial_stage_sha256,
-            prepared_stage=stage_path,
-            repositories=repositories_payload,
+    if log_path is None:
+        log_fd, log_name = tempfile.mkstemp(
+            prefix=f".{prefix.name}.spack-build-", suffix=".log", dir=prefix.parent
         )
+        log_path = Path(log_name).resolve()
+    else:
+        log_path = log_path.resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        except OSError as error:
+            raise SandboxedBuildPhaseError(f"cannot create build log: {error}") from error
+    log_file = os.fdopen(log_fd, "wb")
+
+    try:
+        prefix.mkdir(mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="spack-build-phase-sandbox-") as workspace:
+            state_directory = Path(workspace) / "state"
+            state_directory.mkdir(mode=0o700)
+            for name in ("cache", "config", "stage", "store", "tmp"):
+                (state_directory / name).mkdir(mode=0o700)
+            repositories_payload = _repository_payload(
+                repositories, Path(workspace) / "repositories"
+            )
+            identities = _repository_identities(repositories_payload)
+            root = spec_data["spec"]["nodes"][0]
+            expected_provenance = {
+                "dag_hash": root["hash"],
+                "package_hash": root["package_hash"],
+                "repositories": identities,
+            }
+            try:
+                validate_source_plan(source_plan, expected_provenance=expected_provenance)
+            except SourcePlanError as error:
+                raise SandboxedBuildPhaseError(f"invalid source plan: {error}") from error
+            request = {
+                "protocol_version": PROTOCOL_VERSION,
+                "spec": spec_data,
+                "source_plan": source_plan,
+                "source_plan_sha256": plan_sha256,
+                "prepared_stage": str(stage_path),
+                "prepared_stage_sha256": initial_stage_sha256,
+                "prefix": str(prefix),
+                "phases": phases,
+                "repositories": repositories_payload,
+                "platform": architecture.platform,
+                "state_directory": str(state_directory),
+            }
+            request_bytes = _json_bytes(request, MAX_REQUEST_BYTES)
+            with log_file, tempfile.TemporaryFile() as response_file:
+                response_fd = response_file.fileno()
+                process = subprocess.Popen(
+                    _worker_command(response_fd),
+                    stdin=subprocess.PIPE,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    pass_fds=(response_fd,),
+                    close_fds=True,
+                    start_new_session=True,
+                    env=_sanitized_environment(str(state_directory)),
+                )
+                timeout_error = None
+                try:
+                    process.communicate(request_bytes, timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    timeout_error = error
+                finally:
+                    _kill_process_group(process)
+                if timeout_error is not None:
+                    raise SandboxedBuildPhaseError(
+                        f"sandboxed build phases timed out after {timeout:g} seconds"
+                    ) from timeout_error
+                response_file.seek(0)
+                response_bytes = response_file.read(MAX_RESPONSE_BYTES + 1)
+            if len(response_bytes) > MAX_RESPONSE_BYTES:
+                raise SandboxedBuildPhaseError("worker response is too large")
+            if process.returncode != 0 and not response_bytes:
+                raise SandboxedBuildPhaseError(f"worker exited with status {process.returncode}")
+            response = _load_response(response_bytes)
+            validated = _validate_response(
+                response,
+                phases=phases,
+                spec_data=spec_data,
+                source_plan_sha256=plan_sha256,
+                initial_stage_sha256=initial_stage_sha256,
+                prepared_stage=stage_path,
+                repositories=repositories_payload,
+            )
+        return {**validated, "build_log": _build_log_metadata(log_path)}
+    except BaseException:
+        if not log_file.closed:
+            log_file.close()
+        raise
 
 
 def run_build_phase_sandboxed(
@@ -271,6 +302,7 @@ def run_build_phase_sandboxed(
     prefix: Path,
     repositories: List[Union[str, spack.repo.Repo]],
     timeout: float = 120.0,
+    log_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run one declared build phase in a fresh Landlock-confined process."""
     response = run_build_phases_sandboxed(
@@ -281,6 +313,7 @@ def run_build_phase_sandboxed(
         prefix=prefix,
         repositories=repositories,
         timeout=timeout,
+        log_path=log_path,
     )
     return {**response, "phase": phase}
 
@@ -295,6 +328,7 @@ def install_prepared_sandboxed(
     repositories: List[Union[str, spack.repo.Repo]],
     timeout: float = 120.0,
     keep_failed_prefix: bool = False,
+    log_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Run confined phases with parent-owned atomic prefix commit or rollback.
 
@@ -314,4 +348,5 @@ def install_prepared_sandboxed(
             prefix=prefix,
             repositories=repositories,
             timeout=timeout,
+            log_path=log_path,
         )

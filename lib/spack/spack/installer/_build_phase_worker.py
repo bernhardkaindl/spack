@@ -14,7 +14,7 @@ import sys
 from typing import Any, Dict
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_PHASES = 32
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 _PHASE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
@@ -240,15 +240,25 @@ def _run_phases(request: Dict[str, Any], repositories):
     }
 
 
-def _response(ok: bool, **kwargs) -> None:
-    """Write one compact protocol response to standard output."""
+def _response(response_fd: int, ok: bool, **kwargs) -> None:
+    """Write one compact protocol response to the dedicated parent descriptor."""
     response = {"protocol_version": PROTOCOL_VERSION, "ok": ok, **kwargs}
-    sys.stdout.write(json.dumps(response, allow_nan=False, separators=(",", ":")))
-    sys.stdout.flush()
+    data = json.dumps(response, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    while data:
+        written = os.write(response_fd, data)
+        if written == 0:
+            raise RuntimeError("cannot write worker response")
+        data = data[written:]
 
 
 def main() -> None:
     """Run request validation, confinement, verification, and phase execution."""
+    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
+        raise SystemExit("usage: _build_phase_worker.py RESPONSE_FD")
+    response_fd = int(sys.argv[1])
+    if response_fd < 3:
+        raise SystemExit("response descriptor must not be standard input or output")
+    os.set_inheritable(response_fd, False)
     phase = "validate"
     try:
         request = _read_request()
@@ -261,6 +271,7 @@ def main() -> None:
         result = _run_phases(request, repositories)
         phase = "serialize"
         _response(
+            response_fd,
             True,
             sandbox={
                 "backend": "landlock",
@@ -273,7 +284,9 @@ def main() -> None:
         )
     except BaseException as error:
         _response(
-            False, error={"phase": phase, "type": type(error).__name__, "message": str(error)}
+            response_fd,
+            False,
+            error={"phase": phase, "type": type(error).__name__, "message": str(error)},
         )
 
 
