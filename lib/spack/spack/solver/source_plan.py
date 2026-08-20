@@ -23,7 +23,7 @@ import spack.hash_types as ht
 import spack.patch
 import spack.util.url
 
-SOURCE_PLAN_SCHEMA_VERSION = 4
+SOURCE_PLAN_SCHEMA_VERSION = 5
 MAX_SOURCE_URLS = 32
 MAX_RESOURCES = 32
 MAX_PATCHES = 32
@@ -276,12 +276,18 @@ def source_plan_for_spec(spec, repositories: Any) -> Dict[str, Any]:
         raise SourcePlanError("source plan has too many resources")
     resources = []
     for resource in needed_resources:
-        if not isinstance(resource.placement, str) or not resource.placement:
-            raise SourcePlanError("resource placement must be an explicit non-empty string")
+        if resource.placement is None:
+            source = _source_for_fetcher(resource.fetcher, "resource")
+            if not source["expand"]:
+                raise SourcePlanError("implicit placement requires an expanding resource")
+        elif isinstance(resource.placement, str) and resource.placement:
+            source = _source_for_fetcher(resource.fetcher, "resource")
+        else:
+            raise SourcePlanError("resource placement must be a string or null")
         resources.append(
             {
                 "name": resource.name,
-                "source": _source_for_fetcher(resource.fetcher, "resource"),
+                "source": source,
                 "destination": resource.destination,
                 "placement": resource.placement,
             }
@@ -322,6 +328,7 @@ def validate_source_plan(
         1,
         2,
         3,
+        4,
         SOURCE_PLAN_SCHEMA_VERSION,
     ):
         raise SourcePlanError("unsupported source plan schema")
@@ -381,7 +388,12 @@ def validate_source_plan(
             names.append(_string(resource["name"], "resource name", pattern=_IDENTIFIER))
             _validate_url_source(resource["source"], "resource source")
             _relative_path(resource["destination"], "resource destination", allow_empty=True)
-            _relative_path(resource["placement"], "resource placement")
+            placement = resource["placement"]
+            if placement is None:
+                if schema_version < 5 or resource["source"]["expand"] is not True:
+                    raise SourcePlanError("invalid implicit resource placement")
+            else:
+                _relative_path(placement, "resource placement")
         if len(set(names)) != len(names):
             raise SourcePlanError("resource names must be unique")
 

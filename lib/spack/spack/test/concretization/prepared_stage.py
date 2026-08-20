@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import base64
+import copy
 import gzip
 import hashlib
 import http.server
@@ -180,6 +181,67 @@ def test_prepare_stage_fetches_and_places_resource(tmp_path, provenance, fetch_p
     assert header.read_text(encoding="utf-8") == "#define VALUE 1\n"
     assert prepared.source_plan_sha256 == source_plan_digest(plan)
     assert prepared.content_sha256 == prepared_stage_digest(prepared.path)
+
+
+def test_prepare_stage_uses_resource_top_level_directory_for_implicit_placement(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "headers.tar.gz"
+    write_tar(archive, [("project/configure", "#!/bin/sh\n", tarfile.REGTYPE)])
+    write_tar(resource, [("resource-expand/library.h", "#define VALUE 1\n", tarfile.REGTYPE)])
+    plan = add_resource(source_plan(archive, provenance), resource, placement=None)
+    plan["schema_version"] = 5
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    header = prepared.path / "vendor" / "resource-expand" / "library.h"
+    assert header.read_text(encoding="utf-8") == "#define VALUE 1\n"
+
+
+def test_prepare_stage_rejects_flat_implicit_resource_transactionally(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "headers.tar.gz"
+    write_tar(archive, [("project/configure", "#!/bin/sh\n", tarfile.REGTYPE)])
+    write_tar(resource, [("library.h", "#define VALUE 1\n", tarfile.REGTYPE)])
+    plan = add_resource(source_plan(archive, provenance), resource, placement=None)
+    plan["schema_version"] = 5
+
+    with pytest.raises(PreparedStageError, match="one top-level directory"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
+def test_prepare_stage_rolls_back_earlier_implicit_resource(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    first = tmp_path / "first.tar.gz"
+    second = tmp_path / "second.tar.gz"
+    write_tar(archive, [("project/configure", "#!/bin/sh\n", tarfile.REGTYPE)])
+    write_tar(first, [("first/file", "first\n", tarfile.REGTYPE)])
+    write_tar(second, [("flat", "second\n", tarfile.REGTYPE)])
+    plan = add_resource(source_plan(archive, provenance), first, placement=None)
+    second_resource = copy.deepcopy(plan["resources"][0])
+    second_resource["name"] = "second"
+    second_resource["source"]["urls"] = [second.as_uri()]
+    second_resource["source"]["sha256"] = hashlib.sha256(second.read_bytes()).hexdigest()
+    plan["resources"].append(second_resource)
+    plan["schema_version"] = 5
+
+    with pytest.raises(PreparedStageError, match="one top-level directory"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
 
 
 @pytest.mark.requires_executables("patch")

@@ -92,8 +92,8 @@ SourcePlan resources
 --------------------
 
 SourcePlan version 2 added bounded immutable URL resources.
-New plans use version 4, while versions 1 through 3 remain valid for existing provenance records.
-Each resource has an identifier, the same fixed-URL source descriptor used for the main source, and relative ``destination`` and ``placement`` paths.
+New plans use version 5, while versions 1 through 4 remain valid for existing provenance records.
+Each resource has an identifier, the same fixed-URL source descriptor used for the main source, a relative ``destination``, and an explicit relative or implicit ``placement``.
 The recipe worker may emit at most 32 resources and 32 unique candidate URLs per source descriptor.
 Every source and resource requires a SHA-256 checksum; mutable VCS fetchers and fetch options remain rejected.
 
@@ -103,11 +103,13 @@ As in normal Spack staging, a single top-level archive directory is stripped bef
 The four GiB download limit, 100,000 archive-entry limit, and 16 GiB expanded-size limit are aggregate limits across the entire plan, so resources cannot multiply staging authority.
 Archive traversal, links, special files, malformed relative paths, duplicate resource names, and placement conflicts fail the transaction before the prepared tree is published.
 
-Version 2 deliberately supports only an explicit nonempty string ``placement``.
-Implicit placement depends on archive-layout inference, while dictionary placement projects multiple paths and introduces merge-order and conflict semantics.
-Both forms remain rejected until those semantics have a dedicated bounded validator and transactional tests.
+Version 2 supports only an explicit nonempty string ``placement``.
+Version 5 adds implicit placement for expanding resources whose archive contains exactly one top-level directory and no sibling entries.
+The trusted parent records the validated top-level directory name while stripping that directory during extraction and places the resource under ``destination/<top-level-directory>``, matching normal ``ResourceStage.srcdir`` behavior without exposing a private staging path.
+Flat, multi-root, hidden-sibling, and non-expanding resources fail closed when placement is omitted because they have no unambiguous relative placement name.
+Dictionary placement remains unsupported because it projects multiple selected paths and requires separate overlap, merge-order, and conflict semantics.
 
-Tests cover recipe-worker serialization, malformed descriptors, traversal, duplicate names, unsupported placement, authority prevalidation, aggregate limits, transactional rollback, placement conflicts, prepared-tree identity, and consumption by the confined build worker without a parent recipe import.
+Tests cover recipe-worker serialization, malformed descriptors, traversal, duplicate names, explicit and implicit placement, legacy-schema rejection, ambiguous-layout rollback, authority prevalidation, aggregate limits, placement conflicts, prepared-tree identity, and consumption by the confined build worker without a parent recipe import.
 
 SourcePlan patches
 ------------------
@@ -188,8 +190,8 @@ For example:
       --source-origin https://zlib.net \
       --phase install
 
-The command supports SourcePlan version 4 fixed SHA-256 URL sources, simply placed URL resources, bounded repository-local or URL unified-diff patches, and package-defined ``patch()`` methods.
-It does not support ``.Z`` or extensionless compressed patches, implicit or dictionary resource placement, mutable VCS sources, custom fetchers, or fetch options.
+The command supports SourcePlan version 5 fixed SHA-256 URL sources, explicitly or implicitly placed URL resources, bounded repository-local or URL unified-diff patches, and package-defined ``patch()`` methods.
+It does not support ``.Z`` or extensionless compressed patches, dictionary resource placement, ambiguous implicit resource layouts, mutable VCS sources, custom fetchers, or fetch options.
 It is Linux-only because the worker requires Landlock filesystem and TCP restrictions.
 It is intended for development and trust-boundary evaluation, not as a compatibility replacement for normal installation.
 Command tests must verify authority parsing, ordered argument transport, temporary-stage lifetime, and registration inputs, while the worker integration suite remains responsible for real confinement, rollback, and provenance behavior.

@@ -102,6 +102,25 @@ def test_validate_url_resource_source_plan(source_plan):
     assert validate_source_plan(source_plan) is source_plan
 
 
+def test_validate_implicit_resource_placement(source_plan):
+    source_plan["schema_version"] = 5
+    resource = resource_description()
+    resource["placement"] = None
+    source_plan["resources"] = [resource]
+
+    assert validate_source_plan(source_plan) is source_plan
+
+
+def test_legacy_source_plan_rejects_implicit_resource_placement(source_plan):
+    source_plan["schema_version"] = 4
+    resource = resource_description()
+    resource["placement"] = None
+    source_plan["resources"] = [resource]
+
+    with pytest.raises(SourcePlanError, match="implicit resource placement"):
+        validate_source_plan(source_plan)
+
+
 @pytest.mark.parametrize(
     "mutation,match",
     [
@@ -340,8 +359,40 @@ def test_source_plan_for_url_resource(concretize_scope, mock_packages_repo, repo
         concrete = spack.concretize.concretize_one("source-plan-resource@1.0")
         plan = source_plan_for_spec(concrete, repositories)
 
-    assert plan["schema_version"] == 4
+    assert plan["schema_version"] == 5
     assert plan["resources"] == [resource_description()]
+
+
+@pytest.mark.use_package_hash
+def test_source_plan_for_implicit_resource_placement(
+    concretize_scope, mock_packages_repo, repo_builder
+):
+    repo_builder.add_package("source-plan-implicit-resource")
+    recipe = Path(repo_builder._recipe_filename("source-plan-implicit-resource"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-implicit-resource-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n'
+        + "    resource(\n"
+        + '        name="headers",\n'
+        + '        url="https://example.com/headers.tar.gz",\n'
+        + f"        sha256={'e' * 64!r},\n"
+        + '        destination="vendor",\n'
+        + '        when="@1.0",\n'
+        + "    )\n",
+        encoding="utf-8",
+    )
+    repositories = [
+        {"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}
+    ]
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-implicit-resource@1.0")
+        plan = source_plan_for_spec(concrete, repositories)
+
+    assert plan["schema_version"] == 5
+    assert plan["resources"][0]["placement"] is None
 
 
 @pytest.mark.use_package_hash
@@ -488,7 +539,7 @@ def test_source_plan_rejects_resource_dictionary_placement(
 
     with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
         concrete = spack.concretize.concretize_one("source-plan-resource-dict@1.0")
-        with pytest.raises(SourcePlanError, match="explicit non-empty string"):
+        with pytest.raises(SourcePlanError, match="string or null"):
             source_plan_for_spec(concrete, [])
 
 

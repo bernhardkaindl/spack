@@ -327,18 +327,21 @@ def _extract_url_patch(
     return entries[0]
 
 
-def _publish_extracted_archive(container: Path, destination: Path) -> None:
+def _publish_extracted_archive(container: Path, destination: Path) -> Optional[str]:
     entries = list(container.iterdir())
     non_hidden = [entry for entry in entries if not entry.name.startswith(".")]
+    top_level_directory = None
     if len(non_hidden) == 1 and non_hidden[0].is_dir():
         if len(entries) != 1:
             raise PreparedStageError("unsupported archive layout beside top-level directory")
+        top_level_directory = non_hidden[0].name
         entries = list(non_hidden[0].iterdir())
     for entry in entries:
         target = destination / entry.name
         if target.exists():
             raise PreparedStageError(f"archive extraction conflict: {entry.name}")
         entry.rename(target)
+    return top_level_directory
 
 
 def _prepare_source(
@@ -347,7 +350,7 @@ def _prepare_source(
     download: Path,
     fetch_policy: SourceFetchPolicy,
     budget: _PreparationBudget,
-) -> None:
+) -> Optional[str]:
     download.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     archive = _fetch(source, download, fetch_policy, budget)
     if source["expand"]:
@@ -355,12 +358,13 @@ def _prepare_source(
         container.mkdir(mode=0o700)
         try:
             _extract_archive(archive, container, source["extension"], budget)
-            _publish_extracted_archive(container, destination)
+            return _publish_extracted_archive(container, destination)
         finally:
             shutil.rmtree(container, ignore_errors=True)
     else:
         filename = Path(urllib.parse.urlsplit(source["urls"][0]).path).name or "source"
         shutil.copy2(archive, destination / filename)
+    return None
 
 
 def _prepare_resources(
@@ -373,14 +377,21 @@ def _prepare_resources(
     for index, resource in enumerate(resources):
         resource_root = workspace / "resources" / str(index)
         resource_root.mkdir(mode=0o700, parents=True)
-        _prepare_source(
+        implicit_placement = _prepare_source(
             resource["source"],
             resource_root,
             workspace / "downloads" / str(index),
             fetch_policy,
             budget,
         )
-        target = root / resource["destination"] / resource["placement"]
+        placement = resource["placement"]
+        if placement is None:
+            if implicit_placement is None:
+                raise PreparedStageError(
+                    "implicit resource placement requires one top-level directory"
+                )
+            placement = str(_relative_archive_path(implicit_placement))
+        target = root / resource["destination"] / placement
         if target.exists():
             raise PreparedStageError(
                 f"resource placement already exists: {target.relative_to(root)}"
