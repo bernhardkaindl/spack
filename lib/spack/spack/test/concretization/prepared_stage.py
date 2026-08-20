@@ -474,6 +474,79 @@ def test_prepare_stage_fetches_and_applies_gzip_url_patch(tmp_path, provenance, 
     assert (prepared.path / "file").read_text(encoding="utf-8") == "after\n"
 
 
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_detects_extensionless_gzip_url_patch(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    patch_archive = tmp_path / "download"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    content = b"--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n"
+    with gzip.open(patch_archive, "wb") as output:
+        output.write(content)
+    plan = source_plan(archive, provenance)
+    add_url_patch(
+        plan,
+        patch_archive.as_uri(),
+        hashlib.sha256(content).hexdigest(),
+        archive_sha256=hashlib.sha256(patch_archive.read_bytes()).hexdigest(),
+        extension=None,
+    )
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    assert (prepared.path / "file").read_text(encoding="utf-8") == "after\n"
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_detects_extensionless_tar_gzip_url_patch(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    patch_archive = tmp_path / "download"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    content = "--- file\n+++ file\n@@ -1 +1 @@\n-before\n+after\n"
+    write_tar(patch_archive, [("fix.patch", content, tarfile.REGTYPE)])
+    plan = source_plan(archive, provenance)
+    add_url_patch(
+        plan,
+        patch_archive.as_uri(),
+        hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        archive_sha256=hashlib.sha256(patch_archive.read_bytes()).hexdigest(),
+        extension=None,
+    )
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    assert (prepared.path / "file").read_text(encoding="utf-8") == "after\n"
+
+
+def test_prepare_stage_rejects_unknown_extensionless_patch_format(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    patch_archive = tmp_path / "download"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    patch_archive.write_bytes(b"unknown archive format")
+    plan = source_plan(archive, provenance)
+    add_url_patch(
+        plan,
+        patch_archive.as_uri(),
+        hashlib.sha256(b"irrelevant").hexdigest(),
+        archive_sha256=hashlib.sha256(patch_archive.read_bytes()).hexdigest(),
+        extension=None,
+    )
+
+    with pytest.raises(PreparedStageError, match="unsupported extensionless"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
+
+
 @pytest.mark.requires_executables("gzip")
 def test_extract_unix_compress_url_patch(tmp_path):
     archive = Path(__file__).parent.parent / "data" / "compression" / "Foo.Z"

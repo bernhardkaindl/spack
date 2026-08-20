@@ -26,11 +26,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import spack.error
+import spack.util.compression
 import spack.util.url
 import spack.util.web
 from spack.solver.source_plan import (
     MAX_PATCH_BYTES,
     MAX_PATCH_BYTES_TOTAL,
+    SUPPORTED_PATCH_ARCHIVE_EXTENSIONS,
     SourcePlanError,
     _validate_unified_diff,
     validate_source_plan,
@@ -337,9 +339,22 @@ def _extract_unix_compress(archive: Path, destination: Path, budget: _Preparatio
         raise
 
 
+def _detected_patch_archive_extension(archive: Path) -> str:
+    try:
+        extension = spack.util.compression.extension_from_magic_numbers(
+            str(archive), decompress=True
+        ) or spack.util.compression.extension_from_magic_numbers(str(archive), decompress=False)
+    except (EOFError, OSError, lzma.LZMAError) as error:
+        raise PreparedStageError(f"invalid compressed URL patch: {error}") from error
+    if extension not in SUPPORTED_PATCH_ARCHIVE_EXTENSIONS:
+        raise PreparedStageError("unsupported extensionless compressed URL patch format")
+    return extension
+
+
 def _extract_url_patch(
-    archive: Path, destination: Path, extension: str, budget: _PreparationBudget
+    archive: Path, destination: Path, extension: Optional[str], budget: _PreparationBudget
 ) -> Path:
+    extension = extension or _detected_patch_archive_extension(archive)
     if extension in ("gz", "bz2", "xz"):
         payload = destination / "patch"
         _extract_single_file_compression(archive, payload, extension, budget)

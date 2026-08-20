@@ -6,6 +6,7 @@
 
 import contextlib
 import copy
+import gzip
 import hashlib
 import io
 import json
@@ -561,6 +562,63 @@ def test_run_prepared_build_phase_with_url_patch(
             prefix=tmp_path / "tampered-prefix",
             repositories=repositories,
         )
+
+
+@pytest.mark.use_package_hash
+@pytest.mark.requires_executables("patch")
+def test_run_prepared_build_phase_with_extensionless_compressed_url_patch(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    source = tmp_path / "source.tar.gz"
+    patch_path = tmp_path / "download"
+    checksum = _write_source_archive(
+        source, source_files={"project/message": (b"before\n", 0o644)}
+    )
+    patch_content = b"--- message\n+++ message\n@@ -1 +1 @@\n-before\n+after\n"
+    with gzip.open(patch_path, "wb") as output:
+        output.write(patch_content)
+    _add_build_recipe(
+        repo_builder,
+        "sandbox-build-extensionless-url-patch",
+        source.as_uri(),
+        checksum,
+        f"""    patch(
+        {patch_path.as_uri()!r},
+        sha256={hashlib.sha256(patch_content).hexdigest()!r},
+        archive_sha256={hashlib.sha256(patch_path.read_bytes()).hexdigest()!r},
+        level=0,
+    )
+
+    def install(self, spec, prefix):
+        from pathlib import Path
+        source = Path(self.stage.source_path).joinpath("message")
+        Path(prefix).joinpath("message").write_text(source.read_text())
+""",
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+    concrete = concretize_one_sandboxed(
+        "sandbox-build-extensionless-url-patch@1.0", repositories=repositories
+    )
+    plan = plan_sources_sandboxed(concrete, repositories=repositories)
+    prepared = prepare_stage(
+        plan,
+        tmp_path / "prepared-extensionless",
+        expected_provenance=plan["provenance"],
+        fetch_policy=SourceFetchPolicy(file_roots=(tmp_path,)),
+    )
+
+    response = run_build_phase_sandboxed(
+        concrete,
+        plan,
+        prepared,
+        "install",
+        prefix=tmp_path / "prefix-extensionless",
+        repositories=repositories,
+    )
+
+    assert response["source_plan_sha256"] == source_plan_digest(plan)
+    assert plan["patches"][0]["extension"] is None
+    assert (tmp_path / "prefix-extensionless" / "message").read_text() == "after\n"
 
 
 @pytest.mark.use_package_hash

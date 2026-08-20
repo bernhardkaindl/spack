@@ -236,7 +236,7 @@ def _run_phases(request: Dict[str, Any], repositories):
                     "url": patch.url,
                     "archive_sha256": patch.archive_sha256,
                     "extension": (
-                        spack.util.url.extension_from_path(patch.url)
+                        spack.util.url.determine_url_file_extension(patch.url) or None
                         if patch.archive_sha256
                         else None
                     ),

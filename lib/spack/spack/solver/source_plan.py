@@ -152,7 +152,11 @@ def _patch_for_plan(patch: Any) -> Dict[str, Any]:
             if patch.archive_sha256
             else None
         )
-        if patch.archive_sha256 and extension not in SUPPORTED_PATCH_ARCHIVE_EXTENSIONS:
+        if (
+            patch.archive_sha256
+            and extension is not None
+            and extension not in SUPPORTED_PATCH_ARCHIVE_EXTENSIONS
+        ):
             raise SourcePlanError("unsupported compressed URL patch extension")
         return {
             "kind": "url",
@@ -503,7 +507,11 @@ def _validate_patches(patches: Any, *, allow_url: bool) -> None:
                 _string(extension, "patch archive extension", pattern=_EXTENSION)
             if archive_sha256 is None and extension is not None:
                 raise SourcePlanError("uncompressed URL patch cannot have an archive extension")
-            if archive_sha256 is not None and extension not in SUPPORTED_PATCH_ARCHIVE_EXTENSIONS:
+            if (
+                archive_sha256 is not None
+                and extension is not None
+                and extension not in SUPPORTED_PATCH_ARCHIVE_EXTENSIONS
+            ):
                 raise SourcePlanError("unsupported compressed URL patch extension")
             continue
         targets = patch["targets"]
