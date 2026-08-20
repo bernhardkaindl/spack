@@ -177,11 +177,19 @@ config:
   # This feature is only available on Linux kernels with Landlock support, and
   # only works with the new installer.
   sandbox:
-    enable: false
-    # Restrict filesystem access during the build phase.
-    restrict_filesystem: true
-    # Restrict TCP network access during the build phase.
-    restrict_network: true
+    enable: true
+    # Deny current and future sandboxed resources unless explicitly allowed.
+    defaults:
+      policy: deny
+      deny: [network, filesystem]
+    overrides:
+    - spec: "4c-multiphysics"
+      allow: [network]  # clones googletest from github
+    - spec: "arrow"
+      allow: [network]  # fetches mimalloc source to configure a custom build of it
+    - spec: "py-tensorboard-data-server"
+      allow: [network]  # fetches async-stream as a dependency of package rustboard
+
     # Additional paths with read and execute permissions.
     allow_read: []
     # Additional paths with write and execute permissions.
