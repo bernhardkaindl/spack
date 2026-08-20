@@ -266,6 +266,59 @@ properties: Dict[str, Any] = {
                     },
                 },
             },
+            "sandbox_installer": {
+                "type": "object",
+                "description": "Policy defaults for the experimental worker-based installer.",
+                "additionalProperties": False,
+                "properties": {
+                    "repositories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "uniqueItems": True,
+                        "description": "Ordered local package repository paths.",
+                    },
+                    "source_origins": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": True,
+                        "description": "Allowed HTTP(S) source origins.",
+                    },
+                    "file_roots": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "uniqueItems": True,
+                        "description": "Allowed roots for local file sources.",
+                    },
+                    "repository_snapshots": {
+                        "type": "boolean",
+                        "description": "Copy repository snapshots before recipe import.",
+                    },
+                    "phases": {
+                        "type": "array",
+                        "items": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{0,127}$"},
+                        "minItems": 1,
+                        "maxItems": 32,
+                        "uniqueItems": True,
+                        "description": "Ordered confined build phases.",
+                    },
+                    "post_actions": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["sbang", "drop_redundant_rpaths", "set_permissions"],
+                        },
+                        "maxItems": 16,
+                        "uniqueItems": True,
+                        "description": "Ordered allowlisted parent actions.",
+                    },
+                    "timeout": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "Timeout in seconds for each confined worker.",
+                    },
+                },
+            },
         },
     }
 }

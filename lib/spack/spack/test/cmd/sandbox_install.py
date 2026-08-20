@@ -30,7 +30,7 @@ def test_source_fetch_policy_rejects_non_origin(origin):
         command._source_fetch_policy([origin], [])
 
 
-def test_sandbox_install_composes_explicit_workflow(monkeypatch, tmp_path):
+def test_sandbox_install_composes_explicit_workflow(monkeypatch, mutable_config, tmp_path):
     repository = tmp_path / "repository"
     repository.mkdir()
     source_root = tmp_path / "sources"
@@ -61,6 +61,18 @@ def test_sandbox_install_composes_explicit_workflow(monkeypatch, tmp_path):
     monkeypatch.setattr(command, "plan_sources_sandboxed", plan)
     monkeypatch.setattr(command, "prepare_stage", prepare)
     monkeypatch.setattr(command, "install_prepared_registered_sandboxed", install)
+    mutable_config.set(
+        "config:sandbox_installer",
+        {
+            "repositories": ["/configured/repository"],
+            "source_origins": ["https://configured.example"],
+            "file_roots": ["/configured/sources"],
+            "repository_snapshots": False,
+            "phases": ["install"],
+            "post_actions": [],
+            "timeout": 30,
+        },
+    )
 
     output = sandbox_install(
         "example@1.0",
@@ -74,6 +86,9 @@ def test_sandbox_install_composes_explicit_workflow(monkeypatch, tmp_path):
         "install",
         "--post-action",
         "drop_redundant_rpaths",
+        "--repository-snapshots",
+        "--timeout",
+        "120",
     )
 
     repositories = [str(repository.resolve())]
@@ -94,6 +109,90 @@ def test_sandbox_install_composes_explicit_workflow(monkeypatch, tmp_path):
     assert calls[3][5]["post_actions"] == ["drop_redundant_rpaths"]
     assert "Installed" in output
     assert "/installed/prefix" in output
+
+
+def test_sandbox_install_uses_isolated_config_policy(monkeypatch, mutable_config, tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    mutable_config.set(
+        "config:sandbox_installer",
+        {
+            "repositories": [str(repository)],
+            "file_roots": [str(source_root)],
+            "repository_snapshots": False,
+            "phases": ["build", "install"],
+            "post_actions": ["set_permissions"],
+            "timeout": 45,
+        },
+    )
+    concrete = object()
+    plan = {"provenance": {}}
+    observed = {}
+
+    monkeypatch.setattr(command, "concretize_one_sandboxed", lambda spec, **kwargs: concrete)
+    monkeypatch.setattr(command, "plan_sources_sandboxed", lambda spec, **kwargs: plan)
+    monkeypatch.setattr(command, "prepare_stage", lambda *args, **kwargs: object())
+
+    def install(spec, source_plan, prepared, phases, **kwargs):
+        observed.update({"phases": phases, **kwargs})
+        return {"registration": {"prefix": "/installed/prefix"}}
+
+    monkeypatch.setattr(command, "install_prepared_registered_sandboxed", install)
+
+    sandbox_install("example")
+
+    assert observed["repositories"] == [str(repository.resolve())]
+    assert observed["phases"] == ["build", "install"]
+    assert observed["post_actions"] == ["set_permissions"]
+    assert observed["timeout"] == 45
+
+
+def test_sandbox_install_requires_repository_policy(mutable_config):
+    mutable_config.set("config:sandbox_installer", {})
+    output = sandbox_install("example", fail_on_error=False)
+
+    assert sandbox_install.returncode == 2
+    assert "at least one --repository" in output
+
+
+def test_sandbox_install_rejects_policy_before_recipe_worker(monkeypatch, tmp_path):
+    def reject_worker(*args, **kwargs):
+        raise AssertionError("recipe worker started for invalid policy")
+
+    monkeypatch.setattr(command, "concretize_one_sandboxed", reject_worker)
+    output = sandbox_install(
+        "example",
+        "--repository",
+        str(tmp_path),
+        "--phase",
+        "install",
+        "--phase",
+        "install",
+        fail_on_error=False,
+    )
+
+    assert sandbox_install.returncode == 2
+    assert "invalid worker phase list" in output
+
+
+def test_sandbox_install_rejects_action_order_before_recipe_worker(
+    monkeypatch, mutable_config, tmp_path
+):
+    mutable_config.set(
+        "config:sandbox_installer",
+        {"repositories": [str(tmp_path)], "post_actions": ["set_permissions", "sbang"]},
+    )
+
+    def reject_worker(*args, **kwargs):
+        raise AssertionError("recipe worker started for invalid policy")
+
+    monkeypatch.setattr(command, "concretize_one_sandboxed", reject_worker)
+    output = sandbox_install("example", fail_on_error=False)
+
+    assert sandbox_install.returncode == 2
+    assert "canonical order" in output
 
 
 def test_sandbox_install_rejects_nonpositive_timeout(tmp_path):

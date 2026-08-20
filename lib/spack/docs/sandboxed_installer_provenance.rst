@@ -116,6 +116,33 @@ It is Linux-only because the worker requires Landlock filesystem and TCP restric
 It is intended for development and trust-boundary evaluation, not as a compatibility replacement for normal installation.
 Command tests must verify authority parsing, ordered argument transport, temporary-stage lifetime, and registration inputs, while the worker integration suite remains responsible for real confinement, rollback, and provenance behavior.
 
+Policy configuration
+--------------------
+
+``config:sandbox_installer`` provides optional defaults only for ``spack sandbox-install`` and is ignored by normal ``spack install``.
+The strict schema supports ``repositories``, ``source_origins``, ``file_roots``, ``repository_snapshots``, ``phases``, ``post_actions``, and ``timeout``.
+Repository and source-authority defaults are empty, preserving fail-closed behavior.
+
+.. code-block:: yaml
+
+    config:
+      sandbox_installer:
+         repositories:
+         - /path/to/packages
+         source_origins:
+         - https://zlib.net
+         file_roots: []
+         repository_snapshots: true
+         phases: [install]
+         post_actions: [drop_redundant_rpaths, set_permissions]
+         timeout: 120
+
+For each policy field, one or more command-line arguments replace the configured value rather than extending it.
+This precedence prevents an invocation that names a narrower repository, origin, phase, or action list from silently inheriting additional configured authority.
+The command still requires at least one repository after policy resolution.
+Malformed origins, nonpositive timeouts, unknown fields, duplicate or malformed phase lists, and unknown or noncanonical parent actions fail before recipe execution.
+A syntactically valid phase that the selected recipe does not define is rejected inside the confined build worker.
+
 Extending the worker-based installer
 ------------------------------------
 

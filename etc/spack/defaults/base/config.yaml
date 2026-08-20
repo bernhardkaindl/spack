@@ -187,6 +187,18 @@ config:
     # Additional paths with write and execute permissions.
     allow_write: []
 
+  # Optional policy defaults for the experimental `spack sandbox-install`
+  # command. This section is ignored by normal `spack install`. Repository and
+  # source authorities remain empty so the experimental command fails closed
+  # unless they are supplied explicitly or configured by an administrator.
+  sandbox_installer:
+    source_origins: []
+    file_roots: []
+    repository_snapshots: true
+    phases: [install]
+    post_actions: []
+    timeout: 120
+
   # If set to true, Spack will use ccache to cache C compiles.
   ccache: false
 

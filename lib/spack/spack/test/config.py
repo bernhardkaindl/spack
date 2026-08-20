@@ -892,6 +892,35 @@ config:
     )
 
 
+def test_sandbox_installer_accepts_strict_policy():
+    check_schema(
+        spack.schema.config.schema,
+        """\
+config:
+    sandbox_installer:
+        repositories: [/packages/site, /packages/community]
+        source_origins: [https://sources.example]
+        file_roots: [/mirror]
+        repository_snapshots: true
+        phases: [configure, install]
+        post_actions: [sbang, drop_redundant_rpaths, set_permissions]
+        timeout: 300
+""",
+    )
+
+
+def test_sandbox_installer_rejects_unknown_policy():
+    with pytest.raises(spack.config.ConfigFormatError, match="unknown_policy"):
+        check_schema(
+            spack.schema.config.schema,
+            """\
+config:
+    sandbox_installer:
+        unknown_policy: true
+""",
+        )
+
+
 def test_config_parse_list_in_dict(tmp_path: pathlib.Path):
     with fs.working_dir(str(tmp_path)):
         e = get_config_error(
