@@ -5,6 +5,7 @@
 from pathlib import Path
 import socket
 import sys
+from typing import Any, cast
 
 import pytest
 
@@ -83,6 +84,61 @@ def test_concretize_one_sandboxed_round_trip(
     assert concrete.namespace == repo_builder.namespace
 
 
+def test_concretization_can_use_live_repositories_without_copying(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-live-repository")
+
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("repository snapshot creation should be disabled")
+
+    monkeypatch.setattr(concretize_worker_module, "create_repository_snapshot", fail_if_called)
+
+    concrete = concretize_one_sandboxed(
+        "sandbox-live-repository@1.0",
+        repositories=[repo_builder.root, mock_packages_repo],
+        repository_snapshots=False,
+    )
+
+    assert concrete.concrete
+
+
+def test_live_repository_change_is_rejected_before_concretization(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-live-mutation")
+    recipe = Path(repo_builder._recipe_filename("sandbox-live-mutation"))
+    repository_root = Path(repo_builder.root).resolve()
+    repository_digest = concretize_worker_module.repository_digest
+    mutated = False
+
+    def digest_then_mutate(root):
+        nonlocal mutated
+        identity = repository_digest(root)
+        if root == repository_root and not mutated:
+            recipe.write_text("raise RuntimeError('repository changed')\n", encoding="utf-8")
+            mutated = True
+        return identity
+
+    monkeypatch.setattr(concretize_worker_module, "repository_digest", digest_then_mutate)
+
+    with pytest.raises(SandboxedConcretizationError, match="repository identity mismatch"):
+        concretize_one_sandboxed(
+            "sandbox-live-mutation@1.0",
+            repositories=[repo_builder.root, mock_packages_repo],
+            repository_snapshots=False,
+        )
+
+
+def test_repository_snapshots_option_must_be_boolean(mock_packages_repo):
+    with pytest.raises(SandboxedConcretizationError, match="must be a boolean"):
+        concretize_one_sandboxed(
+            "trivial-install-test-package",
+            repositories=[mock_packages_repo],
+            repository_snapshots=cast(Any, "false"),
+        )
+
+
 def test_concretization_uses_snapshot_after_source_changes(
     concretize_scope, mock_packages_repo, repo_builder, monkeypatch
 ):
@@ -137,7 +193,7 @@ def test_repository_identity_mismatch_fails_before_concretization(
         concretize_worker_module, "create_repository_snapshot", create_with_wrong_identity
     )
 
-    with pytest.raises(SandboxedConcretizationError, match="snapshot identity mismatch"):
+    with pytest.raises(SandboxedConcretizationError, match="repository identity mismatch"):
         concretize_one_sandboxed(
             "sandbox-manifest-mismatch@1.0",
             repositories=[repo_builder.root, mock_packages_repo],

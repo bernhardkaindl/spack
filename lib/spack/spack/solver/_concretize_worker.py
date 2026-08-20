@@ -161,7 +161,7 @@ def _configure_state(request: Dict[str, Any]):
             raise WorkerRequestError("repository roots must be absolute")
         root = root.resolve(strict=True)
         if repository_digest(root) != description["identity"]:
-            raise WorkerRequestError("repository snapshot identity mismatch")
+            raise WorkerRequestError("repository identity mismatch")
         repository = spack.repo.Repo(str(root), cache=cache)
         if repository.namespace != description["namespace"]:
             raise WorkerRequestError("repository namespace changed after validation")

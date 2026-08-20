@@ -11,8 +11,9 @@ the parent never unpickles worker-controlled data.
 
 This is not complete malicious-code isolation. The worker can read files available to the invoking
 user, and Landlock does not restrict every metadata operation, UDP, Unix sockets and other IPC,
-signals, or all process behavior. Package hashes are produced by the worker and are not
-independently attested until a later repository-provenance protocol is implemented.
+signals, or all process behavior. Repository content identities and package-hash provenance are
+validated without importing recipe code in the parent. Repository copying is enabled by default
+but can be disabled for development use, which retains identity checks but not snapshot isolation.
 """
 
 import importlib.util
@@ -24,7 +25,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import spack.config
 import spack.error
@@ -123,7 +124,7 @@ def _configuration_payload() -> Dict[str, Any]:
 
 
 def _repository_payload(
-    repositories: List[Union[str, spack.repo.Repo]], snapshot_base: Path
+    repositories: List[Union[str, spack.repo.Repo]], snapshot_base: Optional[Path]
 ) -> List[Dict[str, Any]]:
     result = []
     for index, repository in enumerate(repositories):
@@ -133,12 +134,16 @@ def _repository_payload(
             else spack.repo.from_path(repository)
         )
         source = Path(repo.root).resolve(strict=True)
-        root = snapshot_root(snapshot_base, index, repo.namespace, repo.package_api)
         try:
-            identity = create_repository_snapshot(source, root)
+            if snapshot_base is None:
+                root = source
+                identity = repository_digest(root)
+            else:
+                root = snapshot_root(snapshot_base, index, repo.namespace, repo.package_api)
+                identity = create_repository_snapshot(source, root)
         except RepositorySnapshotError as error:
             raise SandboxedConcretizationError(
-                f"cannot snapshot repository {repo.namespace}: {error}"
+                f"cannot identify repository {repo.namespace}: {error}"
             ) from error
         result.append(
             {
@@ -336,10 +341,10 @@ def _validate_success(
             identity = repository_digest(Path(repository["root"]))
         except RepositorySnapshotError as error:
             raise SandboxedConcretizationError(
-                f"cannot verify repository snapshot: {error}"
+                f"cannot verify repository contents: {error}"
             ) from error
         if identity != repository["identity"]:
-            raise SandboxedConcretizationError("repository snapshot changed during concretization")
+            raise SandboxedConcretizationError("repository contents changed during concretization")
     spec_data = response["spec"]
     _validate_spec_payload(spec_data)
     expected_package_hashes = [
@@ -373,13 +378,21 @@ def concretize_one_sandboxed(
     repositories: List[Union[str, spack.repo.Repo]],
     tests: Union[bool, List[str]] = False,
     timeout: float = 120.0,
+    repository_snapshots: bool = True,
 ) -> Spec:
     """Concretize one abstract spec in an experimental Landlock-confined worker.
+
+    Repository snapshots are enabled by default so concurrent changes to live repositories cannot
+    affect recipe imports. Developers can set ``repository_snapshots=False`` to avoid copying; the
+    worker and parent still verify repository identities, but this does not prevent changes that are
+    made and reverted between those checks.
 
     This initial API intentionally rejects active environments, concrete and hash-reference inputs,
     develop and external specs, and Git versions. It does not alter normal Spack concretization or
     installation entry points.
     """
+    if not isinstance(repository_snapshots, bool):
+        raise SandboxedConcretizationError("repository_snapshots must be a boolean")
     if active_environment() is not None:
         raise SandboxedConcretizationError("active environments are unsupported by this PoC")
     if isinstance(spec, Spec) and spec.concrete:
@@ -395,9 +408,8 @@ def concretize_one_sandboxed(
         os.mkdir(state_directory, mode=0o700)
         for name in ("cache", "config", "store", "stage", "source-cache", "tmp"):
             os.mkdir(os.path.join(state_directory, name), mode=0o700)
-        repositories_payload = _repository_payload(
-            repositories, Path(workspace) / "repositories"
-        )
+        snapshot_base = Path(workspace) / "repositories" if repository_snapshots else None
+        repositories_payload = _repository_payload(repositories, snapshot_base)
         request = {
             "protocol_version": PROTOCOL_VERSION,
             "operation": "concretize_one",

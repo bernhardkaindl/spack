@@ -17,11 +17,13 @@ process to change recipe input while concretization is in progress, making the r
 if the worker itself cannot write to the repository. Importing those recipes again in the trusted
 parent to verify the result would also execute the less-trusted code outside the sandbox.
 
-The sandboxed-concretization protocol therefore creates snapshots before launching the worker and
-places them outside the worker's writable state. The worker verifies each snapshot identity before it
-enables the repository or imports recipe code, and the parent verifies the same identity after the
+By default, the sandboxed-concretization protocol creates snapshots before launching the worker and
+places them outside the worker's writable state. The worker verifies each snapshot identity before
+it enables the repository or imports recipe code, and the parent verifies the same identity after the
 worker exits. This binds the concrete Spec and its worker-produced package hashes to an ordered,
-content-addressed set of repository inputs without executing recipe code in the parent.
+content-addressed set of repository inputs without executing recipe code in the parent. Developers
+can explicitly disable copying and use live repositories; identity checks remain active in that mode,
+but they cannot detect a repository change that is made and reverted between checks.
 """
 
 import hashlib
