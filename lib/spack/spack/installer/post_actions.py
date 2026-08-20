@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import spack.error
+import spack.hooks.drop_redundant_rpaths
 import spack.hooks.sbang
 import spack.package_prefs
+import spack.util.elf
 from spack.installer.install_tree import (
     MAX_INSTALL_TREE_ENTRIES,
     InstallTreeError,
@@ -21,8 +23,9 @@ from spack.installer.install_tree import (
 from spack.spec import Spec
 
 SBANG = "sbang"
+DROP_REDUNDANT_RPATHS = "drop_redundant_rpaths"
 SET_PERMISSIONS = "set_permissions"
-SUPPORTED_POST_ACTIONS = (SBANG, SET_PERMISSIONS)
+SUPPORTED_POST_ACTIONS = (SBANG, DROP_REDUNDANT_RPATHS, SET_PERMISSIONS)
 MAX_POST_ACTIONS = 16
 COPY_CHUNK_SIZE = 1024 * 1024
 
@@ -141,6 +144,119 @@ def _sbang(
             finally:
                 os.close(descriptor)
     return {"type": SBANG, "entries": entries, "patched": patched, "sbang_path": str(sbang_path)}
+
+
+def _drop_redundant_rpaths(
+    prefix: Path, internal_hardlinks: Dict[Tuple[int, int], int]
+) -> Dict[str, Any]:
+    """Remove nonexistent absolute RPATH entries through no-follow descriptors."""
+    if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "fchmod", "pwrite")):
+        raise PostActionError("RPATH normalization requires no-follow positional file I/O")
+    entries = 0
+    patched = 0
+    visited = set()
+    for root, directories, files in os.walk(prefix, followlinks=False):
+        directories.sort()
+        files.sort()
+        for name in files:
+            entries += 1
+            if entries > MAX_INSTALL_TREE_ENTRIES:
+                raise PostActionError("install tree exceeds the post-action entry limit")
+            path = Path(root) / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            _reject_external_hardlink(path, prefix, info, internal_hardlinks)
+            key = (info.st_dev, info.st_ino)
+            if key in visited:
+                continue
+            visited.add(key)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            original_mode = stat.S_IMODE(info.st_mode)
+            mode_changed = False
+            try:
+                opened = os.fstat(descriptor)
+                expected = (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size)
+                if (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_mode,
+                    opened.st_nlink,
+                    opened.st_size,
+                ) != expected:
+                    relative = path.relative_to(prefix)
+                    raise PostActionError(
+                        "install-tree entry changed during post-action: {0}".format(relative)
+                    )
+                with os.fdopen(os.dup(descriptor), "rb") as stream:
+                    try:
+                        elf = spack.util.elf.parse_elf(
+                            stream, interpreter=False, dynamic_section=True
+                        )
+                    except spack.util.elf.ElfParsingError:
+                        continue
+                if not elf.has_rpath:
+                    continue
+                old_rpath = elf.dt_rpath_str
+                new_rpath = b":".join(
+                    entry
+                    for entry in old_rpath.split(b":")
+                    if spack.hooks.drop_redundant_rpaths.should_keep(entry)
+                )
+                if old_rpath == new_rpath:
+                    continue
+                if not original_mode & stat.S_IWUSR:
+                    os.fchmod(descriptor, original_mode | stat.S_IWUSR)
+                    mode_changed = True
+                writable = os.open(path, os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW)
+                try:
+                    writable_info = os.fstat(writable)
+                    if (
+                        writable_info.st_dev,
+                        writable_info.st_ino,
+                        writable_info.st_nlink,
+                        writable_info.st_size,
+                    ) != (info.st_dev, info.st_ino, info.st_nlink, info.st_size):
+                        relative = path.relative_to(prefix)
+                        raise PostActionError(
+                            "install-tree entry changed during post-action: {0}".format(relative)
+                        )
+                    offset = elf.pt_dynamic_strtab_offset + elf.rpath_strtab_offset
+                    _pwrite_all(
+                        writable, new_rpath + b"\x00" * (len(old_rpath) - len(new_rpath)), offset
+                    )
+                finally:
+                    os.close(writable)
+                final_mode = original_mode & ~(stat.S_ISUID | stat.S_ISGID)
+                if mode_changed or final_mode != original_mode:
+                    os.fchmod(descriptor, final_mode)
+                    mode_changed = False
+                final = os.fstat(descriptor)
+                expected_final = (
+                    info.st_dev,
+                    info.st_ino,
+                    stat.S_IFMT(info.st_mode) | final_mode,
+                    info.st_nlink,
+                    info.st_size,
+                )
+                if (
+                    final.st_dev,
+                    final.st_ino,
+                    final.st_mode,
+                    final.st_nlink,
+                    final.st_size,
+                ) != expected_final:
+                    relative = path.relative_to(prefix)
+                    raise PostActionError(
+                        "install-tree entry changed during post-action: {0}".format(relative)
+                    )
+                patched += 1
+            finally:
+                if mode_changed:
+                    os.fchmod(descriptor, original_mode)
+                os.close(descriptor)
+    return {"type": DROP_REDUNDANT_RPATHS, "entries": entries, "patched": patched}
 
 
 def _validate_permission_mode(mode: int) -> None:
@@ -263,6 +379,8 @@ def run_post_actions(
                 if sbang_path is None:
                     raise PostActionError("sbang post-action requires an explicit store path")
                 results.append(_sbang(prefix, sbang_path, internal_hardlinks))
+            elif action == DROP_REDUNDANT_RPATHS:
+                results.append(_drop_redundant_rpaths(prefix, internal_hardlinks))
             elif action == SET_PERMISSIONS:
                 results.append(_set_permissions(spec, prefix, internal_hardlinks))
         final_install_tree = install_tree_metadata(prefix)

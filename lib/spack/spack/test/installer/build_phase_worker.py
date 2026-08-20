@@ -22,6 +22,7 @@ import spack.hooks.sbang
 import spack.installer.build_phase_worker
 import spack.repo
 import spack.spec
+import spack.util.elf
 import spack.verify
 from spack.installer.build_phase_worker import (
     SandboxedBuildPhaseError,
@@ -39,13 +40,18 @@ from spack.solver.prepared_stage import (
 )
 
 
-def _write_source_archive(path: Path) -> str:
+def _write_source_archive(path: Path, source_files=None) -> str:
     """Write a minimal source archive and return its SHA-256 checksum."""
     contents = b"prepared source\n"
     with tarfile.open(path, "w:gz") as archive:
         info = tarfile.TarInfo("project/README")
         info.size = len(contents)
         archive.addfile(info, io.BytesIO(contents))
+        for name, (file_contents, mode) in sorted((source_files or {}).items()):
+            info = tarfile.TarInfo(name)
+            info.size = len(file_contents)
+            info.mode = mode
+            archive.addfile(info, io.BytesIO(file_contents))
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -64,10 +70,10 @@ def _add_build_recipe(repo_builder, name: str, source_url: str, checksum: str, b
     recipe.write_text(text + "\n" + body, encoding="utf-8")
 
 
-def _prepare_build(repo_builder, mock_packages_repo, tmp_path, name, body):
+def _prepare_build(repo_builder, mock_packages_repo, tmp_path, name, body, source_files=None):
     """Concretize, plan, and prepare one generated package for a build test."""
     source = tmp_path / f"{name}.tar.gz"
-    checksum = _write_source_archive(source)
+    checksum = _write_source_archive(source, source_files=source_files)
     _add_build_recipe(repo_builder, name, source.as_uri(), checksum, body)
     repositories = [repo_builder.root, mock_packages_repo]
     concrete = concretize_one_sandboxed(f"{name}@1.0", repositories=repositories)
@@ -582,6 +588,65 @@ def test_install_prepared_runs_typed_sbang_action(
 
 
 @pytest.mark.use_package_hash
+@pytest.mark.requires_executables("gcc")
+def test_install_prepared_runs_typed_rpath_action(
+    concretize_scope,
+    mock_packages_repo,
+    repo_builder,
+    temporary_store,
+    tmp_path,
+    binary_with_rpaths,
+):
+    """Drop nonexistent ELF RPATHs before permissions and metadata publication."""
+    existing_rpath = str(tmp_path)
+    missing_rpath = str(tmp_path / "missing")
+    elf = Path(binary_with_rpaths(rpaths=[existing_rpath, missing_rpath]))
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-rpath",
+        """    def install(self, spec, prefix):
+        import os
+        import shutil
+        from pathlib import Path
+        binary = Path(prefix).joinpath("bin")
+        binary.mkdir()
+        source = Path(self.stage.source_path).joinpath("project", "tool")
+        tool = binary.joinpath("tool")
+        shutil.copy2(source, tool)
+        tool.chmod(0o4555)
+        os.link(str(tool), str(binary.joinpath("tool-alias")))
+        data = Path(prefix).joinpath("data")
+        data.write_text("data")
+        data.chmod(0o444)
+""",
+        source_files={"project/tool": (elf.read_bytes(), 0o555)},
+    )
+
+    response = install_prepared_registered_sandboxed(
+        concrete,
+        plan,
+        prepared,
+        ["install"],
+        store=temporary_store,
+        repositories=repositories,
+        post_actions=["drop_redundant_rpaths"],
+    )
+
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    assert spack.util.elf.get_rpaths(str(prefix / "bin" / "tool")) == [existing_rpath]
+    assert (prefix / "bin" / "tool").stat().st_ino == (prefix / "bin" / "tool-alias").stat().st_ino
+    assert stat.S_IMODE((prefix / "bin" / "tool").stat().st_mode) == 0o555
+    assert stat.S_IMODE((prefix / "data").stat().st_mode) == 0o444
+    assert [action["type"] for action in response["post_actions"]["actions"]] == [
+        "drop_redundant_rpaths"
+    ]
+    assert response["post_actions"]["actions"][0]["patched"] == 1
+    assert response["install_metadata"]["install_tree"] == install_tree_metadata(prefix)
+
+
+@pytest.mark.use_package_hash
 def test_install_prepared_rejects_post_actions_out_of_order(
     concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
 ):
@@ -605,7 +670,7 @@ def test_install_prepared_rejects_post_actions_out_of_order(
             ["install"],
             store=temporary_store,
             repositories=repositories,
-            post_actions=["set_permissions", "sbang"],
+            post_actions=["set_permissions", "drop_redundant_rpaths"],
         )
 
     assert not (prepared.path / "worker-ran").exists()
