@@ -755,6 +755,7 @@ class PackageInstaller:
             denied = []
             if self.sandbox in ("all", "root", "filesystem"):
                 denied.append("filesystem")
+                denied.append("proc")
             if self.sandbox in ("all", "root", "network"):
                 denied.append("network")
             sandbox_config = {

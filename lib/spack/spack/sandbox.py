@@ -105,6 +105,12 @@ class Sandbox(ABC):
         if resolved.exists():
             self._allow_read(p, resolved)
 
+    def allow_read_files(self, path: Union[str, Path]):
+        p = Path(path).absolute()
+        resolved = p.resolve()
+        if resolved.exists():
+            self._allow_read_files(p, resolved)
+
     def allow_write(self, path: Union[str, Path]):
         p = Path(path).absolute()
         resolved = p.resolve()
@@ -113,6 +119,9 @@ class Sandbox(ABC):
 
     @abstractmethod
     def _allow_read(self, original: Path, resolved: Path): ...
+
+    @abstractmethod
+    def _allow_read_files(self, original: Path, resolved: Path): ...
 
     @abstractmethod
     def _allow_write(self, original: Path, resolved: Path): ...
@@ -174,6 +183,10 @@ class LandlockSandbox(Sandbox):
     def _allow_read(self, original: Path, resolved: Path):
         current_flags = self.path_rules.get(resolved, 0)
         self.path_rules[resolved] = current_flags | self.read_flags
+
+    def _allow_read_files(self, original: Path, resolved: Path):
+        current_flags = self.path_rules.get(resolved, 0)
+        self.path_rules[resolved] = current_flags | FSAccess.READ_FILE
 
     def _allow_write(self, original: Path, resolved: Path):
         current_flags = self.path_rules.get(resolved, 0)

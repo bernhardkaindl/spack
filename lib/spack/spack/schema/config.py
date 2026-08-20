@@ -235,7 +235,7 @@ properties: Dict[str, Any] = {
             },
             "sandbox": {
                 "type": "object",
-                "description": "Restrict filesystem and network access during builds.",
+                "description": "Restrict filesystem, procfs, and network access during builds.",
                 "additionalProperties": False,
                 "properties": {
                     "enable": {
@@ -263,12 +263,12 @@ properties: Dict[str, Any] = {
                             "policy": {"type": "string", "enum": ["allow", "deny"]},
                             "allow": {
                                 "type": "array",
-                                "items": {"enum": ["all", "network", "filesystem"]},
+                                "items": {"enum": ["all", "network", "filesystem", "proc"]},
                                 "uniqueItems": True,
                             },
                             "deny": {
                                 "type": "array",
-                                "items": {"enum": ["all", "network", "filesystem"]},
+                                "items": {"enum": ["all", "network", "filesystem", "proc"]},
                                 "uniqueItems": True,
                             },
                         },
@@ -285,12 +285,12 @@ properties: Dict[str, Any] = {
                                 "spec": {"type": "string", "minLength": 1},
                                 "allow": {
                                     "type": "array",
-                                    "items": {"enum": ["all", "network", "filesystem"]},
+                                    "items": {"enum": ["all", "network", "filesystem", "proc"]},
                                     "uniqueItems": True,
                                 },
                                 "deny": {
                                     "type": "array",
-                                    "items": {"enum": ["all", "network", "filesystem"]},
+                                    "items": {"enum": ["all", "network", "filesystem", "proc"]},
                                     "uniqueItems": True,
                                 },
                             },

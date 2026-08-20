@@ -170,14 +170,20 @@ See :ref:`spack install <spack-install>` for the full set of flags related to de
 Build isolation and sandboxing (Linux)
 --------------------------------------
 
-Spack can run builds in an unprivileged sandbox to restrict filesystem and network access.
+Spack can run builds in an unprivileged sandbox to restrict filesystem, procfs, and network access.
 This opt-in feature requires Linux 5.13+ with Landlock support (network restrictions require Linux 6.7+).
 Sandboxing is meant for build reproducibility and bug containment rather than acting as a strict security boundary, as package recipes still execute outside the sandbox ahead of the build.
 
 The overall ``enable`` switch controls sandboxing. The ``defaults`` policy determines whether
 sandboxed resources are denied or allowed unless a more specific rule applies. The shipped
-``deny`` policy restricts both current resources, ``network`` and ``filesystem``, and also
+``deny`` policy restricts all current resources, ``network``, ``filesystem``, and ``proc``, and
 provides a conservative default for resources added in future Spack versions.
+
+The ``proc`` resource controls read access to files below ``/proc`` while filesystem isolation
+is active. Allowing it permits tools to open known paths such as ``/proc/cpuinfo`` and
+``/proc/<pid>/stat`` but does not permit directory enumeration. Since Landlock cannot subtract
+one subtree from an otherwise unrestricted filesystem, ``proc`` has no effect when
+``filesystem`` is allowed.
 
 The optional ``allow`` and ``deny`` lists change individual resources from the policy default.
 ``all`` selects every resource, and ``deny`` wins if the same resource appears in both lists.
@@ -214,6 +220,18 @@ Within one entry, ``deny`` wins over ``allow``:
 This example permits network access for matching TensorBoard data-server builds while retaining
 filesystem isolation. Since Spack prepends higher-priority configuration lists, their matching
 overrides take precedence over entries from lower-priority scopes.
+
+For packages whose build tools (bazel) inspect process metadata, you can allow procfs files separately:
+
+.. code-block:: yaml
+
+   config:
+     sandbox:
+       defaults:
+         policy: deny
+       overrides:
+       - spec: "py-tensorflow"
+         allow: [network, proc]
 
 If filesystem restrictions are enabled, the stage directory, install prefix, system temporary
 directory, ``/dev/null``, and required runtime facilities are implicitly writable.
@@ -255,10 +273,10 @@ Sandboxing can also be enabled for one install invocation without changing confi
 
 The available modes are:
 
-* ``all`` enables filesystem and network restrictions for every build.
-* ``root`` enables filesystem and network restrictions only for root package builds.
+* ``all`` enables filesystem, procfs, and network restrictions for every build.
+* ``root`` enables filesystem, procfs, and network restrictions only for root package builds.
 * ``network`` enables only network restrictions for every build.
-* ``filesystem`` enables only filesystem restrictions for every build.
+* ``filesystem`` enables filesystem restrictions without procfs file access for every build.
 
 These command-line modes replace the configured default policy for builds in that install
 invocation. Configured package overrides and ``allow_read``/``allow_write`` paths still apply.

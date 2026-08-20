@@ -889,10 +889,10 @@ config:
         defaults:
             policy: deny
             allow: []
-            deny: [network, filesystem]
+            deny: [network, filesystem, proc]
         overrides:
         - spec: "py-tensorboard-data-server@0.7.3: +rocm"
-          allow: [network]
+          allow: [network, proc]
           deny: [filesystem]
 """,
     )

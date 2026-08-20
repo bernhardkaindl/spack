@@ -29,7 +29,6 @@ HOST_RUNTIME_READ_PATHS = (
     "/etc/ld.so.cache",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",
-    "/proc/cpuinfo",
     "/etc/debian_version",
     "/etc/group",
     "/etc/hosts",
@@ -110,7 +109,7 @@ BUILD_TOOLS = (
 )
 #: Support files that compiler drivers may pass to subordinate tools.
 COMPILER_FILES = ("liblto_plugin.so",)
-SANDBOX_RESOURCES = ("network", "filesystem")
+SANDBOX_RESOURCES = ("network", "filesystem", "proc")
 
 
 def _apply_policy_rule(restrictions: Dict[str, bool], rule: dict) -> None:
@@ -127,22 +126,20 @@ def _apply_policy_rule(restrictions: Dict[str, bool], rule: dict) -> None:
         restrictions[resource] = True
 
 
-def resolve_restrictions(
+def resolve_resource_restrictions(
     config: dict, spec: Optional[spack.spec.Spec] = None
-) -> Tuple[bool, bool]:
-    """Resolve filesystem and network restrictions for an optional concrete spec."""
+) -> Dict[str, bool]:
+    """Resolve sandbox resource restrictions for an optional concrete spec."""
     defaults = config.get("defaults")
     if defaults is None:
         restrictions: Dict[str, bool] = {
             "filesystem": bool(config.get("restrict_filesystem", True)),
             "network": spack.sandbox.network_restriction_enabled(config),
+            "proc": True,
         }
     else:
         restricted_by_default = defaults.get("policy", "deny") == "deny"
-        restrictions = {
-            "filesystem": restricted_by_default,
-            "network": restricted_by_default,
-        }
+        restrictions = {resource: restricted_by_default for resource in SANDBOX_RESOURCES}
         _apply_policy_rule(restrictions, defaults)
 
     if "restrict_filesystem" in config:
@@ -167,6 +164,14 @@ def resolve_restrictions(
                     restrictions[resource] = matched[resource]
                     overridden.add(resource)
 
+    return restrictions
+
+
+def resolve_restrictions(
+    config: dict, spec: Optional[spack.spec.Spec] = None
+) -> Tuple[bool, bool]:
+    """Resolve legacy filesystem and network restriction values."""
+    restrictions = resolve_resource_restrictions(config, spec)
     return restrictions["filesystem"], restrictions["network"]
 
 
@@ -255,7 +260,9 @@ def enable(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
     if not config.get("enable", False):
         return
 
-    restrict_filesystem, restrict_network = resolve_restrictions(config, spec)
+    restrictions = resolve_resource_restrictions(config, spec)
+    restrict_filesystem = restrictions["filesystem"]
+    restrict_network = restrictions["network"]
     if not restrict_filesystem and not restrict_network:
         return
 
@@ -287,6 +294,14 @@ def enable(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
 
         for path in HOST_RUNTIME_READ_PATHS:
             sandbox.allow_read(path)
+
+        # Bazel need to read /proc/<pid>/stat to read the start time of the process.
+        # It is used to compute the elapsed time of the process.
+        # Permits known proc-file paths but denies directory listing (READ_DIR),
+        # so proc/<pid> cannot be enumerated without knowing/guessing the PID.
+
+        if not restrictions["proc"]:
+            sandbox.allow_read_files("/proc")
         for path in HOST_RUNTIME_WRITE_PATHS:
             sandbox.allow_write(path)
         sandbox.allow_read(Path("/bin/sh"))

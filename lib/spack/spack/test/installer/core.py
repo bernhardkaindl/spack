@@ -169,13 +169,25 @@ def test_dependency_built_before_dependent(temporary_store, mock_packages):
     [
         (
             "all",
-            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem", "network"]}},
-            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem", "network"]}},
+            {
+                "enable": True,
+                "defaults": {"policy": "allow", "deny": ["filesystem", "proc", "network"]},
+            },
+            {
+                "enable": True,
+                "defaults": {"policy": "allow", "deny": ["filesystem", "proc", "network"]},
+            },
         ),
         (
             "root",
-            {"enable": False, "defaults": {"policy": "allow", "deny": ["filesystem", "network"]}},
-            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem", "network"]}},
+            {
+                "enable": False,
+                "defaults": {"policy": "allow", "deny": ["filesystem", "proc", "network"]},
+            },
+            {
+                "enable": True,
+                "defaults": {"policy": "allow", "deny": ["filesystem", "proc", "network"]},
+            },
         ),
         (
             "network",
@@ -184,8 +196,8 @@ def test_dependency_built_before_dependent(temporary_store, mock_packages):
         ),
         (
             "filesystem",
-            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem"]}},
-            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem"]}},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem", "proc"]}},
+            {"enable": True, "defaults": {"policy": "allow", "deny": ["filesystem", "proc"]}},
         ),
     ],
 )

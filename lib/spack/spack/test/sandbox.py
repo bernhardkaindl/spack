@@ -112,16 +112,36 @@ def test_resolve_sandbox_overrides_use_first_resource_match():
     assert spack.installer.sandbox.resolve_restrictions(config, spec) == (False, False)
 
 
+def test_resolve_sandbox_proc_override():
+    config = {
+        "defaults": {"policy": "deny"},
+        "overrides": [{"spec": "bazel-package", "allow": ["proc"]}],
+    }
+
+    matching = spack.installer.sandbox.resolve_resource_restrictions(
+        config, spack.spec.Spec("bazel-package")
+    )
+    nonmatching = spack.installer.sandbox.resolve_resource_restrictions(
+        config, spack.spec.Spec("other-package")
+    )
+
+    assert matching == {"filesystem": True, "network": True, "proc": False}
+    assert nonmatching == {"filesystem": True, "network": True, "proc": True}
+
+
 def test_landlock_sandbox_syscall_args(tmp_path: pathlib.Path):
     """Test that LandlockSandbox passes correct arguments to each syscall."""
     sandbox = SpyLandlockSandbox(abi_version=3)
 
     test_dir = tmp_path / "dir"
     test_dir.mkdir()
+    files_only_dir = tmp_path / "files-only"
+    files_only_dir.mkdir()
     test_file = test_dir / "file"
     test_file.touch()
 
     sandbox.allow_read(test_dir)
+    sandbox.allow_read_files(files_only_dir)
     sandbox.allow_write(test_file)
     sandbox.apply(restrict_filesystem=True, restrict_network=False)
 
@@ -131,8 +151,8 @@ def test_landlock_sandbox_syscall_args(tmp_path: pathlib.Path):
     assert fs_flags & spack.sandbox.FSAccess.WRITE_FILE
     assert net_flags == 0
 
-    # One rule per path, both using the same ruleset fd
-    assert len(sandbox.add_rule_calls) == 2
+    # One rule per path, all using the same ruleset fd
+    assert len(sandbox.add_rule_calls) == 3
     for ruleset_fd, _access, path_fd in sandbox.add_rule_calls:
         assert ruleset_fd == sandbox.ruleset_fd
         assert path_fd > 0
@@ -142,6 +162,12 @@ def test_landlock_sandbox_syscall_args(tmp_path: pathlib.Path):
         a for _, a, _ in sandbox.add_rule_calls if a & spack.sandbox.FSAccess.READ_DIR
     )
     assert not (dir_access & spack.sandbox.FSAccess.WRITE_FILE)
+
+    # Files-only directory: known descendants are readable without directory enumeration.
+    files_only_access = next(
+        a for _, a, _ in sandbox.add_rule_calls if a == spack.sandbox.FSAccess.READ_FILE
+    )
+    assert not (files_only_access & spack.sandbox.FSAccess.READ_DIR)
 
     # Write file: has WRITE_FILE, no READ_DIR (dir flags stripped for non-dirs)
     file_access = next(
@@ -185,11 +211,15 @@ class MockSandbox(spack.sandbox.Sandbox):
     def __init__(self):
         """Initialize empty call lists for each sandbox operation."""
         self.read_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
+        self.files_only_read_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
         self.write_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
         self.apply_calls: List[Tuple[bool, bool]] = []
 
     def _allow_read(self, original: pathlib.Path, resolved: pathlib.Path):
         self.read_calls.append((original, resolved))
+
+    def _allow_read_files(self, original: pathlib.Path, resolved: pathlib.Path):
+        self.files_only_read_calls.append((original, resolved))
 
     def _allow_write(self, original: pathlib.Path, resolved: pathlib.Path):
         self.write_calls.append((original, resolved))
@@ -407,6 +437,29 @@ def test_enable_sandbox_paths(
             assert resolved in allow_write_resolved
 
     assert mock_sandbox.apply_calls == [(True, True)]
+    assert not mock_sandbox.files_only_read_calls
+
+
+def test_enable_sandbox_allows_proc_for_matching_override(
+    mock_packages, monkeypatch, tmp_path: pathlib.Path
+):
+    mock_sandbox = MockSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+    spec = spack.concretize.concretize_one("dependent-install")
+    config = {
+        "enable": True,
+        "defaults": {"policy": "deny"},
+        "overrides": [{"spec": "dependent-install", "allow": ["proc"]}],
+    }
+
+    spack.installer.sandbox.enable(config, spec, str(tmp_path))
+
+    assert mock_sandbox.files_only_read_calls == [(pathlib.Path("/proc"), pathlib.Path("/proc"))]
+
+
+def test_host_runtime_paths_include_process_metadata():
+    assert "/proc" not in spack.installer.sandbox.HOST_RUNTIME_READ_PATHS
+    assert "/proc/cpuinfo" not in spack.installer.sandbox.HOST_RUNTIME_READ_PATHS
 
 
 def test_enable_sandbox_defaults_to_all_restrictions(mock_packages, monkeypatch, tmp_path):

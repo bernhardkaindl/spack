@@ -170,7 +170,7 @@ config:
   # Which installer to use: "old" or "new".
   installer: new
 
-  # Restrict filesystem and network access during builds. The stage directory,
+  # Restrict filesystem, procfs, and network access during builds. The stage directory,
   # install prefix, and system temp directory are always writable.
   # Spack-installed dependency prefixes are always readable. Use the allow_read
   # and allow_write lists to grant additional permissions to other paths.
@@ -181,14 +181,39 @@ config:
     # Deny current and future sandboxed resources unless explicitly allowed.
     defaults:
       policy: deny
-      deny: [network, filesystem]
+      deny: [network, filesystem, proc]
     overrides:
     - spec: "4c-multiphysics"
       allow: [network]  # clones googletest from github
     - spec: "arrow"
       allow: [network]  # fetches mimalloc source to configure a custom build of it
+    - spec: "distbench"
+      allow: [proc]
+    - spec: "nccl-fastsocket"
+      allow: [proc]
+    - spec: "py-jaxlib"
+      allow: [proc]
+    - spec: "py-keras"
+      allow: [proc]
+    - spec: "py-ray"
+      allow: [proc]
     - spec: "py-tensorboard-data-server"
       allow: [network]  # fetches async-stream as a dependency of package rustboard
+    - spec: "py-tensorflow"
+      # Bazel uses a local server and reads its process metadata
+      allow: [proc, network, filesystem]
+    - spec: "py-tensorflow-estimator"
+      allow: [proc]
+    - spec: "py-tensorflow-hub"
+      allow: [proc]
+    - spec: "py-tensorflow-metadata"
+      allow: [proc]
+    - spec: "py-tensorflow-probability"
+      allow: [proc]
+    - spec: "py-tensorstore"
+      allow: [proc]
+    - spec: "verible"
+      allow: [proc]
 
     # Additional paths with read and execute permissions.
     allow_read: []
