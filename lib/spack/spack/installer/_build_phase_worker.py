@@ -186,6 +186,7 @@ def _run_phases(request: Dict[str, Any], repositories):
     """Verify build provenance and execute declared phases under confinement."""
     import spack.build_environment
     import spack.builder
+    import spack.patch
     import spack.platforms
     from spack.installer.install_tree import install_tree_metadata
     from spack.solver.prepared_stage import prepared_stage_digest, source_plan_digest
@@ -215,6 +216,27 @@ def _run_phases(request: Dict[str, Any], repositories):
     package = spec.package
     if package.content_hash() != root["package_hash"]:
         raise WorkerRequestError("package hash does not match the verified repository")
+    if callable(getattr(package, "patch", None)):
+        raise WorkerRequestError("package-defined patch methods are unsupported")
+    recipe_patches = []
+    for patch in spec.patches:
+        if type(patch) is not spack.patch.FilePatch:
+            raise WorkerRequestError("source plan supports only repository-local file patches")
+        recipe_patches.append(
+            {
+                "owner": patch.owner,
+                "sha256": patch.sha256,
+                "level": patch.level,
+                "working_dir": patch.working_dir,
+                "reverse": patch.reverse,
+            }
+        )
+    planned_patches = [
+        {key: patch[key] for key in ("owner", "sha256", "level", "working_dir", "reverse")}
+        for patch in request["source_plan"]["patches"]
+    ]
+    if planned_patches != recipe_patches:
+        raise WorkerRequestError("source plan patches do not match the concrete recipe")
     package.stage = SimpleNamespace(
         path=request["prepared_stage"], source_path=request["prepared_stage"]
     )

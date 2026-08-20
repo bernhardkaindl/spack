@@ -187,9 +187,117 @@ def test_run_prepared_build_phase_with_resource(
     )
 
     assert response["source_plan_sha256"] == source_plan_digest(plan)
-    assert plan["schema_version"] == 2
+    assert plan["schema_version"] == 3
     assert [resource["name"] for resource in plan["resources"]] == ["headers"]
     assert (prefix / "resource.txt").read_text(encoding="utf-8") == "prepared source\n"
+
+
+@pytest.mark.use_package_hash
+@pytest.mark.requires_executables("patch")
+def test_run_prepared_build_phase_with_repository_patch(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
+):
+    """Apply a worker-planned repository patch before the confined build phase."""
+    source = tmp_path / "source.tar.gz"
+    checksum = _write_source_archive(
+        source, source_files={"project/message": (b"before\n", 0o644)}
+    )
+    _add_build_recipe(
+        repo_builder,
+        "sandbox-build-patch",
+        source.as_uri(),
+        checksum,
+        '''    patch("fix.patch", level=0)
+
+    def install(self, spec, prefix):
+        """Install content transformed by the confined patch worker."""
+        from pathlib import Path
+        source = Path(self.stage.source_path).joinpath("message")
+        Path(prefix).joinpath("message").write_text(source.read_text())
+''',
+    )
+    recipe = Path(repo_builder._recipe_filename("sandbox-build-patch"))
+    recipe.with_name("fix.patch").write_text(
+        "--- message\n+++ message\n@@ -1 +1 @@\n-before\n+after\n", encoding="utf-8"
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+    concrete = concretize_one_sandboxed("sandbox-build-patch@1.0", repositories=repositories)
+    plan = plan_sources_sandboxed(concrete, repositories=repositories)
+    prepared = prepare_stage(
+        plan,
+        tmp_path / "prepared",
+        expected_provenance=plan["provenance"],
+        fetch_policy=SourceFetchPolicy(file_roots=(tmp_path,)),
+    )
+
+    def reject_parent_package_import(*args, **kwargs):
+        raise AssertionError("trusted parent imported recipe code")
+
+    monkeypatch.setattr(spack.repo.PATH, "get_pkg_class", reject_parent_package_import)
+    prefix = tmp_path / "prefix"
+    response = run_build_phase_sandboxed(
+        concrete, plan, prepared, "install", prefix=prefix, repositories=repositories
+    )
+
+    assert response["source_plan_sha256"] == source_plan_digest(plan)
+    assert len(plan["patches"]) == 1
+    assert (prepared.path / "message").read_text(encoding="utf-8") == "after\n"
+    assert (prefix / "message").read_text(encoding="utf-8") == "after\n"
+
+
+@pytest.mark.use_package_hash
+@pytest.mark.requires_executables("patch")
+def test_build_worker_rejects_patch_not_bound_to_recipe(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path
+):
+    """Reject a valid prepared tree when patch metadata differs from the concrete recipe."""
+    source = tmp_path / "source.tar.gz"
+    checksum = _write_source_archive(
+        source, source_files={"project/message": (b"before\n", 0o644)}
+    )
+    _add_build_recipe(
+        repo_builder,
+        "sandbox-build-patch-tamper",
+        source.as_uri(),
+        checksum,
+        """    patch("fix.patch", level=0)
+
+    def install(self, spec, prefix):
+        pass
+""",
+    )
+    recipe = Path(repo_builder._recipe_filename("sandbox-build-patch-tamper"))
+    recipe.with_name("fix.patch").write_text(
+        "--- message\n+++ message\n@@ -1 +1 @@\n-before\n+after\n", encoding="utf-8"
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+    concrete = concretize_one_sandboxed(
+        "sandbox-build-patch-tamper@1.0", repositories=repositories
+    )
+    plan = plan_sources_sandboxed(concrete, repositories=repositories)
+    prepared = prepare_stage(
+        plan,
+        tmp_path / "prepared",
+        expected_provenance=plan["provenance"],
+        fetch_policy=SourceFetchPolicy(file_roots=(tmp_path,)),
+    )
+    tampered = copy.deepcopy(plan)
+    tampered["patches"][0]["owner"] = "test.unrelated"
+    tampered_prepared = PreparedStage(
+        path=prepared.path,
+        source_plan_sha256=source_plan_digest(tampered),
+        content_sha256=prepared.content_sha256,
+    )
+
+    with pytest.raises(SandboxedBuildPhaseError, match="patches do not match"):
+        run_build_phase_sandboxed(
+            concrete,
+            tampered,
+            tampered_prepared,
+            "install",
+            prefix=tmp_path / "prefix",
+            repositories=repositories,
+        )
 
 
 @pytest.mark.use_package_hash

@@ -9,18 +9,25 @@ is recipe-free so a trusted parent can reject malformed worker output without im
 code.
 """
 
+import base64
+import binascii
+import hashlib
 import re
 import urllib.parse
 from pathlib import PurePosixPath
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import spack.error
 import spack.fetch_strategy
 import spack.hash_types as ht
+import spack.patch
 
-SOURCE_PLAN_SCHEMA_VERSION = 2
+SOURCE_PLAN_SCHEMA_VERSION = 3
 MAX_SOURCE_URLS = 32
 MAX_RESOURCES = 32
+MAX_PATCHES = 32
+MAX_PATCH_BYTES = 48 * 1024
+MAX_PATCH_BYTES_TOTAL = 512 * 1024
 MAX_SOURCE_PLAN_STRING = 4096
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -28,6 +35,8 @@ _DAG_HASH = re.compile(r"[a-z2-7]{32}")
 _PACKAGE_HASH = re.compile(r"[a-z2-7]{52}={4}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9_.-]+")
 _EXTENSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,31}")
+_HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?\n")
+_GIT_INDEX = re.compile(r"index [0-9a-f]+\.\.[0-9a-f]+(?: [0-7]{6})?\n")
 
 
 class SourcePlanError(spack.error.SpackError):
@@ -60,8 +69,12 @@ def _url(value: Any) -> str:
     return url
 
 
-def _relative_path(value: Any, description: str, *, allow_empty: bool = False) -> str:
+def _relative_path(
+    value: Any, description: str, *, allow_empty: bool = False, allow_dot: bool = False
+) -> str:
     if allow_empty and value == "":
+        return value
+    if allow_dot and value == ".":
         return value
     path = _string(value, description)
     parsed = PurePosixPath(path)
@@ -75,6 +88,124 @@ def _relative_path(value: Any, description: str, *, allow_empty: bool = False) -
     ):
         raise SourcePlanError(f"invalid {description}")
     return path
+
+
+def _patch_for_plan(patch: Any) -> Dict[str, Any]:
+    if type(patch) is not spack.patch.FilePatch or patch.path is None:
+        raise SourcePlanError("only repository-local file patches are supported")
+    try:
+        with open(patch.path, "rb") as stream:
+            content = stream.read(MAX_PATCH_BYTES + 1)
+    except OSError as error:
+        raise SourcePlanError(f"cannot read repository patch: {error}") from error
+    if len(content) > MAX_PATCH_BYTES:
+        raise SourcePlanError("repository patch exceeds the size limit")
+    sha256 = hashlib.sha256(content).hexdigest()
+    if sha256 != patch.sha256:
+        raise SourcePlanError("repository patch checksum changed during planning")
+    targets = _validate_unified_diff(content, patch.level)
+    return {
+        "kind": "inline",
+        "owner": patch.owner,
+        "sha256": sha256,
+        "level": patch.level,
+        "working_dir": patch.working_dir,
+        "reverse": patch.reverse,
+        "targets": targets,
+        "content_base64": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def _patch_header_path(line: str, level: int) -> str:
+    value = line[4:].rstrip("\n").split("\t", 1)[0]
+    path = PurePosixPath(value)
+    if (
+        not value
+        or path.is_absolute()
+        or "\\" in value
+        or ".." in path.parts
+        or len(path.parts) <= level
+    ):
+        raise SourcePlanError("invalid unified patch target")
+    return str(PurePosixPath(*path.parts[level:]))
+
+
+def _validate_unified_diff(content: bytes, level: int) -> List[str]:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SourcePlanError("patch payload must be UTF-8 unified diff text") from error
+    if "\x00" in text or "\r" in text:
+        raise SourcePlanError("patch payload must use LF-terminated unified diff text")
+    lines = text.splitlines(keepends=True)
+    if not lines or any(not line.endswith("\n") for line in lines):
+        raise SourcePlanError("patch payload must use LF-terminated unified diff text")
+    targets = []
+    index = 0
+    while index < len(lines):
+        git_targets = None
+        if lines[index].startswith("diff --git "):
+            fields = lines[index].rstrip("\n").split(" ")
+            if len(fields) != 4:
+                raise SourcePlanError("invalid Git patch preamble")
+            git_targets = (
+                _patch_header_path(f"--- {fields[2]}\n", level),
+                _patch_header_path(f"+++ {fields[3]}\n", level),
+            )
+            if git_targets[0] != git_targets[1]:
+                raise SourcePlanError("patch renames, creations, and deletions are unsupported")
+            index += 1
+            if index < len(lines) and lines[index].startswith("index "):
+                if _GIT_INDEX.fullmatch(lines[index]) is None:
+                    raise SourcePlanError("invalid Git patch index")
+                index += 1
+        if index >= len(lines):
+            raise SourcePlanError("patch payload is missing a unified diff")
+        if not lines[index].startswith("--- "):
+            raise SourcePlanError("patch payload is not a supported unified diff")
+        old_target = _patch_header_path(lines[index], level)
+        index += 1
+        if index >= len(lines) or not lines[index].startswith("+++ "):
+            raise SourcePlanError("patch payload is missing a unified diff target")
+        new_target = _patch_header_path(lines[index], level)
+        if old_target != new_target:
+            raise SourcePlanError("patch renames, creations, and deletions are unsupported")
+        if git_targets is not None and git_targets != (old_target, new_target):
+            raise SourcePlanError("Git patch preamble does not match unified diff targets")
+        if old_target in targets:
+            raise SourcePlanError("patch target must occur only once per payload")
+        targets.append(old_target)
+        index += 1
+        hunks = 0
+        while index < len(lines) and lines[index].startswith("@@ "):
+            match = _HUNK.fullmatch(lines[index])
+            if match is None:
+                raise SourcePlanError("invalid unified patch hunk")
+            old_remaining = int(match.group(2) or "1")
+            new_remaining = int(match.group(4) or "1")
+            index += 1
+            while old_remaining or new_remaining:
+                if index >= len(lines):
+                    raise SourcePlanError("truncated unified patch hunk")
+                prefix = lines[index][0]
+                if prefix == " ":
+                    old_remaining -= 1
+                    new_remaining -= 1
+                elif prefix == "-":
+                    old_remaining -= 1
+                elif prefix == "+":
+                    new_remaining -= 1
+                else:
+                    raise SourcePlanError("invalid unified patch hunk body")
+                if old_remaining < 0 or new_remaining < 0:
+                    raise SourcePlanError("unified patch hunk exceeds declared size")
+                index += 1
+                if index < len(lines) and lines[index] == "\\ No newline at end of file\n":
+                    index += 1
+            hunks += 1
+        if not hunks:
+            raise SourcePlanError("patch target has no unified diff hunks")
+    return targets
 
 
 def _source_for_fetcher(fetcher: Any, description: str) -> Dict[str, Any]:
@@ -119,8 +250,11 @@ def source_plan_for_spec(spec, repositories: Any) -> Dict[str, Any]:
                 "placement": resource.placement,
             }
         )
-    if spec.patches:
-        raise SourcePlanError("source plan patches are unsupported")
+    if callable(getattr(package, "patch", None)):
+        raise SourcePlanError("package-defined patch methods are unsupported")
+    if len(spec.patches) > MAX_PATCHES:
+        raise SourcePlanError("source plan has too many patches")
+    patches = [_patch_for_plan(patch) for patch in spec.patches]
 
     package_hash = ht.package_hash(spec)
     plan = {
@@ -132,7 +266,7 @@ def source_plan_for_spec(spec, repositories: Any) -> Dict[str, Any]:
         },
         "source": source,
         "resources": resources,
-        "patches": [],
+        "patches": patches,
     }
     return validate_source_plan(plan)
 
@@ -150,7 +284,7 @@ def validate_source_plan(
     }:
         raise SourcePlanError("source plan has unexpected fields")
     schema_version = plan["schema_version"]
-    if type(schema_version) is not int or schema_version not in (1, SOURCE_PLAN_SCHEMA_VERSION):
+    if type(schema_version) is not int or schema_version not in (1, 2, SOURCE_PLAN_SCHEMA_VERSION):
         raise SourcePlanError("unsupported source plan schema")
 
     provenance = plan["provenance"]
@@ -212,9 +346,71 @@ def validate_source_plan(
         if len(set(names)) != len(names):
             raise SourcePlanError("resource names must be unique")
 
-    if plan["patches"] != []:
-        raise SourcePlanError("source plan patches are unsupported")
+    patches = plan["patches"]
+    if schema_version in (1, 2):
+        if patches != []:
+            raise SourcePlanError(
+                f"source plan patches are unsupported by version {schema_version}"
+            )
+    else:
+        _validate_patches(patches)
     return plan
+
+
+def _validate_patches(patches: Any) -> None:
+    if not isinstance(patches, list) or len(patches) > MAX_PATCHES:
+        raise SourcePlanError("invalid source plan patches")
+    total_bytes = 0
+    for patch in patches:
+        if not isinstance(patch, dict) or set(patch) != {
+            "kind",
+            "owner",
+            "sha256",
+            "level",
+            "working_dir",
+            "reverse",
+            "targets",
+            "content_base64",
+        }:
+            raise SourcePlanError("invalid source plan patch")
+        if patch["kind"] != "inline":
+            raise SourcePlanError("unsupported patch kind")
+        _string(patch["owner"], "patch owner", pattern=_IDENTIFIER)
+        sha256 = _string(patch["sha256"], "patch SHA-256", pattern=_SHA256)
+        level = patch["level"]
+        if type(level) is not int or not 0 <= level <= 16:
+            raise SourcePlanError("invalid patch level")
+        _relative_path(patch["working_dir"], "patch working directory", allow_dot=True)
+        if not isinstance(patch["reverse"], bool):
+            raise SourcePlanError("invalid patch reverse policy")
+        targets = patch["targets"]
+        if (
+            not isinstance(targets, list)
+            or not targets
+            or len(targets) > 256
+            or len(set(targets)) != len(targets)
+        ):
+            raise SourcePlanError("invalid patch targets")
+        for target in targets:
+            _relative_path(target, "patch target")
+        encoded = patch["content_base64"]
+        if not isinstance(encoded, str) or not encoded:
+            raise SourcePlanError("invalid patch payload")
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise SourcePlanError("invalid patch payload") from error
+        if base64.b64encode(content).decode("ascii") != encoded:
+            raise SourcePlanError("patch payload is not canonically encoded")
+        if not content or len(content) > MAX_PATCH_BYTES:
+            raise SourcePlanError("patch payload exceeds the size limit")
+        total_bytes += len(content)
+        if total_bytes > MAX_PATCH_BYTES_TOTAL:
+            raise SourcePlanError("patch payloads exceed the aggregate size limit")
+        if hashlib.sha256(content).hexdigest() != sha256:
+            raise SourcePlanError("patch payload checksum does not match")
+        if _validate_unified_diff(content, level) != targets:
+            raise SourcePlanError("patch targets do not match the payload")
 
 
 def _validate_url_source(source: Any, description: str) -> None:

@@ -4,11 +4,15 @@
 
 """Trusted preparation of source plans without importing recipe code."""
 
+import base64
 import hashlib
 import json
 import os
 import shutil
+import signal
 import stat
+import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.parse
@@ -25,6 +29,10 @@ from spack.solver.source_plan import validate_source_plan
 MAX_ARCHIVE_ENTRIES = 100000
 MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
 MAX_EXPANDED_BYTES = 16 * 1024 * 1024 * 1024
+PATCH_PROTOCOL_VERSION = 1
+PATCH_TIMEOUT_SECONDS = 120
+MAX_PATCH_WORKER_RESPONSE_BYTES = 64 * 1024
+MAX_PATCH_WORKER_STDERR_BYTES = 1024 * 1024
 
 
 class PreparedStageError(spack.error.SpackError):
@@ -317,6 +325,132 @@ def _prepare_resources(
         resource_root.rename(target)
 
 
+def _patch_worker_command() -> Tuple[str, ...]:
+    worker = Path(__file__).with_name("_patch_worker.py")
+    return (sys.executable, "-I", "-S", "-B", str(worker))
+
+
+def _patch_worker_environment(state: Path) -> Dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"PYTHONHOME", "PYTHONPATH", "LD_PRELOAD", "SPACK_ENV"}
+    }
+    environment.update({"HOME": str(state), "TMPDIR": str(state), "LC_ALL": "C"})
+    return environment
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        process.kill()
+    process.wait()
+
+
+def _apply_patches(patches: Any, source: Path, workspace: Path) -> None:
+    if not patches:
+        return
+    patch_executable = shutil.which("patch")
+    if patch_executable is None:
+        raise PreparedStageError("patch executable is required for source plan patches")
+    patch_executable = str(Path(patch_executable).resolve(strict=True))
+    state = workspace / "patch-state"
+    state.mkdir(mode=0o700)
+    descriptions = []
+    for index, patch in enumerate(patches):
+        path = state / str(index)
+        content = base64.b64decode(patch["content_base64"], validate=True)
+        with open(path, "xb") as stream:
+            stream.write(content)
+        descriptions.append(
+            {
+                "path": str(path),
+                "sha256": patch["sha256"],
+                "level": patch["level"],
+                "working_dir": patch["working_dir"],
+                "reverse": patch["reverse"],
+                "targets": patch["targets"],
+            }
+        )
+    request = {
+        "protocol_version": PATCH_PROTOCOL_VERSION,
+        "source_path": str(source),
+        "state_directory": str(state),
+        "patch_executable": patch_executable,
+        "patches": descriptions,
+    }
+    request_bytes = json.dumps(request, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    process = subprocess.Popen(
+        _patch_worker_command(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        start_new_session=True,
+        env=_patch_worker_environment(state),
+    )
+    timeout_error = None
+    try:
+        stdout, stderr = process.communicate(request_bytes, timeout=PATCH_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        timeout_error = error
+        _kill_process_group(process)
+        stdout, stderr = process.communicate()
+    if timeout_error is not None:
+        raise PreparedStageError(
+            f"patch worker timed out after {PATCH_TIMEOUT_SECONDS} seconds"
+        ) from timeout_error
+    if len(stdout) > MAX_PATCH_WORKER_RESPONSE_BYTES:
+        raise PreparedStageError("patch worker response is too large")
+    if len(stderr) > MAX_PATCH_WORKER_STDERR_BYTES:
+        raise PreparedStageError("patch worker diagnostic output is too large")
+
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        response = json.loads(stdout.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
+        raise PreparedStageError("patch worker returned an invalid response") from error
+    if process.returncode != 0 or not isinstance(response, dict):
+        raise PreparedStageError(f"patch worker exited with status {process.returncode}")
+    if (
+        response.get("protocol_version") != PATCH_PROTOCOL_VERSION
+        or response.get("ok") is not True
+    ):
+        error = response.get("error", {})
+        raise PreparedStageError(
+            "patch worker failed during {} ({}): {}".format(
+                error.get("phase", "unknown"),
+                error.get("type", "Error"),
+                error.get("message", "patch application failed"),
+            )
+        )
+    if set(response) != {"protocol_version", "ok", "sandbox", "applied"}:
+        raise PreparedStageError("patch worker response has unexpected fields")
+    sandbox = response["sandbox"]
+    if (
+        not isinstance(sandbox, dict)
+        or set(sandbox) != {"backend", "abi_version", "filesystem_restricted", "tcp_restricted"}
+        or sandbox["backend"] != "landlock"
+        or type(sandbox["abi_version"]) is not int
+        or sandbox["abi_version"] < 4
+        or sandbox["filesystem_restricted"] is not True
+        or sandbox["tcp_restricted"] is not True
+    ):
+        raise PreparedStageError("patch worker did not apply the required restrictions")
+    if response["applied"] != [patch["sha256"] for patch in patches]:
+        raise PreparedStageError("patch worker returned inconsistent patch identities")
+
+
 def prepare_stage(
     plan: Dict[str, Any],
     destination: Path,
@@ -345,6 +479,7 @@ def prepare_stage(
             plan["source"], temporary, workspace / "downloads" / "source", fetch_policy, budget
         )
         _prepare_resources(plan["resources"], temporary, workspace, fetch_policy, budget)
+        _apply_patches(plan["patches"], temporary, workspace)
         temporary.rename(destination)
     except BaseException:
         raise

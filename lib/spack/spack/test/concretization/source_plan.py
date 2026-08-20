@@ -2,7 +2,9 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import base64
 import copy
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -53,6 +55,19 @@ def resource_description():
         },
         "destination": "vendor",
         "placement": "headers",
+    }
+
+
+def patch_description(content=b"--- a/file\n+++ b/file\n@@ -1 +1 @@\n-before\n+after\n"):
+    return {
+        "kind": "inline",
+        "owner": "test.patch-owner",
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "level": 1,
+        "working_dir": ".",
+        "reverse": False,
+        "targets": ["file"],
+        "content_base64": base64.b64encode(content).decode("ascii"),
     }
 
 
@@ -111,6 +126,70 @@ def test_source_plan_rejects_too_many_resources(source_plan):
         source_plan["resources"].append(resource)
 
     with pytest.raises(SourcePlanError, match="resources"):
+        validate_source_plan(source_plan)
+
+
+def test_validate_inline_patch_source_plan(source_plan):
+    source_plan["schema_version"] = 3
+    source_plan["patches"] = [patch_description()]
+
+    assert validate_source_plan(source_plan) is source_plan
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda patch: patch.update(extra=True), "source plan patch"),
+        (lambda patch: patch.update(kind="url"), "patch kind"),
+        (lambda patch: patch.update(level=-1), "patch level"),
+        (lambda patch: patch.update(level=17), "patch level"),
+        (lambda patch: patch.update(working_dir="../escape"), "working directory"),
+        (lambda patch: patch.update(reverse=1), "reverse policy"),
+        (lambda patch: patch.update(targets=["other"]), "targets do not match"),
+        (lambda patch: patch.update(content_base64="not base64"), "patch payload"),
+        (lambda patch: patch.update(sha256="0" * 64), "checksum"),
+    ],
+)
+def test_source_plan_rejects_malformed_inline_patch(source_plan, mutation, match):
+    source_plan["schema_version"] = 3
+    patch = patch_description()
+    mutation(patch)
+    source_plan["patches"] = [patch]
+
+    with pytest.raises(SourcePlanError, match=match):
+        validate_source_plan(source_plan)
+
+
+def test_source_plan_rejects_non_unified_patch(source_plan):
+    source_plan["schema_version"] = 3
+    source_plan["patches"] = [patch_description(b"1c\nmalicious\n.\n")]
+
+    with pytest.raises(SourcePlanError, match="unified diff"):
+        validate_source_plan(source_plan)
+
+
+def test_source_plan_accepts_git_unified_patch(source_plan):
+    content = (
+        b"diff --git a/file b/file\n"
+        b"index 1111111..2222222 100644\n"
+        b"--- a/file\n"
+        b"+++ b/file\n"
+        b"@@ -1 +1 @@\n"
+        b"-before\n"
+        b"+after\n"
+    )
+    source_plan["schema_version"] = 3
+    source_plan["patches"] = [patch_description(content)]
+
+    assert validate_source_plan(source_plan) is source_plan
+
+
+def test_source_plan_rejects_git_patch_target_mismatch(source_plan):
+    content = b"diff --git a/other b/other\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-before\n+after\n"
+    source_plan["schema_version"] = 3
+    source_plan["patches"] = [patch_description(content)]
+
+    with pytest.raises(SourcePlanError, match="preamble does not match"):
         validate_source_plan(source_plan)
 
 
@@ -213,8 +292,84 @@ def test_source_plan_for_url_resource(concretize_scope, mock_packages_repo, repo
         concrete = spack.concretize.concretize_one("source-plan-resource@1.0")
         plan = source_plan_for_spec(concrete, repositories)
 
-    assert plan["schema_version"] == 2
+    assert plan["schema_version"] == 3
     assert plan["resources"] == [resource_description()]
+
+
+@pytest.mark.use_package_hash
+def test_source_plan_for_repository_patch(concretize_scope, mock_packages_repo, repo_builder):
+    repo_builder.add_package("source-plan-patch")
+    recipe = Path(repo_builder._recipe_filename("source-plan-patch"))
+    patch = recipe.with_name("fix.patch")
+    content = b"--- a/file\n+++ b/file\n@@ -1 +1 @@\n-before\n+after\n"
+    patch.write_bytes(content)
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-patch-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n'
+        + '    patch("fix.patch", level=1, working_dir="src", reverse=True)\n',
+        encoding="utf-8",
+    )
+    repositories = [
+        {"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}
+    ]
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-patch@1.0")
+        plan = source_plan_for_spec(concrete, repositories)
+
+    assert plan["patches"] == [
+        {
+            **patch_description(content),
+            "owner": f"{repo_builder.namespace}.source-plan-patch",
+            "working_dir": "src",
+            "reverse": True,
+        }
+    ]
+
+
+@pytest.mark.use_package_hash
+def test_source_plan_rejects_url_patch(concretize_scope, mock_packages_repo, repo_builder):
+    repo_builder.add_package("source-plan-url-patch")
+    recipe = Path(repo_builder._recipe_filename("source-plan-url-patch"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-url-patch-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n'
+        + '    patch("https://example.com/fix.patch", sha256="'
+        + "e" * 64
+        + '")\n',
+        encoding="utf-8",
+    )
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-url-patch@1.0")
+        with pytest.raises(SourcePlanError, match="repository-local"):
+            source_plan_for_spec(concrete, [])
+
+
+@pytest.mark.use_package_hash
+def test_source_plan_rejects_package_patch_method(
+    concretize_scope, mock_packages_repo, repo_builder
+):
+    repo_builder.add_package("source-plan-patch-method")
+    recipe = Path(repo_builder._recipe_filename("source-plan-patch-method"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-patch-method-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n'
+        + "    def patch(self):\n"
+        + "        pass\n",
+        encoding="utf-8",
+    )
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-patch-method@1.0")
+        with pytest.raises(SourcePlanError, match="patch methods"):
+            source_plan_for_spec(concrete, [])
 
 
 @pytest.mark.use_package_hash

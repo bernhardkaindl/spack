@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import base64
 import hashlib
 import http.server
 import io
@@ -76,6 +77,32 @@ def add_resource(
     return plan
 
 
+def add_patch(
+    plan,
+    content: bytes,
+    *,
+    owner="test.package",
+    level=0,
+    working_dir=".",
+    reverse=False,
+    targets=None,
+):
+    plan["schema_version"] = 3
+    plan["patches"].append(
+        {
+            "kind": "inline",
+            "owner": owner,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "level": level,
+            "working_dir": working_dir,
+            "reverse": reverse,
+            "targets": targets or ["file"],
+            "content_base64": base64.b64encode(content).decode("ascii"),
+        }
+    )
+    return plan
+
+
 def write_tar(archive: Path, entries):
     with tarfile.open(archive, "w:gz") as output:
         for name, contents, entry_type in entries:
@@ -123,6 +150,46 @@ def test_prepare_stage_fetches_and_places_resource(tmp_path, provenance, fetch_p
     assert header.read_text(encoding="utf-8") == "#define VALUE 1\n"
     assert prepared.source_plan_sha256 == source_plan_digest(plan)
     assert prepared.content_sha256 == prepared_stage_digest(prepared.path)
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_applies_ordered_patches_in_confined_worker(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    write_tar(archive, [("project/src/file", "before\n", tarfile.REGTYPE)])
+    first = b"--- file\n+++ file\n@@ -1 +1 @@\n-before\n+middle\n"
+    second = b"--- file\n+++ file\n@@ -1 +1 @@\n-after\n+middle\n"
+    plan = source_plan(archive, provenance)
+    add_patch(plan, first, working_dir="src")
+    add_patch(plan, second, working_dir="src", reverse=True)
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    assert (prepared.path / "src" / "file").read_text(encoding="utf-8") == "after\n"
+    assert prepared.source_plan_sha256 == source_plan_digest(plan)
+    assert prepared.content_sha256 == prepared_stage_digest(prepared.path)
+
+
+@pytest.mark.requires_executables("patch")
+def test_prepare_stage_rolls_back_failed_patch_set(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    write_tar(archive, [("project/file", "before\n", tarfile.REGTYPE)])
+    first = b"--- file\n+++ file\n@@ -1 +1 @@\n-before\n+middle\n"
+    failing = b"--- file\n+++ file\n@@ -1 +1 @@\n-missing\n+after\n"
+    plan = source_plan(archive, provenance)
+    add_patch(plan, first)
+    add_patch(plan, failing)
+
+    with pytest.raises(PreparedStageError, match="patch worker failed during apply"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
 
 
 def test_prepare_stage_rejects_resource_conflict_transactionally(

@@ -91,8 +91,8 @@ Signing the current local manifest alone would not establish all of these semant
 SourcePlan resources
 --------------------
 
-SourcePlan version 2 adds bounded immutable URL resources while retaining version 1 validation for existing provenance records.
-New plans use version 2 even when they contain no resources.
+SourcePlan version 2 added bounded immutable URL resources.
+New plans use version 3, while versions 1 and 2 remain valid for existing provenance records.
 Each resource has an identifier, the same fixed-URL source descriptor used for the main source, and relative ``destination`` and ``placement`` paths.
 The recipe worker may emit at most 32 resources and 32 unique candidate URLs per source descriptor.
 Every source and resource requires a SHA-256 checksum; mutable VCS fetchers and fetch options remain rejected.
@@ -106,9 +106,34 @@ Archive traversal, links, special files, malformed relative paths, duplicate res
 Version 2 deliberately supports only an explicit nonempty string ``placement``.
 Implicit placement depends on archive-layout inference, while dictionary placement projects multiple paths and introduces merge-order and conflict semantics.
 Both forms remain rejected until those semantics have a dedicated bounded validator and transactional tests.
-Patches also remain rejected because patch selection, working directories, strip levels, path confinement, application order, and tool execution require a separate protocol revision.
 
 Tests cover recipe-worker serialization, malformed descriptors, traversal, duplicate names, unsupported placement, authority prevalidation, aggregate limits, transactional rollback, placement conflicts, prepared-tree identity, and consumption by the confined build worker without a parent recipe import.
+
+SourcePlan patches
+------------------
+
+SourcePlan version 3 supports ordered repository-local file patches without allowing the trusted parent to resolve package classes or read repository paths.
+The confined planning worker reads each selected ``FilePatch``, verifies its concrete-spec SHA-256 identity, and emits its owner, strip level, relative working directory, reverse flag, parsed targets, and canonical base64 payload.
+A plan may contain at most 32 patches, each decoded payload is limited to 48 KiB, and all decoded payloads together are limited to 512 KiB.
+The per-patch limit keeps canonical base64 within the concretization protocol's existing 64 KiB string bound.
+
+Only UTF-8, LF-terminated unified diffs are accepted.
+Validated ``diff --git`` and ``index`` preambles are allowed, but rename, create, delete, binary, mode-only, ed-script, duplicated-target, and other patch formats fail closed.
+Patch levels are limited to 0 through 16; working directories and parsed targets must be normalized relative paths.
+
+After source and resource staging, the parent writes validated payloads into the private preparation workspace and launches a fresh patch worker.
+That worker applies Landlock before invoking the exact resolved system ``patch`` executable without a shell or interactive prompts.
+It can write only the unpublished source tree and private patch state, rechecks every payload checksum and working directory, and requires every parsed target to resolve to an existing regular non-symlink file inside the source tree.
+Reject output is captured instead of written to the source tree.
+All patches are applied in concrete-spec order before the prepared tree is atomically published; any timeout or failure discards the complete workspace.
+
+The later confined build worker independently compares patch owner, checksum, level, working directory, reverse flag, and order against ``spec.patches`` from the verified repository before executing package phases.
+This prevents a syntactically valid but unrelated patch plan from being consumed by a recipe.
+The persisted SourcePlan and prepared-stage digests bind both the patch inputs and resulting source tree into install provenance.
+
+URL and compressed patches remain unsupported because they add fetch-authority, archive, and two-checksum semantics that should reuse the trusted source-fetch policy in a separate milestone.
+Package-defined ``patch()`` methods remain unsupported because they are arbitrary recipe code rather than declarative patch inputs; supporting them safely requires an explicit confined pre-build lifecycle contract.
+Tests cover malformed and non-unified payloads, Git preambles, target binding, traversal, checksum and option validation, ordered and reverse application, working directories, transactional rollback, real recipe consumption, and build-worker rejection of patch metadata not bound to the concrete recipe.
 
 Experimental command
 --------------------
@@ -133,8 +158,8 @@ For example:
       --source-origin https://zlib.net \
       --phase install
 
-The command supports SourcePlan version 2 fixed SHA-256 URL sources and simply placed URL resources.
-It does not support patches, implicit or dictionary resource placement, mutable VCS sources, custom fetchers, or fetch options.
+The command supports SourcePlan version 3 fixed SHA-256 URL sources, simply placed URL resources, and bounded repository-local unified-diff patches.
+It does not support URL or compressed patches, package-defined ``patch()`` methods, implicit or dictionary resource placement, mutable VCS sources, custom fetchers, or fetch options.
 It is Linux-only because the worker requires Landlock filesystem and TCP restrictions.
 It is intended for development and trust-boundary evaluation, not as a compatibility replacement for normal installation.
 Command tests must verify authority parsing, ordered argument transport, temporary-stage lifetime, and registration inputs, while the worker integration suite remains responsible for real confinement, rollback, and provenance behavior.
