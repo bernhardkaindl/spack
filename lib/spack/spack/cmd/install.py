@@ -67,6 +67,7 @@ def install_kwargs_from_args(args):
         "install_deps": ("dependencies" in args.things_to_install),
         "install_package": ("package" in args.things_to_install),
         "concurrent_packages": args.concurrent_packages,
+        "sandbox": args.sandbox,
     }
 
 
@@ -217,6 +218,11 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
         default=None,
         choices=["root", "all"],
         help="run tests on only root packages or all packages",
+    )
+    subparser.add_argument(
+        "--sandbox",
+        choices=["all", "root", "network", "filesystem"],
+        help="sandbox all builds, only root builds, or one resource for all builds",
     )
     arguments.add_common_arguments(subparser, ["log_format"])
     subparser.add_argument("--log-file", default=None, help="filename for the log file")

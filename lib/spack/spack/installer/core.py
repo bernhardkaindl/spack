@@ -39,6 +39,7 @@ from spack.installer.base import (
     FdInfo,
     InstallPolicy,
     JobServerBase,
+    SandboxMode,
 )
 from spack.installer.build import BuildRequest, ChildInfo, start_build
 from spack.installer.schedule import (
@@ -189,6 +190,7 @@ class PackageInstaller:
         stop_at: Optional[str] = None,
         stop_before: Optional[str] = None,
         tests: Union[bool, List[str], Set[str]] = False,
+        sandbox: Optional[SandboxMode] = None,
         unsigned: Optional[bool] = None,
         verbose: bool = False,
         concurrent_packages: Optional[int] = None,
@@ -205,6 +207,7 @@ class PackageInstaller:
         self.stop_at = stop_at
         self.stop_before = stop_before
         self.tests: Union[bool, List[str], Set[str]] = tests
+        self.sandbox = sandbox
 
         self.store = store or spack.store.STORE
 
@@ -747,6 +750,13 @@ class PackageInstaller:
         tests = self.tests
         run_tests = tests is True or bool(tests and spec.name in tests)
         is_root = dag_hash in self.build_graph.roots
+        sandbox_config = None
+        if self.sandbox is not None:
+            sandbox_config = {
+                "enable": self.sandbox != "root" or is_root,
+                "restrict_filesystem": self.sandbox in ("all", "root", "filesystem"),
+                "restrict_network": self.sandbox in ("all", "root", "network"),
+            }
         # Both possible sub-processes (cache install, source build) append to the same log file.
         if dag_hash not in self.log_paths:
             if spec.external:
@@ -776,6 +786,7 @@ class PackageInstaller:
             fake=self.fake,
             install_source=self.install_source,
             run_tests=run_tests,
+            sandbox_config=sandbox_config,
             log_path=self.log_paths[dag_hash],
             stop_before=self.stop_before if is_root else None,
             stop_at=self.stop_at if is_root else None,

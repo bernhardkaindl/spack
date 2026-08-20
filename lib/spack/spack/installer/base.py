@@ -23,6 +23,8 @@ from spack.util.tty.log import redirect_stdio, restore_stdio
 
 #: Type for specifying installation source modes
 InstallPolicy = Literal["auto", "cache_only", "source_only"]
+#: Sandbox scope and restriction mode for one install invocation
+SandboxMode = Literal["all", "root", "network", "filesystem"]
 
 # Inter-process communication type
 if sys.platform == "win32":

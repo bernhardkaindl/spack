@@ -16,7 +16,9 @@ import tempfile
 from typing import List, Tuple
 
 import spack.concretize
+import spack.config
 import spack.installer.sandbox
+import spack.installer_dispatch
 import spack.sandbox
 import spack.store
 
@@ -64,6 +66,20 @@ class SpyLandlockSandbox(spack.sandbox.LandlockSandbox):
         self.prctl_called = True
 
 
+@pytest.mark.parametrize(
+    "config,expected",
+    [
+        ({}, True),
+        ({"allow_network": True}, False),
+        ({"allow_network": False}, True),
+        ({"allow_network": True, "restrict_network": True}, True),
+        ({"allow_network": False, "restrict_network": False}, False),
+    ],
+)
+def test_network_restriction_compatibility(config, expected):
+    assert spack.sandbox.network_restriction_enabled(config) is expected
+
+
 def test_landlock_sandbox_syscall_args(tmp_path: pathlib.Path):
     """Test that LandlockSandbox passes correct arguments to each syscall."""
     sandbox = SpyLandlockSandbox(abi_version=3)
@@ -75,7 +91,7 @@ def test_landlock_sandbox_syscall_args(tmp_path: pathlib.Path):
 
     sandbox.allow_read(test_dir)
     sandbox.allow_write(test_file)
-    sandbox.apply(block_network=False)
+    sandbox.apply(restrict_filesystem=True, restrict_network=False)
 
     # Ruleset covers both read and write access; no network flags
     [(fs_flags, net_flags)] = sandbox.create_ruleset_calls
@@ -109,22 +125,33 @@ def test_landlock_sandbox_syscall_args(tmp_path: pathlib.Path):
     assert sandbox.prctl_called
 
 
-def test_landlock_sandbox_network_args():
-    """Test that block_network=True sets the correct net flags in the ruleset."""
+def test_landlock_sandbox_network_only_args():
+    """Test that network-only mode sets network flags without filesystem rules."""
     sandbox = SpyLandlockSandbox(abi_version=4)
-    sandbox.apply(block_network=True)
+    sandbox.allow_read("/usr")
+    sandbox.apply(restrict_filesystem=False, restrict_network=True)
 
-    [(_, net_flags)] = sandbox.create_ruleset_calls
+    [(fs_flags, net_flags)] = sandbox.create_ruleset_calls
+    assert fs_flags == 0
     assert net_flags & spack.sandbox.LANDLOCK_ACCESS_NET_CONNECT_TCP
     assert net_flags & spack.sandbox.LANDLOCK_ACCESS_NET_BIND_TCP
+    assert not sandbox.add_rule_calls
     assert sandbox.prctl_called
+
+
+def test_landlock_sandbox_no_restrictions_is_noop():
+    sandbox = SpyLandlockSandbox(abi_version=4)
+    sandbox.apply(restrict_filesystem=False, restrict_network=False)
+
+    assert not sandbox.create_ruleset_calls
+    assert not sandbox.prctl_called
 
 
 class MockSandbox(spack.sandbox.Sandbox):
     def __init__(self):
         self.read_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
         self.write_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
-        self.apply_calls: List[bool] = []
+        self.apply_calls: List[Tuple[bool, bool]] = []
 
     def _allow_read(self, original: pathlib.Path, resolved: pathlib.Path):
         self.read_calls.append((original, resolved))
@@ -132,8 +159,8 @@ class MockSandbox(spack.sandbox.Sandbox):
     def _allow_write(self, original: pathlib.Path, resolved: pathlib.Path):
         self.write_calls.append((original, resolved))
 
-    def apply(self, block_network=False):
-        self.apply_calls.append(block_network)
+    def apply(self, restrict_filesystem=True, restrict_network=False):
+        self.apply_calls.append((restrict_filesystem, restrict_network))
 
 
 def test_enable_sandbox_paths(
@@ -168,9 +195,10 @@ def test_enable_sandbox_paths(
 
     config = {
         "enable": True,
+        "restrict_filesystem": True,
+        "restrict_network": True,
         "allow_read": [str(custom_read_link)],
         "allow_write": [str(custom_write)],
-        "allow_network": True,
     }
 
     spack.installer.sandbox.enable(config, spec, str(stage_path))
@@ -198,7 +226,103 @@ def test_enable_sandbox_paths(
     assert custom_write.resolve() in allow_write_resolved
     assert pathlib.Path(tempfile.gettempdir()).resolve() in allow_write_resolved
 
-    assert mock_sandbox.apply_calls == [False]
+    assert mock_sandbox.apply_calls == [(True, True)]
+
+
+def test_enable_sandbox_defaults_to_all_restrictions(mock_packages, monkeypatch, tmp_path):
+    mock_sandbox = MockSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+    spec = spack.concretize.concretize_one("dependent-install")
+
+    spack.installer.sandbox.enable({"enable": True}, spec, str(tmp_path))
+
+    assert mock_sandbox.read_calls
+    assert mock_sandbox.write_calls
+    assert mock_sandbox.apply_calls == [(True, True)]
+
+
+def test_enable_network_only_sandbox(mock_packages, monkeypatch, tmp_path: pathlib.Path):
+    mock_sandbox = MockSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+    spec = spack.concretize.concretize_one("dependent-install")
+
+    spack.installer.sandbox.enable(
+        {"enable": True, "restrict_filesystem": False, "restrict_network": True},
+        spec,
+        str(tmp_path),
+    )
+
+    assert not mock_sandbox.read_calls
+    assert not mock_sandbox.write_calls
+    assert mock_sandbox.apply_calls == [(False, True)]
+
+
+def test_enable_sandbox_without_restrictions_is_noop(mock_packages, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        spack.sandbox,
+        "get_sandbox",
+        lambda: pytest.fail("empty sandbox should not probe Landlock support"),
+    )
+    spec = spack.concretize.concretize_one("dependent-install")
+
+    spack.installer.sandbox.enable(
+        {"enable": True, "restrict_filesystem": False, "restrict_network": False},
+        spec,
+        str(tmp_path),
+    )
+
+
+@pytest.mark.parametrize(
+    ("sandbox_config", "should_probe"),
+    [
+        ({"enable": False, "restrict_filesystem": True, "restrict_network": True}, False),
+        ({"enable": True, "restrict_filesystem": False, "restrict_network": False}, False),
+        ({"enable": True, "restrict_filesystem": False, "restrict_network": True}, True),
+        ({"enable": True}, True),
+    ],
+)
+def test_installer_dispatch_probes_active_sandbox(
+    mock_packages, monkeypatch, sandbox_config, should_probe
+):
+    calls = []
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: calls.append(True))
+    spec = spack.concretize.concretize_one("dependent-install")
+
+    with spack.config.CONFIG.override("config:installer", "new"):
+        with spack.config.CONFIG.override("config:sandbox", sandbox_config):
+            spack.installer_dispatch.create_installer([spec.package])
+
+    assert bool(calls) is should_probe
+
+
+@pytest.mark.parametrize("mode", ["all", "root", "network", "filesystem"])
+def test_installer_dispatch_probes_cli_sandbox(mock_packages, monkeypatch, mode):
+    calls = []
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: calls.append(True))
+    spec = spack.concretize.concretize_one("dependent-install")
+
+    with spack.config.CONFIG.override("config:installer", "new"):
+        with spack.config.CONFIG.override("config:sandbox:enable", False):
+            spack.installer_dispatch.create_installer([spec.package], sandbox=mode)
+
+    assert calls == [True]
+
+
+def test_noop_sandbox_allows_old_installer(mock_packages):
+    spec = spack.concretize.concretize_one("dependent-install")
+    sandbox_config = {"enable": True, "restrict_filesystem": False, "restrict_network": False}
+
+    with spack.config.CONFIG.override("config:installer", "old"):
+        with spack.config.CONFIG.override("config:sandbox", sandbox_config):
+            spack.installer_dispatch.create_installer([spec.package])
+
+
+def test_cli_sandbox_rejects_old_installer(mock_packages):
+    spec = spack.concretize.concretize_one("dependent-install")
+
+    with spack.config.CONFIG.override("config:installer", "old"):
+        with pytest.raises(spack.sandbox.SandboxError, match="only supported.*installer:new"):
+            spack.installer_dispatch.create_installer([spec.package], sandbox="all")
 
 
 def test_host_runtime_paths_include_network_configuration():
@@ -215,4 +339,4 @@ def test_sandbox_network_blocking_requires_abi_v4():
     with pytest.raises(
         spack.sandbox.SandboxError, match="Blocking network access requires Landlock ABI v4\\+"
     ):
-        sandbox.apply(block_network=True)
+        sandbox.apply(restrict_filesystem=False, restrict_network=True)

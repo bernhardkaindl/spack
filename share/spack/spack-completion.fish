@@ -2129,7 +2129,7 @@ complete -c spack -n '__fish_spack_using_command info' -l virtuals -f -a virtual
 complete -c spack -n '__fish_spack_using_command info' -l virtuals -d 'output virtual packages'
 
 # spack install
-set -g __fish_spack_optspecs_spack_install h/help only= u/until= p/concurrent-packages= j/jobs= overwrite fail-fast keep-prefix keep-stage dont-restage use-cache no-cache cache-only use-buildcache= include-build-deps no-check-signature show-log-on-error source n/no-checksum v/verbose fake only-concrete add no-add clean dirty test= log-format= log-file= help-cdash y/yes-to-all f/force U/fresh reuse fresh-roots deprecated
+set -g __fish_spack_optspecs_spack_install h/help only= u/until= p/concurrent-packages= j/jobs= overwrite fail-fast keep-prefix keep-stage dont-restage use-cache no-cache cache-only use-buildcache= include-build-deps no-check-signature show-log-on-error source n/no-checksum v/verbose fake only-concrete add no-add clean dirty test= sandbox= log-format= log-file= help-cdash y/yes-to-all f/force U/fresh reuse fresh-roots deprecated
 complete -c spack -n '__fish_spack_using_command_pos_remainder 0 install' -f -k -a '(__fish_spack_specs)'
 complete -c spack -n '__fish_spack_using_command install' -s h -l help -f -a help
 complete -c spack -n '__fish_spack_using_command install' -s h -l help -d 'show this help message and exit'
@@ -2185,6 +2185,8 @@ complete -c spack -n '__fish_spack_using_command install' -l dirty -f -a dirty
 complete -c spack -n '__fish_spack_using_command install' -l dirty -d 'preserve user environment in spack'"'"'s build environment (danger!)'
 complete -c spack -n '__fish_spack_using_command install' -l test -r -f -a 'root all'
 complete -c spack -n '__fish_spack_using_command install' -l test -r -d 'run tests on only root packages or all packages'
+complete -c spack -n '__fish_spack_using_command install' -l sandbox -r -f -a 'all root network filesystem'
+complete -c spack -n '__fish_spack_using_command install' -l sandbox -r -d 'sandbox all builds, only root builds, or one resource for all builds'
 complete -c spack -n '__fish_spack_using_command install' -l log-format -r -f -a 'junit cdash'
 complete -c spack -n '__fish_spack_using_command install' -l log-format -r -d 'format to be used for log files'
 complete -c spack -n '__fish_spack_using_command install' -l log-file -r -f -a log_file

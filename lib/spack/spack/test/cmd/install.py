@@ -145,6 +145,18 @@ def test_install_dirty_flag(arguments, expected):
     assert args.dirty == expected
 
 
+@pytest.mark.parametrize("mode", ["all", "root", "network", "filesystem"])
+def test_install_sandbox_flag(mode):
+    parser = argparse.ArgumentParser()
+    spack.cmd.install.setup_parser(parser)
+
+    args = parser.parse_args([f"--sandbox={mode}"])
+    args.verbose = False
+    args.install_verbose = False
+
+    assert spack.cmd.install.install_kwargs_from_args(args)["sandbox"] == mode
+
+
 def test_package_output(install_mockery, mock_fetch):
     """
     Ensure output printed from pkgs is captured by output redirection.

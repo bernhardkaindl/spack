@@ -240,11 +240,19 @@ properties: Dict[str, Any] = {
                 "properties": {
                     "enable": {
                         "type": "boolean",
-                        "description": "Enable or disable the build sandbox.",
+                        "description": "Enable or disable build sandbox restrictions.",
+                    },
+                    "restrict_filesystem": {
+                        "type": "boolean",
+                        "description": "Restrict filesystem access during the build phase.",
+                    },
+                    "restrict_network": {
+                        "type": "boolean",
+                        "description": "Restrict TCP network access during the build phase.",
                     },
                     "allow_network": {
                         "type": "boolean",
-                        "description": "Allow TCP network access during the build phase.",
+                        "description": "Deprecated inverse of restrict_network.",
                     },
                     "allow_read": {
                         "type": "array",
@@ -284,6 +292,13 @@ def update(data: dict) -> bool:
     """
     changed = False
     data = data["config"]
+    sandbox = data.get("sandbox")
+    if isinstance(sandbox, dict) and "allow_network" in sandbox:
+        if "restrict_network" not in sandbox:
+            sandbox["restrict_network"] = not sandbox["allow_network"]
+        del sandbox["allow_network"]
+        changed = True
+
     shared_linking = data.get("shared_linking", None)
     if isinstance(shared_linking, str):
         # deprecated short-form shared_linking: rpath/runpath
