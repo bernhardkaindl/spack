@@ -8,6 +8,7 @@ import contextlib
 import copy
 import hashlib
 import io
+import json
 import os
 import socket
 import stat
@@ -344,10 +345,36 @@ def test_install_prepared_publishes_trusted_metadata(
 
     metadata = response["install_metadata"]
     assert metadata["spec_path"] == ".spack/spec.json"
+    assert metadata["provenance_path"] == ".spack/sandbox_provenance.json"
     assert metadata["manifest_path"] == ".spack/install_manifest.json"
     assert metadata["install_tree"] == install_tree_metadata(prefix)
     installed_spec = spack.spec.Spec.from_json((prefix / metadata["spec_path"]).read_text())
     assert installed_spec.dag_hash() == concrete.dag_hash()
+    provenance = json.loads((prefix / metadata["provenance_path"]).read_text(encoding="utf-8"))
+    assert provenance["schema_version"] == 1
+    assert provenance["spec"] == {
+        "dag_hash": concrete.dag_hash(),
+        "package_hash": response["package_hash"],
+    }
+    assert provenance["source_plan"] == plan
+    assert provenance["build"]["protocol_version"] == response["protocol_version"]
+    assert provenance["build"]["phases"] == ["install"]
+    assert provenance["build"]["sandbox"] == response["sandbox"]
+    assert provenance["build"]["repositories"] == plan["provenance"]["repositories"]
+    assert provenance["build"]["source_plan_sha256"] == response["source_plan_sha256"]
+    assert provenance["build"]["prepared_stage"] == {
+        "initial_sha256": response["initial_stage_sha256"],
+        "final_sha256": response["final_stage_sha256"],
+    }
+    assert provenance["build"]["log"] == {
+        "size": response["build_log"]["size"],
+        "sha256": response["build_log"]["sha256"],
+    }
+    assert "path" not in provenance["build"]["log"]
+    assert provenance["parent"] == {
+        "actions": [],
+        "install_tree": response["post_actions"]["install_tree"],
+    }
     installed_spec.set_prefix(str(prefix))
     assert not spack.verify.check_spec_manifest(installed_spec).has_errors()
 
@@ -644,6 +671,15 @@ def test_install_prepared_runs_typed_rpath_action(
     ]
     assert response["post_actions"]["actions"][0]["patched"] == 1
     assert response["install_metadata"]["install_tree"] == install_tree_metadata(prefix)
+    provenance = json.loads(
+        (prefix / response["install_metadata"]["provenance_path"]).read_text(encoding="utf-8")
+    )
+    assert provenance["build"]["install_tree"] == response["install_tree"]
+    assert provenance["parent"] == {
+        "actions": ["drop_redundant_rpaths"],
+        "install_tree": response["post_actions"]["install_tree"],
+    }
+    assert provenance["build"]["install_tree"] != provenance["parent"]["install_tree"]
 
 
 @pytest.mark.use_package_hash

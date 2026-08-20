@@ -17,7 +17,11 @@ import spack.error
 import spack.repo
 import spack.store
 import spack.util.lang
-from spack.installer.install_metadata import InstallMetadataError, publish_install_metadata
+from spack.installer.install_metadata import (
+    InstallMetadataError,
+    create_install_provenance,
+    publish_install_metadata,
+)
 from spack.installer.install_tree import InstallTreeError, install_tree_metadata
 from spack.installer.post_actions import (
     PostActionError,
@@ -423,7 +427,10 @@ def _install_prepared_sandboxed(
         action_result = run_post_actions(
             spec, prefix, actions, response["install_tree"], sbang_path=sbang_path
         )
-        metadata = publish_install_metadata(spec, prefix, action_result["install_tree"])
+        provenance = create_install_provenance(spec, source_plan, response, actions, action_result)
+        metadata = publish_install_metadata(
+            spec, prefix, action_result["install_tree"], provenance
+        )
     except (InstallMetadataError, PostActionError) as error:
         raise SandboxedBuildPhaseError(str(error)) from error
     return {**response, "post_actions": action_result, "install_metadata": metadata}
