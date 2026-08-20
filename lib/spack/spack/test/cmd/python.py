@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import io
 import platform
 import sys
 
@@ -13,9 +14,37 @@ from spack.main import SpackCommand
 python = SpackCommand("python")
 
 
-def test_python():
+def test_python(monkeypatch, tmp_path):
+    """
+    Test that the python command can import Spack and print the Spack version.
+
+    Use python -c to verify it runs only the given command without executing
+    the PYTHONSTARTUP startup file.
+    """
+    startup_file = tmp_path / "startup.py"
+    startup_file.write_text("print('startup script should not run with -c')", encoding="utf-8")
+    monkeypatch.setenv("PYTHONSTARTUP", str(startup_file))
+
     out = python("-c", "import spack; print(spack.spack_version)")
     assert out.strip() == spack.spack_version
+
+
+def test_python_interactive_runs_startup(monkeypatch, tmp_path):
+    """
+    Test that the python command can run an interactive python interpreter, runs
+    the PYTHONSTARTUP startup file early before interactive mode as expected, and
+    that it can import Spack and print the Spack version of the imported module.
+    """
+    startup_file = tmp_path / "startup.py"
+    startup_mesg = "startup script ran"
+    startup_file.write_text(f"print('{startup_mesg}')", encoding="utf-8")
+    monkeypatch.setenv("PYTHONSTARTUP", str(startup_file))
+    monkeypatch.setattr(sys, "stdin", io.StringIO("import spack; print(spack.spack_version)"))
+
+    out = python().strip()
+    assert out.startswith(startup_mesg)
+    assert f"Spack version {spack.spack_version}" in out
+    assert f">>> {spack.spack_version}" in out
 
 
 def test_python_interpreter_path():
