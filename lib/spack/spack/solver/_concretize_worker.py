@@ -18,7 +18,7 @@ import sys
 from typing import Any, Dict
 
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 
 
@@ -69,9 +69,16 @@ def _read_request() -> Dict[str, Any]:
         raise WorkerRequestError("request has unexpected fields")
     if request["protocol_version"] != PROTOCOL_VERSION:
         raise WorkerRequestError("unsupported protocol version")
-    if request["operation"] not in ("concretize_one", "diagnose_concretization"):
+    if request["operation"] not in (
+        "concretize_one",
+        "diagnose_concretization",
+        "plan_sources",
+    ):
         raise WorkerRequestError("unsupported operation")
-    if not isinstance(request["spec"], str) or not request["spec"]:
+    if request["operation"] == "plan_sources":
+        if not isinstance(request["spec"], dict):
+            raise WorkerRequestError("source planning requires a concrete Spec document")
+    elif not isinstance(request["spec"], str) or not request["spec"]:
         raise WorkerRequestError("spec must be a non-empty string")
     if not isinstance(request["tests"], (bool, list)):
         raise WorkerRequestError("tests must be a boolean or list")
@@ -153,9 +160,10 @@ def _configure_state(request: Dict[str, Any]):
             raise WorkerRequestError("clingo paths must be absolute strings")
         sys.path.insert(0, path)
 
-    import importlib
+    if request["operation"] != "plan_sources":
+        import importlib
 
-    importlib.import_module("clingo")
+        importlib.import_module("clingo")
     import spack.caches
     import spack.config
     import spack.repo
@@ -230,6 +238,15 @@ def _diagnose(request: Dict[str, Any]):
         )
 
 
+def _plan_sources(request: Dict[str, Any], repositories):
+    from spack.solver.source_plan import source_plan_for_spec
+    from spack.spec import Spec
+
+    with contextlib.redirect_stdout(sys.stderr):
+        spec = Spec.from_dict(request["spec"])
+        return source_plan_for_spec(spec, repositories)
+
+
 def _response(ok: bool, **kwargs) -> None:
     response = {"protocol_version": PROTOCOL_VERSION, "ok": ok, **kwargs}
     sys.stdout.write(json.dumps(response, allow_nan=False, separators=(",", ":")))
@@ -267,7 +284,7 @@ def main() -> None:
                     repositories=repositories,
                     diagnostics=diagnostics,
                 )
-            else:
+            elif request["operation"] == "concretize_one":
                 phase = "concretize"
                 spec, package_hashes = _concretize(request)
                 phase = "serialize"
@@ -277,6 +294,16 @@ def main() -> None:
                     repositories=repositories,
                     package_hashes=package_hashes,
                     spec=spec,
+                )
+            else:
+                phase = "plan_sources"
+                source_plan = _plan_sources(request, repositories)
+                phase = "serialize"
+                _response(
+                    True,
+                    sandbox=sandbox,
+                    repositories=repositories,
+                    source_plan=source_plan,
                 )
     except BaseException as error:
         _response(

@@ -39,11 +39,12 @@ from spack.solver.repository_snapshot import (
     repository_digest,
     snapshot_root,
 )
+from spack.solver.source_plan import SourcePlanError, validate_source_plan
 from spack.spec import Spec
 from spack.version.common import is_git_version
 
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 2 * 1024 * 1024
@@ -379,6 +380,39 @@ def _validate_worker_context(
             raise SandboxedConcretizationError("repository contents changed during concretization")
 
 
+def _validate_source_plan_success(
+    response: Dict[str, Any], spec_data: Dict[str, Any], repositories: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    if response.get("protocol_version") != PROTOCOL_VERSION:
+        raise SandboxedConcretizationError("worker returned an unsupported protocol version")
+    if response.get("ok") is not True:
+        error = response.get("error")
+        if not isinstance(error, dict):
+            raise SandboxedConcretizationError("worker failed without a structured error")
+        raise SandboxedConcretizationError(
+            "worker failed during {} ({}): {}".format(
+                error.get("phase", "unknown"),
+                error.get("type", "Error"),
+                error.get("message", "sandboxed source planning failed"),
+            )
+        )
+    if set(response) != {"protocol_version", "ok", "sandbox", "repositories", "source_plan"}:
+        raise SandboxedConcretizationError("worker source plan response has unexpected fields")
+    _validate_worker_context(response, repositories)
+    root = spec_data["spec"]["nodes"][0]
+    expected_provenance = {
+        "dag_hash": root["hash"],
+        "package_hash": root["package_hash"],
+        "repositories": response["repositories"],
+    }
+    try:
+        return validate_source_plan(
+            response["source_plan"], expected_provenance=expected_provenance
+        )
+    except SourcePlanError as error:
+        raise SandboxedConcretizationError(f"worker returned an invalid source plan: {error}") from error
+
+
 def _validate_digest(value: Any, description: str) -> None:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         raise SandboxedConcretizationError(f"worker returned invalid {description} digest")
@@ -501,14 +535,21 @@ def _run_worker(
     diagnostic_predicates = diagnostic_predicates or []
     if active_environment() is not None:
         raise SandboxedConcretizationError("active environments are unsupported by this PoC")
-    if isinstance(spec, Spec) and spec.concrete:
+    if isinstance(spec, Spec) and spec.concrete and operation != "plan_sources":
         raise SandboxedConcretizationError("concrete inputs are unsupported by this PoC")
-    spec_string = str(spec)
-    requested = Spec(spec_string)
-    if any(node.abstract_hash for node in requested.traverse()):
-        raise SandboxedConcretizationError("hash references are unsupported by this PoC")
-    if any("dev_path" in node.variants for node in requested.traverse()):
-        raise SandboxedConcretizationError("develop specs are unsupported by this PoC")
+    if operation == "plan_sources":
+        if not isinstance(spec, Spec) or not spec.concrete:
+            raise SandboxedConcretizationError("source planning requires a concrete Spec")
+        spec_payload = spec.to_dict()
+        _validate_spec_payload(spec_payload)
+        requested = spec
+    else:
+        spec_payload = str(spec)
+        requested = Spec(spec_payload)
+        if any(node.abstract_hash for node in requested.traverse()):
+            raise SandboxedConcretizationError("hash references are unsupported by this PoC")
+        if any("dev_path" in node.variants for node in requested.traverse()):
+            raise SandboxedConcretizationError("develop specs are unsupported by this PoC")
     with tempfile.TemporaryDirectory(prefix="spack-concretize-sandbox-") as workspace:
         state_directory = os.path.join(workspace, "state")
         os.mkdir(state_directory, mode=0o700)
@@ -519,11 +560,11 @@ def _run_worker(
         request = {
             "protocol_version": PROTOCOL_VERSION,
             "operation": operation,
-            "spec": spec_string,
+            "spec": spec_payload,
             "tests": tests,
             "configuration": _configuration_payload(),
             "repositories": repositories_payload,
-            "clingo_paths": _clingo_paths(),
+            "clingo_paths": [] if operation == "plan_sources" else _clingo_paths(),
             "diagnostic_predicates": diagnostic_predicates,
             "platform": spack.platforms.host().name,
             "state_directory": state_directory,
@@ -568,6 +609,8 @@ def _run_worker(
         response = _load_response(stdout)
         if operation == "concretize_one":
             return _validate_success(response, requested, repositories_payload)
+        if operation == "plan_sources":
+            return _validate_source_plan_success(response, spec_payload, repositories_payload)
         return _validate_diagnostics(response, repositories_payload)
 
 
@@ -624,4 +667,22 @@ def concretization_diagnostics_sandboxed(
         timeout=timeout,
         repository_snapshots=repository_snapshots,
         diagnostic_predicates=excerpt_predicates,
+    )
+
+
+def plan_sources_sandboxed(
+    spec: Spec,
+    *,
+    repositories: List[Union[str, spack.repo.Repo]],
+    timeout: float = 120.0,
+    repository_snapshots: bool = True,
+) -> Dict[str, Any]:
+    """Plan a concrete Spec's fixed URL source in an experimental confined worker."""
+    return _run_worker(
+        spec,
+        operation="plan_sources",
+        repositories=repositories,
+        timeout=timeout,
+        repository_snapshots=repository_snapshots,
+        diagnostic_predicates=[],
     )

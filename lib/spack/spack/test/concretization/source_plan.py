@@ -1,0 +1,211 @@
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
+#
+# SPDX-License-Identifier: (Apache-2.0 OR MIT)
+
+import copy
+from pathlib import Path
+
+import pytest
+
+import spack.concretize
+import spack.repo
+import spack.solver.concretize_worker as concretize_worker_module
+from spack.solver.concretize_worker import (
+    SandboxedConcretizationError,
+    concretize_one_sandboxed,
+    plan_sources_sandboxed,
+)
+from spack.solver.source_plan import (
+    SourcePlanError,
+    source_plan_for_spec,
+    validate_source_plan,
+)
+
+
+@pytest.fixture
+def source_plan():
+    return {
+        "schema_version": 1,
+        "provenance": {
+            "dag_hash": "a" * 32,
+            "package_hash": "b" * 52 + "====",
+            "repositories": [
+                {
+                    "namespace": "builtin.mock",
+                    "package_api": [2, 1],
+                    "identity": "c" * 64,
+                }
+            ],
+        },
+        "source": {
+            "kind": "url",
+            "urls": ["https://example.com/archive.tar.gz"],
+            "sha256": "d" * 64,
+            "expand": True,
+            "extension": "tar.gz",
+        },
+        "resources": [],
+        "patches": [],
+    }
+
+
+def test_validate_fixed_url_source_plan(source_plan):
+    assert validate_source_plan(source_plan) is source_plan
+    assert (
+        validate_source_plan(
+            source_plan, expected_provenance=copy.deepcopy(source_plan["provenance"])
+        )
+        is source_plan
+    )
+
+
+def test_source_plan_rejects_mismatched_provenance(source_plan):
+    expected = copy.deepcopy(source_plan["provenance"])
+    expected["dag_hash"] = "z" * 32
+    with pytest.raises(SourcePlanError, match="does not match"):
+        validate_source_plan(source_plan, expected_provenance=expected)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "relative/archive.tar.gz",
+        "ssh://example.com/archive.tar.gz",
+        "https://user:secret@example.com/archive.tar.gz",
+        "https://example.com/archive.tar.gz#fragment",
+        "file://remotehost/archive.tar.gz",
+    ],
+)
+def test_source_plan_rejects_unsafe_url(source_plan, url):
+    source_plan["source"]["urls"] = [url]
+    with pytest.raises(SourcePlanError, match="source URL"):
+        validate_source_plan(source_plan)
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda plan: plan.update(extra=True), "unexpected fields"),
+        (lambda plan: plan.update(schema_version=True), "unsupported.*schema"),
+        (lambda plan: plan["source"].update(kind="git"), "unsupported source kind"),
+        (lambda plan: plan["source"].update(sha256=""), "source SHA-256"),
+        (lambda plan: plan["source"].update(urls=[]), "source URLs"),
+        (lambda plan: plan["provenance"].update(repositories=[]), "repositories"),
+        (lambda plan: plan.update(resources=[{"destination": "../escape"}]), "unsupported"),
+        (lambda plan: plan.update(patches=[{"working_dir": "/escape"}]), "unsupported"),
+    ],
+)
+def test_source_plan_rejects_unsupported_or_malformed_data(source_plan, mutation, match):
+    plan = copy.deepcopy(source_plan)
+    mutation(plan)
+    with pytest.raises(SourcePlanError, match=match):
+        validate_source_plan(plan)
+
+
+@pytest.mark.use_package_hash
+def test_source_plan_for_fixed_url_recipe(concretize_scope, mock_packages_repo, repo_builder):
+    repo_builder.add_package("source-plan-fixed-url")
+    recipe = Path(repo_builder._recipe_filename("source-plan-fixed-url"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-1.0.tar.gz"\n'
+        + f'    version("2.0", sha256={"e" * 64!r})\n',
+        encoding="utf-8",
+    )
+    repositories = [
+        {
+            "namespace": repo_builder.namespace,
+            "package_api": [2, 0],
+            "identity": "f" * 64,
+        }
+    ]
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-fixed-url@2.0")
+        plan = source_plan_for_spec(concrete, repositories)
+
+    assert plan["source"] == {
+        "kind": "url",
+        "urls": ["https://example.com/source-plan-2.0.tar.gz"],
+        "sha256": "e" * 64,
+        "expand": True,
+        "extension": None,
+    }
+    assert validate_source_plan(plan, expected_provenance=plan["provenance"]) is plan
+
+
+@pytest.mark.use_package_hash
+def test_plan_sources_sandboxed(concretize_scope, mock_packages_repo, repo_builder, monkeypatch):
+    repo_builder.add_package("sandbox-source-plan")
+    recipe = Path(repo_builder._recipe_filename("sandbox-source-plan"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/sandbox-source-plan-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n',
+        encoding="utf-8",
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+
+    concrete = concretize_one_sandboxed("sandbox-source-plan@1.0", repositories=repositories)
+
+    def reject_parent_package_import(*args, **kwargs):
+        raise AssertionError("trusted parent imported recipe code")
+
+    monkeypatch.setattr(spack.repo.PATH, "get_pkg_class", reject_parent_package_import)
+    plan = plan_sources_sandboxed(concrete, repositories=repositories)
+
+    assert plan["provenance"]["dag_hash"] == concrete.dag_hash()
+    assert plan["source"]["urls"] == [
+        "https://example.com/sandbox-source-plan-1.0.tar.gz"
+    ]
+    assert plan["source"]["sha256"] == "d" * 64
+
+
+@pytest.mark.use_package_hash
+def test_plan_sources_sandboxed_rejects_fetch_options(
+    concretize_scope, mock_packages_repo, repo_builder
+):
+    repo_builder.add_package("sandbox-source-options")
+    recipe = Path(repo_builder._recipe_filename("sandbox-source-options"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/sandbox-source-options-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"c" * 64!r}, fetch_options={{"timeout": 5}})\n',
+        encoding="utf-8",
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+
+    concrete = concretize_one_sandboxed("sandbox-source-options@1.0", repositories=repositories)
+    with pytest.raises(SandboxedConcretizationError, match="fetch options are unsupported"):
+        plan_sources_sandboxed(concrete, repositories=repositories)
+
+
+@pytest.mark.use_package_hash
+def test_plan_sources_sandboxed_rejects_tampered_provenance(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-source-tamper")
+    recipe = Path(repo_builder._recipe_filename("sandbox-source-tamper"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/sandbox-source-tamper-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"b" * 64!r})\n',
+        encoding="utf-8",
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+    concrete = concretize_one_sandboxed("sandbox-source-tamper@1.0", repositories=repositories)
+    load_response = concretize_worker_module._load_response
+
+    def load_with_altered_provenance(data):
+        response = load_response(data)
+        if response.get("source_plan"):
+            response["source_plan"]["provenance"]["dag_hash"] = "a" * 32
+        return response
+
+    monkeypatch.setattr(concretize_worker_module, "_load_response", load_with_altered_provenance)
+    with pytest.raises(SandboxedConcretizationError, match="provenance does not match"):
+        plan_sources_sandboxed(concrete, repositories=repositories)
