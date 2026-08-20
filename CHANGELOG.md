@@ -148,10 +148,10 @@ namespaces (as is typical for container runtimes).
 
 Landlock is a good fit for Spack, as it allows us to deny write access to all
 directories except the build stage and install prefix, while giving read/execute
-permissions only to the build stage and dependency prefixes. Users can specify further
-executables, libraries, and directories to be readable, writeable or executable. Looking
-forward (Spack v1.3), we aim to make the sandbox default to enable fully reproducible,
-isolated, unprivileged builds.
+permissions only to the build stage and dependency prefixes. Filesystem and TCP network
+restrictions can be enabled independently. Users can specify further executables, libraries,
+and directories to be readable, writeable or executable. Looking forward (Spack v1.3), we
+aim to make the sandbox default to enable fully reproducible, isolated, unprivileged builds.
 
 See #52334 for more details.
 

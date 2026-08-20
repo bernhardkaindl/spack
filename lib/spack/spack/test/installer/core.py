@@ -164,6 +164,46 @@ def test_dependency_built_before_dependent(temporary_store, mock_packages):
     assert _record(temporary_store, dep) and _record(temporary_store, root)
 
 
+@pytest.mark.parametrize(
+    "mode,dependency_config,root_config",
+    [
+        (
+            "all",
+            {"enable": True, "restrict_filesystem": True, "restrict_network": True},
+            {"enable": True, "restrict_filesystem": True, "restrict_network": True},
+        ),
+        (
+            "root",
+            {"enable": False, "restrict_filesystem": True, "restrict_network": True},
+            {"enable": True, "restrict_filesystem": True, "restrict_network": True},
+        ),
+        (
+            "network",
+            {"enable": True, "restrict_filesystem": False, "restrict_network": True},
+            {"enable": True, "restrict_filesystem": False, "restrict_network": True},
+        ),
+        (
+            "filesystem",
+            {"enable": True, "restrict_filesystem": True, "restrict_network": False},
+            {"enable": True, "restrict_filesystem": True, "restrict_network": False},
+        ),
+    ],
+)
+def test_sandbox_mode_per_build(
+    temporary_store, mock_packages, mode, dependency_config, root_config
+):
+    dep = _make_concrete("dependency-install")
+    root = _make_concrete("dependent-install", deps=[dep])
+    launcher = ScriptedLauncher({dep.name: Script(), root.name: Script()})
+
+    _install(launcher, root, sandbox=mode)
+
+    assert [request.sandbox_config for request in launcher.requests] == [
+        dependency_config,
+        root_config,
+    ]
+
+
 def test_capacity_serializes_launches(temporary_store, mock_packages):
     """With concurrent_packages=1 the second build is only requested after the first finished."""
     a, b = _make_concrete("pkg-a"), _make_concrete("pkg-b")

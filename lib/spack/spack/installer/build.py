@@ -21,7 +21,7 @@ import tempfile
 import traceback
 from gzip import GzipFile
 from multiprocessing import Process
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional
 
 from spack.vendor.typing_extensions import Protocol
 
@@ -39,6 +39,7 @@ import spack.util.environment
 import spack.util.filesystem as fs
 import spack.util.lock
 import spack.util.tty
+from spack.installer import sandbox as build_sandbox
 from spack.installer.base import (
     ExitCode,
     FdInfo,
@@ -48,7 +49,6 @@ from spack.installer.base import (
     Makeflags,
     ProcessExitNotifier,
 )
-from spack.installer import sandbox as build_sandbox
 from spack.old_installer import _do_fake_install, dump_packages
 from spack.subprocess_context import GlobalStateMarshaler
 from spack.util.executable import ProcessError
@@ -70,6 +70,7 @@ OVERWRITE_BACKUP_SUFFIX = ".old"
 
 #: Suffix for temporary cleanup during failed install
 OVERWRITE_GARBAGE_SUFFIX = ".garbage"
+
 
 class ProcessLike(Protocol):
     """The part of the ``multiprocessing.Process`` interface the event loop relies on. Tests
@@ -367,6 +368,7 @@ class BuildRequest(NamedTuple):
     fake: bool
     install_source: bool
     run_tests: bool
+    sandbox_config: Optional[Dict[str, bool]]
     log_path: str
     stop_before: Optional[str]
     stop_at: Optional[str]
@@ -666,7 +668,10 @@ def _install(
         if stop_at is not None and stop_at not in builder.phases:
             raise spack.error.InstallError(f"'{stop_at}' is not a valid phase for {pkg.name}")
 
-        build_sandbox.enable(spack.config.CONFIG.get("config:sandbox", {}), spec, stage.path)
+        sandbox_config = spack.config.CONFIG.get("config:sandbox", {})
+        if request.sandbox_config is not None:
+            sandbox_config = {**sandbox_config, **request.sandbox_config}
+        build_sandbox.enable(sandbox_config, spec, stage.path)
 
         for phase in builder:
             if stop_before is not None and phase.name == stop_before:

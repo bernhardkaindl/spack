@@ -665,6 +665,18 @@ def test_internal_config_update(mock_low_high_config, write_config_file):
     assert after["install_tree"]["root"] == "foo/bar"
 
 
+def test_legacy_allow_network_overrides_lower_restrict_network(
+    mock_low_high_config, write_config_file
+):
+    write_config_file("config", {"config": {"sandbox": {"restrict_network": True}}}, "low")
+    write_config_file("config", {"config": {"sandbox": {"allow_network": True}}}, "high")
+
+    sandbox_config = mock_low_high_config.get("config:sandbox")
+
+    assert sandbox_config["restrict_network"] is False
+    assert "allow_network" not in sandbox_config
+
+
 def test_internal_config_filename(mock_low_high_config, write_config_file):
     write_config_file("config", config_low, "low")
     mock_low_high_config.push_scope(spack.config.InternalConfigScope("command_line"))
@@ -824,6 +836,60 @@ config:
 """,
         )
         assert "config.yaml:3" in str(e)
+
+
+def test_sandbox_accepts_legacy_allow_network():
+    check_schema(
+        spack.schema.config.schema,
+        """\
+config:
+    sandbox:
+        enable: true
+        allow_network: false
+""",
+    )
+
+
+def test_sandbox_accepts_both_network_settings():
+    check_schema(
+        spack.schema.config.schema,
+        """\
+config:
+    sandbox:
+        enable: true
+        allow_network: true
+        restrict_network: true
+""",
+    )
+
+
+@pytest.mark.parametrize(
+    "sandbox_config,expected",
+    [
+        ({"allow_network": True}, {"restrict_network": False}),
+        ({"allow_network": False}, {"restrict_network": True}),
+        ({"allow_network": True, "restrict_network": True}, {"restrict_network": True}),
+        ({"allow_network": False, "restrict_network": False}, {"restrict_network": False}),
+    ],
+)
+def test_sandbox_updates_legacy_allow_network(sandbox_config, expected):
+    data = {"config": {"sandbox": sandbox_config}}
+
+    assert spack.schema.config.update(data)
+    assert data["config"]["sandbox"] == expected
+
+
+def test_sandbox_accepts_independent_restrictions():
+    check_schema(
+        spack.schema.config.schema,
+        """\
+config:
+    sandbox:
+        enable: true
+        restrict_filesystem: false
+        restrict_network: true
+""",
+    )
 
 
 def test_config_parse_list_in_dict(tmp_path: pathlib.Path):
