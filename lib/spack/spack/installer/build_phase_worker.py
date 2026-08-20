@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Union
 
 import spack.error
 import spack.repo
+import spack.store
+import spack.util.lang
 from spack.installer.install_metadata import InstallMetadataError, publish_install_metadata
 from spack.installer.install_tree import InstallTreeError, install_tree_metadata
 from spack.solver.concretize_worker import (
@@ -374,7 +376,7 @@ def install_prepared_sandboxed(
     prefix = prefix.resolve()
     prefix.parent.mkdir(parents=True, exist_ok=True)
     with PrefixPivoter(str(prefix), keep_prefix=keep_failed_prefix):
-        response = run_build_phases_sandboxed(
+        return _install_prepared_sandboxed(
             spec,
             source_plan,
             prepared_stage,
@@ -384,8 +386,81 @@ def install_prepared_sandboxed(
             timeout=timeout,
             log_path=log_path,
         )
-        try:
-            metadata = publish_install_metadata(spec, prefix, response["install_tree"])
-        except InstallMetadataError as error:
-            raise SandboxedBuildPhaseError(str(error)) from error
-        return {**response, "install_metadata": metadata}
+
+
+def _install_prepared_sandboxed(
+    spec: Spec,
+    source_plan: Dict[str, Any],
+    prepared_stage: PreparedStage,
+    phases: List[str],
+    *,
+    prefix: Path,
+    repositories: List[Union[str, spack.repo.Repo]],
+    timeout: float,
+    log_path: Optional[Path],
+) -> Dict[str, Any]:
+    """Build and publish trusted metadata inside a parent-owned prefix transaction."""
+    response = run_build_phases_sandboxed(
+        spec,
+        source_plan,
+        prepared_stage,
+        phases,
+        prefix=prefix,
+        repositories=repositories,
+        timeout=timeout,
+        log_path=log_path,
+    )
+    try:
+        metadata = publish_install_metadata(spec, prefix, response["install_tree"])
+    except InstallMetadataError as error:
+        raise SandboxedBuildPhaseError(str(error)) from error
+    return {**response, "install_metadata": metadata}
+
+
+def install_prepared_registered_sandboxed(
+    spec: Spec,
+    source_plan: Dict[str, Any],
+    prepared_stage: PreparedStage,
+    phases: List[str],
+    *,
+    store: spack.store.Store,
+    repositories: List[Union[str, spack.repo.Repo]],
+    explicit: bool = False,
+    timeout: float = 120.0,
+    keep_failed_prefix: bool = False,
+    log_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Install at the store projection under its prefix lock and register it."""
+    from spack.installer.build import PrefixPivoter
+
+    store = spack.util.lang.ensure_unwrapped(store)
+    if not isinstance(store, spack.store.Store):
+        raise SandboxedBuildPhaseError("registered install requires a Store")
+    prefix = Path(store.layout.path_for_spec(spec)).resolve()
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    with store.prefix_locker.write_lock(spec):
+        with PrefixPivoter(str(prefix), keep_prefix=keep_failed_prefix):
+            response = _install_prepared_sandboxed(
+                spec,
+                source_plan,
+                prepared_stage,
+                phases,
+                prefix=prefix,
+                repositories=repositories,
+                timeout=timeout,
+                log_path=log_path,
+            )
+            try:
+                store.db.add(spec, explicit=explicit)
+            except Exception as error:
+                raise SandboxedBuildPhaseError(
+                    f"cannot register prepared installation: {error}"
+                ) from error
+            return {
+                **response,
+                "registration": {
+                    "dag_hash": spec.dag_hash(),
+                    "explicit": explicit,
+                    "prefix": str(prefix),
+                },
+            }

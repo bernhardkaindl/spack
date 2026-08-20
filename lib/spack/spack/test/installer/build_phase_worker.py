@@ -4,6 +4,7 @@
 
 """Tests for provenance-bound build phases over trusted prepared source trees."""
 
+import contextlib
 import copy
 import hashlib
 import io
@@ -21,6 +22,7 @@ import spack.spec
 import spack.verify
 from spack.installer.build_phase_worker import (
     SandboxedBuildPhaseError,
+    install_prepared_registered_sandboxed,
     install_prepared_sandboxed,
     run_build_phase_sandboxed,
 )
@@ -341,6 +343,106 @@ def test_install_prepared_rejects_package_metadata(
 
     assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
     assert not (prefix / ".spack").exists()
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_registers_under_parent_lock(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path, monkeypatch
+):
+    """Commit a database-ready prefix at the store projection without parent recipe import."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-registered",
+        """    def install(self, spec, prefix):
+        \"\"\"Create installed content for parent registration.\"\"\"
+        from pathlib import Path
+        Path(prefix).joinpath("installed.txt").write_text("installed")
+""",
+    )
+
+    def reject_parent_package_import(*args, **kwargs):
+        """Fail if parent registration resolves recipe code."""
+        raise AssertionError("trusted parent imported recipe code")
+
+    lock_active = False
+    original_write_lock = temporary_store.prefix_locker.write_lock
+    original_add = temporary_store.db.add
+
+    @contextlib.contextmanager
+    def observed_write_lock(spec):
+        """Record when the real per-spec write lock is held."""
+        nonlocal lock_active
+        with original_write_lock(spec):
+            lock_active = True
+            try:
+                yield
+            finally:
+                lock_active = False
+
+    def observed_add(*args, **kwargs):
+        """Require registration to happen while the prefix lock is held."""
+        assert lock_active
+        return original_add(*args, **kwargs)
+
+    monkeypatch.setattr(spack.repo.PATH, "get_pkg_class", reject_parent_package_import)
+    monkeypatch.setattr(temporary_store.prefix_locker, "write_lock", observed_write_lock)
+    monkeypatch.setattr(temporary_store.db, "add", observed_add)
+    response = install_prepared_registered_sandboxed(
+        concrete,
+        plan,
+        prepared,
+        ["install"],
+        store=temporary_store,
+        repositories=repositories,
+        explicit=True,
+    )
+
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    record = temporary_store.db.get_record(concrete)
+    assert record is not None and record.installed and record.explicit
+    assert response["registration"] == {
+        "dag_hash": concrete.dag_hash(),
+        "explicit": True,
+        "prefix": str(prefix),
+    }
+    temporary_store.layout.ensure_installed(concrete)
+    assert (prefix / "installed.txt").read_text(encoding="utf-8") == "installed"
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_rolls_back_database_failure(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path, monkeypatch
+):
+    """Restore the previous projected prefix when parent database registration fails."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-register-failure",
+        """    def install(self, spec, prefix):
+        \"\"\"Create replacement content that must not survive a database failure.\"\"\"
+        from pathlib import Path
+        Path(prefix).joinpath("new.txt").write_text("new")
+""",
+    )
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    prefix.mkdir(parents=True)
+    (prefix / "original.txt").write_text("original", encoding="utf-8")
+
+    def fail_registration(*args, **kwargs):
+        """Simulate a failed trusted database transaction."""
+        raise RuntimeError("database failed")
+
+    monkeypatch.setattr(temporary_store.db, "add", fail_registration)
+    with pytest.raises(SandboxedBuildPhaseError, match="database failed"):
+        install_prepared_registered_sandboxed(
+            concrete, plan, prepared, ["install"], store=temporary_store, repositories=repositories
+        )
+
+    assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
+    assert not (prefix / "new.txt").exists()
 
 
 @pytest.mark.use_package_hash
