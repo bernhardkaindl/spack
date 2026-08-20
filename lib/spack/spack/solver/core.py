@@ -65,7 +65,11 @@ class AspFunction:
             if type(arg) is str:
                 arg = arg.replace("\\", r"\\").replace("\n", r"\n").replace('"', r"\"")
                 parts.append(f'"{arg}"')
-            elif type(arg) is AspFunction or type(arg) is int or type(arg) is AspVar:
+            elif (
+                type(arg) is AspFunction
+                or (isinstance(arg, int) and not isinstance(arg, bool))
+                or type(arg) is AspVar
+            ):
                 parts.append(str(arg))
             else:
                 parts.append(f'"{arg}"')

@@ -60,6 +60,12 @@ from spack.test.utilities import RecordingUI
 from spack.version import Version, VersionList, ver
 
 
+def test_asp_function_formats_yaml_integer_as_number():
+    assert str(spack.solver.core.fn.max_dupes("gcc", syaml.syaml_int(2))) == (
+        'max_dupes("gcc",2)'
+    )
+
+
 def check_spec(abstract, concrete):
     if abstract.versions.concrete:
         assert abstract.versions == concrete.versions
