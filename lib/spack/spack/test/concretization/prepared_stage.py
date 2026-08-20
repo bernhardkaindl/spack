@@ -5,11 +5,11 @@
 import hashlib
 import http.server
 import io
-from pathlib import Path
 import tarfile
 import threading
 import urllib.request
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -29,11 +29,7 @@ def provenance():
         "dag_hash": "a" * 32,
         "package_hash": "b" * 52 + "====",
         "repositories": [
-            {
-                "namespace": "builtin.mock",
-                "package_api": [2, 1],
-                "identity": "c" * 64,
-            }
+            {"namespace": "builtin.mock", "package_api": [2, 1], "identity": "c" * 64}
         ],
     }
 
@@ -59,6 +55,27 @@ def source_plan(archive: Path, provenance, *, extension="tar.gz", expand=True):
     }
 
 
+def add_resource(
+    plan, archive: Path, *, destination="vendor", placement="headers", extension="tar.gz"
+):
+    plan["schema_version"] = 2
+    plan["resources"].append(
+        {
+            "name": "headers",
+            "source": {
+                "kind": "url",
+                "urls": [archive.as_uri()],
+                "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "expand": True,
+                "extension": extension,
+            },
+            "destination": destination,
+            "placement": placement,
+        }
+    )
+    return plan
+
+
 def write_tar(archive: Path, entries):
     with tarfile.open(archive, "w:gz") as output:
         for name, contents, entry_type in entries:
@@ -80,18 +97,74 @@ def test_prepare_stage_fetches_checks_and_extracts(tmp_path, provenance, fetch_p
 
     plan = source_plan(archive, provenance)
     prepared = prepare_stage(
-        plan,
-        tmp_path / "prepared",
-        expected_provenance=provenance,
-        fetch_policy=fetch_policy,
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
     )
 
-    configure = prepared.path / "project" / "configure"
+    configure = prepared.path / "configure"
     assert configure.read_text(encoding="utf-8") == "#!/bin/sh\n"
     assert configure.stat().st_mode & 0o111
     assert prepared.source_plan_sha256 == source_plan_digest(plan)
     assert prepared.content_sha256 == prepared_stage_digest(prepared.path)
     assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
+def test_prepare_stage_fetches_and_places_resource(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "headers.tar.gz"
+    write_tar(archive, [("project/configure", "#!/bin/sh\n", tarfile.REGTYPE)])
+    write_tar(resource, [("include/library.h", "#define VALUE 1\n", tarfile.REGTYPE)])
+    plan = add_resource(source_plan(archive, provenance), resource)
+
+    prepared = prepare_stage(
+        plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+    )
+
+    header = prepared.path / "vendor" / "headers" / "library.h"
+    assert header.read_text(encoding="utf-8") == "#define VALUE 1\n"
+    assert prepared.source_plan_sha256 == source_plan_digest(plan)
+    assert prepared.content_sha256 == prepared_stage_digest(prepared.path)
+
+
+def test_prepare_stage_rejects_resource_conflict_transactionally(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "headers.tar.gz"
+    write_tar(
+        archive,
+        [
+            ("vendor/headers/existing", "main", tarfile.REGTYPE),
+            ("configure", "main", tarfile.REGTYPE),
+        ],
+    )
+    write_tar(resource, [("new", "resource", tarfile.REGTYPE)])
+    plan = add_resource(source_plan(archive, provenance), resource)
+
+    with pytest.raises(PreparedStageError, match="placement already exists"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
+def test_prepare_stage_applies_aggregate_expanded_size_limit(
+    tmp_path, provenance, fetch_policy, monkeypatch
+):
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "headers.tar.gz"
+    write_tar(archive, [("main", "123", tarfile.REGTYPE)])
+    write_tar(resource, [("resource", "456", tarfile.REGTYPE)])
+    plan = add_resource(source_plan(archive, provenance), resource)
+    monkeypatch.setattr(prepared_stage_module, "MAX_EXPANDED_BYTES", 5)
+
+    with pytest.raises(PreparedStageError, match="expand beyond"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not (tmp_path / "prepared").exists()
 
 
 @pytest.mark.parametrize(
@@ -116,6 +189,30 @@ def test_prepare_stage_rejects_unsafe_tar_entries(tmp_path, provenance, fetch_po
     assert not (tmp_path / "prepared").exists()
     assert not list(tmp_path.glob(".prepared.preparing-*"))
     assert not (tmp_path / "escape").exists()
+
+
+def test_prepare_stage_rejects_ambiguous_top_level_archive_layout(
+    tmp_path, provenance, fetch_policy
+):
+    archive = tmp_path / "ambiguous.tar.gz"
+    write_tar(
+        archive,
+        [
+            ("project/configure", "#!/bin/sh\n", tarfile.REGTYPE),
+            (".metadata", "ambiguous", tarfile.REGTYPE),
+        ],
+    )
+
+    with pytest.raises(PreparedStageError, match="beside top-level directory"):
+        prepare_stage(
+            source_plan(archive, provenance),
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=fetch_policy,
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
 
 
 def test_prepare_stage_rejects_zip_symlink(tmp_path, provenance, fetch_policy):
@@ -145,10 +242,7 @@ def test_prepare_stage_rejects_bad_checksum(tmp_path, provenance, fetch_policy):
 
     with pytest.raises(PreparedStageError, match="checksum"):
         prepare_stage(
-            plan,
-            tmp_path / "prepared",
-            expected_provenance=provenance,
-            fetch_policy=fetch_policy,
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
         )
 
     assert not (tmp_path / "prepared").exists()
@@ -189,8 +283,7 @@ def test_prepare_stage_enforces_expanded_size_limit(
 def test_prepare_stage_enforces_entry_limit(tmp_path, provenance, fetch_policy, monkeypatch):
     archive = tmp_path / "source.tar.gz"
     write_tar(
-        archive,
-        [("project/one", "1", tarfile.REGTYPE), ("project/two", "2", tarfile.REGTYPE)],
+        archive, [("project/one", "1", tarfile.REGTYPE), ("project/two", "2", tarfile.REGTYPE)]
     )
     monkeypatch.setattr(prepared_stage_module, "MAX_ARCHIVE_ENTRIES", 1)
 
@@ -273,10 +366,33 @@ def test_prepare_stage_authorizes_all_candidates_before_fetch(
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", record_open)
     with pytest.raises(PreparedStageError, match="authority is not allowed"):
         prepare_stage(
-            plan,
-            tmp_path / "prepared",
-            expected_provenance=provenance,
-            fetch_policy=fetch_policy,
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
+        )
+
+    assert not opened
+
+
+def test_prepare_stage_authorizes_resources_before_any_fetch(
+    tmp_path, provenance, fetch_policy, monkeypatch
+):
+    archive = tmp_path / "source.tar.gz"
+    resource = tmp_path / "headers.tar.gz"
+    write_tar(archive, [("main", "source", tarfile.REGTYPE)])
+    write_tar(resource, [("header", "resource", tarfile.REGTYPE)])
+    plan = add_resource(source_plan(archive, provenance), resource)
+    plan["resources"][0]["source"]["urls"] = ["https://unauthorized.example/headers"]
+    opened = False
+    original_open = urllib.request.OpenerDirector.open
+
+    def record_open(self, *args, **kwargs):
+        nonlocal opened
+        opened = True
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", record_open)
+    with pytest.raises(PreparedStageError, match="authority is not allowed"):
+        prepare_stage(
+            plan, tmp_path / "prepared", expected_provenance=provenance, fetch_policy=fetch_policy
         )
 
     assert not opened
@@ -310,8 +426,7 @@ def test_prepare_stage_rejects_redirect_before_target_request(tmp_path, provenan
     redirect = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
     RedirectHandler.location = f"http://127.0.0.1:{target.server_port}/source"
     threads = [
-        threading.Thread(target=server.serve_forever, daemon=True)
-        for server in (target, redirect)
+        threading.Thread(target=server.serve_forever, daemon=True) for server in (target, redirect)
     ]
     for thread in threads:
         thread.start()

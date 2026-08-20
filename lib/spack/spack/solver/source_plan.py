@@ -4,22 +4,23 @@
 
 """Validation for declarative source plans produced by confined recipe workers.
 
-The initial schema supports one checksummed URL archive and reserves resources and patches for
-later schema revisions. Validation is recipe-free so a trusted parent can reject malformed worker
-output without importing package code.
+The current schema supports checksummed URL sources and simply placed URL resources. Validation
+is recipe-free so a trusted parent can reject malformed worker output without importing package
+code.
 """
 
 import re
-from typing import Any, Dict, Optional
 import urllib.parse
+from pathlib import PurePosixPath
+from typing import Any, Dict, Optional
 
 import spack.error
 import spack.fetch_strategy
 import spack.hash_types as ht
 
-
-SOURCE_PLAN_SCHEMA_VERSION = 1
+SOURCE_PLAN_SCHEMA_VERSION = 2
 MAX_SOURCE_URLS = 32
+MAX_RESOURCES = 32
 MAX_SOURCE_PLAN_STRING = 4096
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -59,6 +60,41 @@ def _url(value: Any) -> str:
     return url
 
 
+def _relative_path(value: Any, description: str, *, allow_empty: bool = False) -> str:
+    if allow_empty and value == "":
+        return value
+    path = _string(value, description)
+    parsed = PurePosixPath(path)
+    if (
+        parsed.is_absolute()
+        or "\\" in path
+        or "\x00" in path
+        or ".." in parsed.parts
+        or str(parsed) != path
+        or path in (".", "..")
+    ):
+        raise SourcePlanError(f"invalid {description}")
+    return path
+
+
+def _source_for_fetcher(fetcher: Any, description: str) -> Dict[str, Any]:
+    if type(fetcher) is not spack.fetch_strategy.URLFetchStrategy:
+        raise SourcePlanError(f"unsupported {description} fetch strategy")
+    if fetcher.extra_options:
+        raise SourcePlanError(f"{description} fetch options are unsupported")
+    if not isinstance(fetcher.digest, str) or _SHA256.fullmatch(fetcher.digest) is None:
+        raise SourcePlanError(f"{description} requires a SHA-256 checksum")
+    source = {
+        "kind": "url",
+        "urls": list(fetcher.candidate_urls),
+        "sha256": fetcher.digest,
+        "expand": fetcher.expand_archive,
+        "extension": fetcher.extension,
+    }
+    _validate_url_source(source, description)
+    return source
+
+
 def source_plan_for_spec(spec, repositories: Any) -> Dict[str, Any]:
     """Create a fixed-URL source plan from a concrete Spec inside a confined worker."""
     if not spec.concrete:
@@ -67,17 +103,24 @@ def source_plan_for_spec(spec, repositories: Any) -> Dict[str, Any]:
         raise SourcePlanError("external packages are unsupported by source planning")
 
     package = spec.package
-    fetcher = package.fetcher
-    if type(fetcher) is not spack.fetch_strategy.URLFetchStrategy:
-        raise SourcePlanError("unsupported source fetch strategy")
-    if fetcher.extra_options:
-        raise SourcePlanError("source fetch options are unsupported")
-    if package._get_needed_resources():
-        raise SourcePlanError("source plan resources are unsupported")
+    source = _source_for_fetcher(package.fetcher, "source")
+    needed_resources = package._get_needed_resources()
+    if len(needed_resources) > MAX_RESOURCES:
+        raise SourcePlanError("source plan has too many resources")
+    resources = []
+    for resource in needed_resources:
+        if not isinstance(resource.placement, str) or not resource.placement:
+            raise SourcePlanError("resource placement must be an explicit non-empty string")
+        resources.append(
+            {
+                "name": resource.name,
+                "source": _source_for_fetcher(resource.fetcher, "resource"),
+                "destination": resource.destination,
+                "placement": resource.placement,
+            }
+        )
     if spec.patches:
         raise SourcePlanError("source plan patches are unsupported")
-    if not isinstance(fetcher.digest, str) or _SHA256.fullmatch(fetcher.digest) is None:
-        raise SourcePlanError("source planning requires a SHA-256 checksum")
 
     package_hash = ht.package_hash(spec)
     plan = {
@@ -87,14 +130,8 @@ def source_plan_for_spec(spec, repositories: Any) -> Dict[str, Any]:
             "package_hash": package_hash,
             "repositories": repositories,
         },
-        "source": {
-            "kind": "url",
-            "urls": list(fetcher.candidate_urls),
-            "sha256": fetcher.digest,
-            "expand": fetcher.expand_archive,
-            "extension": fetcher.extension,
-        },
-        "resources": [],
+        "source": source,
+        "resources": resources,
         "patches": [],
     }
     return validate_source_plan(plan)
@@ -112,9 +149,8 @@ def validate_source_plan(
         "patches",
     }:
         raise SourcePlanError("source plan has unexpected fields")
-    if type(plan["schema_version"]) is not int or plan["schema_version"] != (
-        SOURCE_PLAN_SCHEMA_VERSION
-    ):
+    schema_version = plan["schema_version"]
+    if type(schema_version) is not int or schema_version not in (1, SOURCE_PLAN_SCHEMA_VERSION):
         raise SourcePlanError("unsupported source plan schema")
 
     provenance = plan["provenance"]
@@ -151,7 +187,37 @@ def validate_source_plan(
     if expected_provenance is not None and provenance != expected_provenance:
         raise SourcePlanError("source plan provenance does not match the request")
 
-    source = plan["source"]
+    _validate_url_source(plan["source"], "source")
+
+    resources = plan["resources"]
+    if schema_version == 1:
+        if resources != []:
+            raise SourcePlanError("source plan resources are unsupported by version 1")
+    else:
+        if not isinstance(resources, list) or len(resources) > MAX_RESOURCES:
+            raise SourcePlanError("invalid source plan resources")
+        names = []
+        for resource in resources:
+            if not isinstance(resource, dict) or set(resource) != {
+                "name",
+                "source",
+                "destination",
+                "placement",
+            }:
+                raise SourcePlanError("invalid source plan resource")
+            names.append(_string(resource["name"], "resource name", pattern=_IDENTIFIER))
+            _validate_url_source(resource["source"], "resource source")
+            _relative_path(resource["destination"], "resource destination", allow_empty=True)
+            _relative_path(resource["placement"], "resource placement")
+        if len(set(names)) != len(names):
+            raise SourcePlanError("resource names must be unique")
+
+    if plan["patches"] != []:
+        raise SourcePlanError("source plan patches are unsupported")
+    return plan
+
+
+def _validate_url_source(source: Any, description: str) -> None:
     if not isinstance(source, dict) or set(source) != {
         "kind",
         "urls",
@@ -159,23 +225,17 @@ def validate_source_plan(
         "expand",
         "extension",
     }:
-        raise SourcePlanError("invalid source description")
+        raise SourcePlanError(f"invalid {description} description")
     if source["kind"] != "url":
-        raise SourcePlanError("unsupported source kind")
+        raise SourcePlanError(f"unsupported {description} kind")
     urls = source["urls"]
     if not isinstance(urls, list) or not urls or len(urls) > MAX_SOURCE_URLS:
-        raise SourcePlanError("invalid source URLs")
+        raise SourcePlanError(f"invalid {description} URLs")
     if len(set(_url(value) for value in urls)) != len(urls):
-        raise SourcePlanError("source URLs must be unique")
-    _string(source["sha256"], "source SHA-256", pattern=_SHA256)
+        raise SourcePlanError(f"{description} URLs must be unique")
+    _string(source["sha256"], f"{description} SHA-256", pattern=_SHA256)
     if not isinstance(source["expand"], bool):
-        raise SourcePlanError("invalid source expansion policy")
+        raise SourcePlanError(f"invalid {description} expansion policy")
     extension = source["extension"]
     if extension is not None:
-        _string(extension, "source extension", pattern=_EXTENSION)
-
-    if plan["resources"] != []:
-        raise SourcePlanError("source plan resources are unsupported")
-    if plan["patches"] != []:
-        raise SourcePlanError("source plan patches are unsupported")
-    return plan
+        _string(extension, f"{description} extension", pattern=_EXTENSION)

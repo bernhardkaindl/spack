@@ -138,6 +138,61 @@ def test_run_prepared_build_phase_sandboxed(
 
 
 @pytest.mark.use_package_hash
+def test_run_prepared_build_phase_with_resource(
+    concretize_scope, mock_packages_repo, repo_builder, tmp_path, monkeypatch
+):
+    """Consume a worker-planned resource from the parent-prepared source tree."""
+    source = tmp_path / "source.tar.gz"
+    resource = tmp_path / "resource.tar.gz"
+    source_checksum = _write_source_archive(source)
+    resource_checksum = _write_source_archive(resource)
+    _add_build_recipe(
+        repo_builder,
+        "sandbox-build-resource",
+        source.as_uri(),
+        source_checksum,
+        f'''    resource(
+        name="headers",
+        url={resource.as_uri()!r},
+        sha256={resource_checksum!r},
+        destination="vendor",
+        placement="headers",
+        when="@1.0",
+    )
+
+    def install(self, spec, prefix):
+        """Install content supplied by the trusted-staged resource."""
+        from pathlib import Path
+        source = Path(self.stage.source_path).joinpath("vendor", "headers", "README")
+        Path(prefix).joinpath("resource.txt").write_text(source.read_text())
+''',
+    )
+    repositories = [repo_builder.root, mock_packages_repo]
+    concrete = concretize_one_sandboxed("sandbox-build-resource@1.0", repositories=repositories)
+    plan = plan_sources_sandboxed(concrete, repositories=repositories)
+    prepared = prepare_stage(
+        plan,
+        tmp_path / "prepared",
+        expected_provenance=plan["provenance"],
+        fetch_policy=SourceFetchPolicy(file_roots=(tmp_path,)),
+    )
+
+    def reject_parent_package_import(*args, **kwargs):
+        raise AssertionError("trusted parent imported recipe code")
+
+    monkeypatch.setattr(spack.repo.PATH, "get_pkg_class", reject_parent_package_import)
+    prefix = tmp_path / "prefix"
+    response = run_build_phase_sandboxed(
+        concrete, plan, prepared, "install", prefix=prefix, repositories=repositories
+    )
+
+    assert response["source_plan_sha256"] == source_plan_digest(plan)
+    assert plan["schema_version"] == 2
+    assert [resource["name"] for resource in plan["resources"]] == ["headers"]
+    assert (prefix / "resource.txt").read_text(encoding="utf-8") == "prepared source\n"
+
+
+@pytest.mark.use_package_hash
 def test_build_output_uses_dedicated_bounded_log(
     concretize_scope, mock_packages_repo, repo_builder, tmp_path
 ):
@@ -673,7 +728,7 @@ def test_install_prepared_runs_typed_rpath_action(
         from pathlib import Path
         binary = Path(prefix).joinpath("bin")
         binary.mkdir()
-        source = Path(self.stage.source_path).joinpath("project", "tool")
+        source = Path(self.stage.source_path).joinpath("tool")
         tool = binary.joinpath("tool")
         shutil.copy2(source, tool)
         tool.chmod(0o4555)

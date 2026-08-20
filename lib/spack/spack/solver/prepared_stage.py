@@ -4,24 +4,23 @@
 
 """Trusted preparation of source plans without importing recipe code."""
 
-from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path, PurePosixPath
 import shutil
 import stat
 import tarfile
 import tempfile
-from typing import Any, Dict, FrozenSet, Optional, Tuple
 import urllib.parse
 import urllib.request
 import zipfile
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import spack.error
-from spack.solver.source_plan import validate_source_plan
 import spack.util.web
-
+from spack.solver.source_plan import validate_source_plan
 
 MAX_ARCHIVE_ENTRIES = 100000
 MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
@@ -72,6 +71,28 @@ class SourceFetchPolicy:
         if parsed.scheme == "http" and origin in self.http_origins:
             return
         raise PreparedStageError("source URL authority is not allowed")
+
+
+@dataclass
+class _PreparationBudget:
+    entries: int = 0
+    downloaded_bytes: int = 0
+    expanded_bytes: int = 0
+
+    def add_download(self, size: int) -> None:
+        self.downloaded_bytes += size
+        if self.downloaded_bytes > MAX_DOWNLOAD_BYTES:
+            raise PreparedStageError("source downloads exceed the size limit")
+
+    def add_archive_entry(self, size: int) -> None:
+        if size < 0:
+            raise PreparedStageError("archive entry has an invalid size")
+        self.entries += 1
+        self.expanded_bytes += size
+        if self.entries > MAX_ARCHIVE_ENTRIES:
+            raise PreparedStageError("archives contain too many entries")
+        if self.expanded_bytes > MAX_EXPANDED_BYTES:
+            raise PreparedStageError("archives expand beyond the size limit")
 
 
 class _PolicyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -131,8 +152,12 @@ def prepared_stage_digest(root: Path) -> str:
     return identity.hexdigest()
 
 
-def _fetch(plan: Dict[str, Any], destination: Path, policy: SourceFetchPolicy) -> Path:
-    source = plan["source"]
+def _fetch(
+    source: Dict[str, Any],
+    destination: Path,
+    policy: SourceFetchPolicy,
+    budget: _PreparationBudget,
+) -> Path:
     for url in source["urls"]:
         policy.validate(url)
     opener = urllib.request.build_opener(
@@ -144,19 +169,15 @@ def _fetch(plan: Dict[str, Any], destination: Path, policy: SourceFetchPolicy) -
     for url in source["urls"]:
         try:
             request = urllib.request.Request(
-                url,
-                headers={"User-Agent": spack.util.web.SPACK_USER_AGENT, "Accept": "*/*"},
+                url, headers={"User-Agent": spack.util.web.SPACK_USER_AGENT, "Accept": "*/*"}
             )
             digest = hashlib.sha256()
-            size = 0
             with opener.open(request) as response, open(destination, "xb") as output:
                 while True:
                     chunk = response.read(64 * 1024)
                     if not chunk:
                         break
-                    size += len(chunk)
-                    if size > MAX_DOWNLOAD_BYTES:
-                        raise PreparedStageError("source download exceeds the size limit")
+                    budget.add_download(len(chunk))
                     digest.update(chunk)
                     output.write(chunk)
             if digest.hexdigest() != source["sha256"]:
@@ -178,20 +199,11 @@ def _relative_archive_path(name: str) -> Path:
     return Path(*parts)
 
 
-def _check_archive_limits(entries: int, expanded_bytes: int) -> None:
-    if entries > MAX_ARCHIVE_ENTRIES:
-        raise PreparedStageError("archive contains too many entries")
-    if expanded_bytes > MAX_EXPANDED_BYTES:
-        raise PreparedStageError("archive expands beyond the size limit")
-
-
-def _extract_tar(archive: Path, destination: Path) -> None:
+def _extract_tar(archive: Path, destination: Path, budget: _PreparationBudget) -> None:
     with tarfile.open(archive, mode="r:*") as source:
-        expanded_bytes = 0
-        for index, member in enumerate(source, start=1):
+        for member in source:
             relative = _relative_archive_path(member.name)
-            expanded_bytes += member.size
-            _check_archive_limits(index, expanded_bytes)
+            budget.add_archive_entry(member.size)
             target = destination / relative
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
@@ -207,13 +219,11 @@ def _extract_tar(archive: Path, destination: Path) -> None:
             os.chmod(target, stat.S_IMODE(member.mode) & 0o777)
 
 
-def _extract_zip(archive: Path, destination: Path) -> None:
+def _extract_zip(archive: Path, destination: Path, budget: _PreparationBudget) -> None:
     with zipfile.ZipFile(archive) as source:
-        expanded_bytes = 0
-        for index, member in enumerate(source.infolist(), start=1):
+        for member in source.infolist():
             relative = _relative_archive_path(member.filename)
-            expanded_bytes += member.file_size
-            _check_archive_limits(index, expanded_bytes)
+            budget.add_archive_entry(member.file_size)
             target = destination / relative
             mode = member.external_attr >> 16
             if stat.S_ISLNK(mode):
@@ -230,17 +240,81 @@ def _extract_zip(archive: Path, destination: Path) -> None:
                 os.chmod(target, stat.S_IMODE(mode) & 0o777)
 
 
-def _extract_archive(archive: Path, destination: Path, extension: Optional[str]) -> None:
+def _extract_archive(
+    archive: Path, destination: Path, extension: Optional[str], budget: _PreparationBudget
+) -> None:
     if extension == "zip" or (extension is None and zipfile.is_zipfile(archive)):
-        _extract_zip(archive, destination)
+        _extract_zip(archive, destination, budget)
         return
     if extension in (None, "tar", "tar.gz", "tgz", "tar.bz2", "tbz2", "tar.xz", "txz"):
         try:
-            _extract_tar(archive, destination)
+            _extract_tar(archive, destination, budget)
             return
         except tarfile.TarError as error:
             raise PreparedStageError(f"unsupported or invalid source archive: {error}") from error
     raise PreparedStageError(f"unsupported source archive extension: {extension}")
+
+
+def _publish_extracted_archive(container: Path, destination: Path) -> None:
+    entries = list(container.iterdir())
+    non_hidden = [entry for entry in entries if not entry.name.startswith(".")]
+    if len(non_hidden) == 1 and non_hidden[0].is_dir():
+        if len(entries) != 1:
+            raise PreparedStageError("unsupported archive layout beside top-level directory")
+        entries = list(non_hidden[0].iterdir())
+    for entry in entries:
+        target = destination / entry.name
+        if target.exists():
+            raise PreparedStageError(f"archive extraction conflict: {entry.name}")
+        entry.rename(target)
+
+
+def _prepare_source(
+    source: Dict[str, Any],
+    destination: Path,
+    download: Path,
+    fetch_policy: SourceFetchPolicy,
+    budget: _PreparationBudget,
+) -> None:
+    download.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    archive = _fetch(source, download, fetch_policy, budget)
+    if source["expand"]:
+        container = destination.parent / f".{destination.name}.extracting"
+        container.mkdir(mode=0o700)
+        try:
+            _extract_archive(archive, container, source["extension"], budget)
+            _publish_extracted_archive(container, destination)
+        finally:
+            shutil.rmtree(container, ignore_errors=True)
+    else:
+        filename = Path(urllib.parse.urlsplit(source["urls"][0]).path).name or "source"
+        shutil.copy2(archive, destination / filename)
+
+
+def _prepare_resources(
+    resources: Any,
+    root: Path,
+    workspace: Path,
+    fetch_policy: SourceFetchPolicy,
+    budget: _PreparationBudget,
+) -> None:
+    for index, resource in enumerate(resources):
+        resource_root = workspace / "resources" / str(index)
+        resource_root.mkdir(mode=0o700, parents=True)
+        _prepare_source(
+            resource["source"],
+            resource_root,
+            workspace / "downloads" / str(index),
+            fetch_policy,
+            budget,
+        )
+        target = root / resource["destination"] / resource["placement"]
+        if target.exists():
+            raise PreparedStageError(
+                f"resource placement already exists: {target.relative_to(root)}"
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        resource_root.rename(target)
 
 
 def prepare_stage(
@@ -252,26 +326,25 @@ def prepare_stage(
 ) -> PreparedStage:
     """Fetch, verify, and safely expand a validated fixed-URL source plan."""
     validate_source_plan(plan, expected_provenance=expected_provenance)
+    for source in [plan["source"]] + [resource["source"] for resource in plan["resources"]]:
+        for url in source["urls"]:
+            fetch_policy.validate(url)
     destination = destination.resolve()
     if destination.exists():
         raise PreparedStageError("prepared stage destination must not already exist")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    source = plan["source"]
     workspace = Path(
         tempfile.mkdtemp(prefix=f".{destination.name}.preparing-", dir=destination.parent)
     )
     temporary = workspace / "source"
     temporary.mkdir(mode=0o700)
-    download = workspace / "download" / "archive"
-    download.parent.mkdir(mode=0o700)
+    budget = _PreparationBudget()
     try:
-        archive = _fetch(plan, download, fetch_policy)
-        if source["expand"]:
-            _extract_archive(archive, temporary, source["extension"])
-        else:
-            filename = Path(urllib.parse.urlsplit(source["urls"][0]).path).name or "source"
-            shutil.copy2(archive, temporary / filename)
+        _prepare_source(
+            plan["source"], temporary, workspace / "downloads" / "source", fetch_policy, budget
+        )
+        _prepare_resources(plan["resources"], temporary, workspace, fetch_policy, budget)
         temporary.rename(destination)
     except BaseException:
         raise

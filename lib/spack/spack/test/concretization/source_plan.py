@@ -15,11 +15,7 @@ from spack.solver.concretize_worker import (
     concretize_one_sandboxed,
     plan_sources_sandboxed,
 )
-from spack.solver.source_plan import (
-    SourcePlanError,
-    source_plan_for_spec,
-    validate_source_plan,
-)
+from spack.solver.source_plan import SourcePlanError, source_plan_for_spec, validate_source_plan
 
 
 @pytest.fixture
@@ -30,11 +26,7 @@ def source_plan():
             "dag_hash": "a" * 32,
             "package_hash": "b" * 52 + "====",
             "repositories": [
-                {
-                    "namespace": "builtin.mock",
-                    "package_api": [2, 1],
-                    "identity": "c" * 64,
-                }
+                {"namespace": "builtin.mock", "package_api": [2, 1], "identity": "c" * 64}
             ],
         },
         "source": {
@@ -49,6 +41,21 @@ def source_plan():
     }
 
 
+def resource_description():
+    return {
+        "name": "headers",
+        "source": {
+            "kind": "url",
+            "urls": ["https://example.com/headers.tar.gz"],
+            "sha256": "e" * 64,
+            "expand": True,
+            "extension": None,
+        },
+        "destination": "vendor",
+        "placement": "headers",
+    }
+
+
 def test_validate_fixed_url_source_plan(source_plan):
     assert validate_source_plan(source_plan) is source_plan
     assert (
@@ -57,6 +64,54 @@ def test_validate_fixed_url_source_plan(source_plan):
         )
         is source_plan
     )
+
+
+def test_validate_url_resource_source_plan(source_plan):
+    source_plan["schema_version"] = 2
+    source_plan["resources"] = [resource_description()]
+
+    assert validate_source_plan(source_plan) is source_plan
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        (lambda resource: resource.update(extra=True), "resource"),
+        (lambda resource: resource.update(name="../headers"), "resource name"),
+        (lambda resource: resource.update(destination="../escape"), "destination"),
+        (lambda resource: resource.update(placement="/escape"), "placement"),
+        (lambda resource: resource["source"].update(sha256="md5"), "SHA-256"),
+        (lambda resource: resource["source"].update(urls=[]), "URLs"),
+    ],
+)
+def test_source_plan_rejects_malformed_url_resource(source_plan, mutation, match):
+    source_plan["schema_version"] = 2
+    resource = resource_description()
+    mutation(resource)
+    source_plan["resources"] = [resource]
+
+    with pytest.raises(SourcePlanError, match=match):
+        validate_source_plan(source_plan)
+
+
+def test_source_plan_rejects_duplicate_resource_names(source_plan):
+    source_plan["schema_version"] = 2
+    source_plan["resources"] = [resource_description(), resource_description()]
+
+    with pytest.raises(SourcePlanError, match="names must be unique"):
+        validate_source_plan(source_plan)
+
+
+def test_source_plan_rejects_too_many_resources(source_plan):
+    source_plan["schema_version"] = 2
+    source_plan["resources"] = []
+    for index in range(33):
+        resource = resource_description()
+        resource["name"] = f"resource-{index}"
+        source_plan["resources"].append(resource)
+
+    with pytest.raises(SourcePlanError, match="resources"):
+        validate_source_plan(source_plan)
 
 
 def test_source_plan_rejects_mismatched_provenance(source_plan):
@@ -114,11 +169,7 @@ def test_source_plan_for_fixed_url_recipe(concretize_scope, mock_packages_repo, 
         encoding="utf-8",
     )
     repositories = [
-        {
-            "namespace": repo_builder.namespace,
-            "package_api": [2, 0],
-            "identity": "f" * 64,
-        }
+        {"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}
     ]
 
     with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
@@ -133,6 +184,64 @@ def test_source_plan_for_fixed_url_recipe(concretize_scope, mock_packages_repo, 
         "extension": None,
     }
     assert validate_source_plan(plan, expected_provenance=plan["provenance"]) is plan
+
+
+@pytest.mark.use_package_hash
+def test_source_plan_for_url_resource(concretize_scope, mock_packages_repo, repo_builder):
+    repo_builder.add_package("source-plan-resource")
+    recipe = Path(repo_builder._recipe_filename("source-plan-resource"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-resource-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n'
+        + "    resource(\n"
+        + '        name="headers",\n'
+        + '        url="https://example.com/headers.tar.gz",\n'
+        + f"        sha256={'e' * 64!r},\n"
+        + '        destination="vendor",\n'
+        + '        placement="headers",\n'
+        + '        when="@1.0",\n'
+        + "    )\n",
+        encoding="utf-8",
+    )
+    repositories = [
+        {"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}
+    ]
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-resource@1.0")
+        plan = source_plan_for_spec(concrete, repositories)
+
+    assert plan["schema_version"] == 2
+    assert plan["resources"] == [resource_description()]
+
+
+@pytest.mark.use_package_hash
+def test_source_plan_rejects_resource_dictionary_placement(
+    concretize_scope, mock_packages_repo, repo_builder
+):
+    repo_builder.add_package("source-plan-resource-dict")
+    recipe = Path(repo_builder._recipe_filename("source-plan-resource-dict"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-resource-dict-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n'
+        + "    resource(\n"
+        + '        name="headers",\n'
+        + '        url="https://example.com/headers.tar.gz",\n'
+        + f"        sha256={'e' * 64!r},\n"
+        + '        placement={"include": "headers"},\n'
+        + '        when="@1.0",\n'
+        + "    )\n",
+        encoding="utf-8",
+    )
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-resource-dict@1.0")
+        with pytest.raises(SourcePlanError, match="explicit non-empty string"):
+            source_plan_for_spec(concrete, [])
 
 
 @pytest.mark.use_package_hash
@@ -157,9 +266,7 @@ def test_plan_sources_sandboxed(concretize_scope, mock_packages_repo, repo_build
     plan = plan_sources_sandboxed(concrete, repositories=repositories)
 
     assert plan["provenance"]["dag_hash"] == concrete.dag_hash()
-    assert plan["source"]["urls"] == [
-        "https://example.com/sandbox-source-plan-1.0.tar.gz"
-    ]
+    assert plan["source"]["urls"] == ["https://example.com/sandbox-source-plan-1.0.tar.gz"]
     assert plan["source"]["sha256"] == "d" * 64
 
 
