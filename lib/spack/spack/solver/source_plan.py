@@ -147,7 +147,11 @@ def _patch_for_plan(patch: Any) -> Dict[str, Any]:
         "reverse": patch.reverse,
     }
     if type(patch) is spack.patch.UrlPatch:
-        extension = spack.util.url.extension_from_path(patch.url) if patch.archive_sha256 else None
+        extension = (
+            spack.util.url.determine_url_file_extension(patch.url) or None
+            if patch.archive_sha256
+            else None
+        )
         if patch.archive_sha256 and extension not in SUPPORTED_PATCH_ARCHIVE_EXTENSIONS:
             raise SourcePlanError("unsupported compressed URL patch extension")
         return {

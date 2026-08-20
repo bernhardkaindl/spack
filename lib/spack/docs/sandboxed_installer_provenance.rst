@@ -140,6 +140,7 @@ The persisted SourcePlan and prepared-stage digests bind both the patch inputs a
 
 SourcePlan version 4 adds immutable URL patches.
 The planning worker emits the URL and expanded patch SHA-256; compressed patches also carry a distinct archive SHA-256 and normalized archive extension.
+It derives that extension with normal Spack's URL-aware parser, including recognized archive suffixes followed by query parameters, while the trusted parent consumes only the resulting allowlisted format.
 The trusted parent authorizes every patch URL together with source and resource URLs before issuing any request, and redirects remain subject to the same ``SourceFetchPolicy``.
 Plain downloads are limited to 48 KiB.
 Compressed downloads are limited to four MiB, must expand to exactly one regular file of at most 48 KiB, and are also charged to the plan-wide four GiB download budget.

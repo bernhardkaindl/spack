@@ -540,6 +540,36 @@ def test_source_plan_for_compressed_url_patch(concretize_scope, mock_packages_re
 
 
 @pytest.mark.use_package_hash
+def test_source_plan_for_query_suffixed_compressed_url_patch(
+    concretize_scope, mock_packages_repo, repo_builder
+):
+    repo_builder.add_package("source-plan-query-compressed-patch")
+    recipe = Path(repo_builder._recipe_filename("source-plan-query-compressed-patch"))
+    recipe.write_text(
+        recipe.read_text(encoding="utf-8")
+        + "\n"
+        + '    url = "https://example.com/source-plan-query-compressed-patch-1.0.tar.gz"\n'
+        + f'    version("1.0", sha256={"d" * 64!r})\n'
+        + '    patch("https://example.com/fix.patch.gz?download=1", sha256="'
+        + "e" * 64
+        + '", archive_sha256="'
+        + "f" * 64
+        + '")\n',
+        encoding="utf-8",
+    )
+    repositories = [
+        {"namespace": repo_builder.namespace, "package_api": [2, 0], "identity": "f" * 64}
+    ]
+
+    with spack.repo.use_repositories(repo_builder.root, mock_packages_repo):
+        concrete = spack.concretize.concretize_one("source-plan-query-compressed-patch@1.0")
+        plan = source_plan_for_spec(concrete, repositories)
+
+    assert plan["patches"][0]["url"] == "https://example.com/fix.patch.gz?download=1"
+    assert plan["patches"][0]["extension"] == "gz"
+
+
+@pytest.mark.use_package_hash
 def test_source_plan_accepts_package_patch_method(
     concretize_scope, mock_packages_repo, repo_builder
 ):
