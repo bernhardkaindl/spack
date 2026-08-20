@@ -1,0 +1,339 @@
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
+#
+# SPDX-License-Identifier: (Apache-2.0 OR MIT)
+
+import hashlib
+import http.server
+import io
+from pathlib import Path
+import tarfile
+import threading
+import urllib.request
+import zipfile
+
+import pytest
+
+import spack.solver.prepared_stage as prepared_stage_module
+from spack.solver.prepared_stage import (
+    PreparedStageError,
+    SourceFetchPolicy,
+    prepare_stage,
+    prepared_stage_digest,
+    source_plan_digest,
+)
+
+
+@pytest.fixture
+def provenance():
+    return {
+        "dag_hash": "a" * 32,
+        "package_hash": "b" * 52 + "====",
+        "repositories": [
+            {
+                "namespace": "builtin.mock",
+                "package_api": [2, 1],
+                "identity": "c" * 64,
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def fetch_policy(tmp_path):
+    return SourceFetchPolicy(file_roots=(tmp_path,))
+
+
+def source_plan(archive: Path, provenance, *, extension="tar.gz", expand=True):
+    return {
+        "schema_version": 1,
+        "provenance": provenance,
+        "source": {
+            "kind": "url",
+            "urls": [archive.as_uri()],
+            "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+            "expand": expand,
+            "extension": extension,
+        },
+        "resources": [],
+        "patches": [],
+    }
+
+
+def write_tar(archive: Path, entries):
+    with tarfile.open(archive, "w:gz") as output:
+        for name, contents, entry_type in entries:
+            info = tarfile.TarInfo(name)
+            info.type = entry_type
+            if entry_type == tarfile.REGTYPE:
+                data = contents.encode("utf-8")
+                info.size = len(data)
+                info.mode = 0o755
+                output.addfile(info, io.BytesIO(data))
+            elif entry_type == tarfile.SYMTYPE:
+                info.linkname = contents
+                output.addfile(info)
+
+
+def test_prepare_stage_fetches_checks_and_extracts(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    write_tar(archive, [("project/configure", "#!/bin/sh\n", tarfile.REGTYPE)])
+
+    plan = source_plan(archive, provenance)
+    prepared = prepare_stage(
+        plan,
+        tmp_path / "prepared",
+        expected_provenance=provenance,
+        fetch_policy=fetch_policy,
+    )
+
+    configure = prepared.path / "project" / "configure"
+    assert configure.read_text(encoding="utf-8") == "#!/bin/sh\n"
+    assert configure.stat().st_mode & 0o111
+    assert prepared.source_plan_sha256 == source_plan_digest(plan)
+    assert prepared.content_sha256 == prepared_stage_digest(prepared.path)
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [("ok", "partial", tarfile.REGTYPE), ("../escape", "bad", tarfile.REGTYPE)],
+        [("project/link", "../../escape", tarfile.SYMTYPE)],
+    ],
+)
+def test_prepare_stage_rejects_unsafe_tar_entries(tmp_path, provenance, fetch_policy, entries):
+    archive = tmp_path / "unsafe.tar.gz"
+    write_tar(archive, entries)
+
+    with pytest.raises(PreparedStageError, match="unsafe archive path|unsupported archive entry"):
+        prepare_stage(
+            source_plan(archive, provenance),
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=fetch_policy,
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
+    assert not (tmp_path / "escape").exists()
+
+
+def test_prepare_stage_rejects_zip_symlink(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(archive, "w") as output:
+        link = zipfile.ZipInfo("project/link")
+        link.create_system = 3
+        link.external_attr = 0o120777 << 16
+        output.writestr(link, "../../escape")
+
+    with pytest.raises(PreparedStageError, match="unsupported archive entry"):
+        prepare_stage(
+            source_plan(archive, provenance, extension="zip"),
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=fetch_policy,
+        )
+
+    assert not (tmp_path / "prepared").exists()
+
+
+def test_prepare_stage_rejects_bad_checksum(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    write_tar(archive, [("project/README", "contents", tarfile.REGTYPE)])
+    plan = source_plan(archive, provenance)
+    plan["source"]["sha256"] = "0" * 64
+
+    with pytest.raises(PreparedStageError, match="checksum"):
+        prepare_stage(
+            plan,
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=fetch_policy,
+        )
+
+    assert not (tmp_path / "prepared").exists()
+    assert not list(tmp_path.glob(".prepared.preparing-*"))
+
+
+def test_prepare_stage_does_not_replace_existing_path(tmp_path, provenance, fetch_policy):
+    archive = tmp_path / "source.tar.gz"
+    write_tar(archive, [("project/README", "contents", tarfile.REGTYPE)])
+    destination = tmp_path / "prepared"
+    destination.mkdir()
+
+    with pytest.raises(PreparedStageError, match="must not already exist"):
+        prepare_stage(
+            source_plan(archive, provenance),
+            destination,
+            expected_provenance=provenance,
+            fetch_policy=fetch_policy,
+        )
+
+
+def test_prepare_stage_enforces_expanded_size_limit(
+    tmp_path, provenance, fetch_policy, monkeypatch
+):
+    archive = tmp_path / "source.tar.gz"
+    write_tar(archive, [("project/data", "too large", tarfile.REGTYPE)])
+    monkeypatch.setattr(prepared_stage_module, "MAX_EXPANDED_BYTES", 4)
+
+    with pytest.raises(PreparedStageError, match="size limit"):
+        prepare_stage(
+            source_plan(archive, provenance),
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=fetch_policy,
+        )
+
+
+def test_prepare_stage_enforces_entry_limit(tmp_path, provenance, fetch_policy, monkeypatch):
+    archive = tmp_path / "source.tar.gz"
+    write_tar(
+        archive,
+        [("project/one", "1", tarfile.REGTYPE), ("project/two", "2", tarfile.REGTYPE)],
+    )
+    monkeypatch.setattr(prepared_stage_module, "MAX_ARCHIVE_ENTRIES", 1)
+
+    with pytest.raises(PreparedStageError, match="too many entries"):
+        prepare_stage(
+            source_plan(archive, provenance),
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=fetch_policy,
+        )
+
+
+def test_prepare_stage_can_publish_unexpanded_source(tmp_path, provenance, fetch_policy):
+    source = tmp_path / "script.sh"
+    source.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    prepared = prepare_stage(
+        source_plan(source, provenance, extension=None, expand=False),
+        tmp_path / "prepared",
+        expected_provenance=provenance,
+        fetch_policy=fetch_policy,
+    )
+
+    assert (prepared.path / "script.sh").read_text(encoding="utf-8") == "#!/bin/sh\n"
+
+
+def test_prepared_stage_digest_detects_content_changes(tmp_path):
+    root = tmp_path / "prepared"
+    root.mkdir()
+    source = root / "source"
+    source.write_text("before", encoding="utf-8")
+    before = prepared_stage_digest(root)
+
+    source.write_text("after", encoding="utf-8")
+
+    assert prepared_stage_digest(root) != before
+
+
+def test_prepared_stage_digest_rejects_links(tmp_path):
+    root = tmp_path / "prepared"
+    root.mkdir()
+    (root / "link").symlink_to(tmp_path)
+    with pytest.raises(PreparedStageError, match="unsupported prepared-stage entry"):
+        prepared_stage_digest(root)
+
+    root_link = tmp_path / "prepared-link"
+    root_link.symlink_to(root, target_is_directory=True)
+    with pytest.raises(PreparedStageError, match="root must be a directory"):
+        prepared_stage_digest(root_link)
+
+
+def test_prepare_stage_rejects_file_outside_allowed_roots(tmp_path, provenance):
+    source = tmp_path / "script.sh"
+    source.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    with pytest.raises(PreparedStageError, match="outside allowed file roots"):
+        prepare_stage(
+            source_plan(source, provenance, extension=None, expand=False),
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=SourceFetchPolicy(file_roots=(tmp_path / "other",)),
+        )
+
+
+def test_prepare_stage_authorizes_all_candidates_before_fetch(
+    tmp_path, provenance, fetch_policy, monkeypatch
+):
+    source = tmp_path / "script.sh"
+    source.write_text("#!/bin/sh\n", encoding="utf-8")
+    plan = source_plan(source, provenance, extension=None, expand=False)
+    plan["source"]["urls"].append("https://unauthorized.example/source")
+    opened = False
+    original_open = urllib.request.OpenerDirector.open
+
+    def record_open(self, *args, **kwargs):
+        nonlocal opened
+        opened = True
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", record_open)
+    with pytest.raises(PreparedStageError, match="authority is not allowed"):
+        prepare_stage(
+            plan,
+            tmp_path / "prepared",
+            expected_provenance=provenance,
+            fetch_policy=fetch_policy,
+        )
+
+    assert not opened
+
+
+def test_prepare_stage_rejects_redirect_before_target_request(tmp_path, provenance):
+    class TargetHandler(http.server.BaseHTTPRequestHandler):
+        requests = 0
+
+        def do_GET(self):
+            type(self).requests += 1
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"source")
+
+        def log_message(self, format, *args):
+            pass
+
+    class RedirectHandler(http.server.BaseHTTPRequestHandler):
+        location = ""
+
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", type(self).location)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    redirect = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    RedirectHandler.location = f"http://127.0.0.1:{target.server_port}/source"
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (target, redirect)
+    ]
+    for thread in threads:
+        thread.start()
+    source = tmp_path / "source"
+    source.write_bytes(b"source")
+    plan = source_plan(source, provenance, extension=None, expand=False)
+    plan["source"]["urls"] = [f"http://127.0.0.1:{redirect.server_port}/redirect"]
+    try:
+        with pytest.raises(PreparedStageError, match="authority is not allowed"):
+            prepare_stage(
+                plan,
+                tmp_path / "prepared",
+                expected_provenance=provenance,
+                fetch_policy=SourceFetchPolicy(
+                    http_origins=frozenset({("127.0.0.1", redirect.server_port)})
+                ),
+            )
+    finally:
+        for server in (redirect, target):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join()
+
+    assert TargetHandler.requests == 0
