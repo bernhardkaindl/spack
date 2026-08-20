@@ -18,7 +18,7 @@ import sys
 from typing import Any, Dict
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 
 
@@ -61,13 +61,15 @@ def _read_request() -> Dict[str, Any]:
         "configuration",
         "repositories",
         "clingo_paths",
+        "diagnostic_predicates",
+        "platform",
         "state_directory",
     }
     if set(request) != expected:
         raise WorkerRequestError("request has unexpected fields")
     if request["protocol_version"] != PROTOCOL_VERSION:
         raise WorkerRequestError("unsupported protocol version")
-    if request["operation"] != "concretize_one":
+    if request["operation"] not in ("concretize_one", "diagnose_concretization"):
         raise WorkerRequestError("unsupported operation")
     if not isinstance(request["spec"], str) or not request["spec"]:
         raise WorkerRequestError("spec must be a non-empty string")
@@ -79,6 +81,23 @@ def _read_request() -> Dict[str, Any]:
         raise WorkerRequestError("repositories must be a non-empty list")
     if not isinstance(request["clingo_paths"], list):
         raise WorkerRequestError("clingo_paths must be a list")
+    diagnostic_predicates = request["diagnostic_predicates"]
+    if (
+        not isinstance(diagnostic_predicates, list)
+        or len(diagnostic_predicates) > 32
+        or any(
+            not isinstance(name, str)
+            or not name
+            or len(name) > 128
+            or not name.replace("_", "a").isalnum()
+            for name in diagnostic_predicates
+        )
+    ):
+        raise WorkerRequestError("diagnostic_predicates must be a bounded list of names")
+    if request["operation"] == "concretize_one" and diagnostic_predicates:
+        raise WorkerRequestError("diagnostic predicates require the diagnostic operation")
+    if not isinstance(request["platform"], str) or not request["platform"]:
+        raise WorkerRequestError("platform must be a non-empty string")
     state_directory = Path(request["state_directory"])
     if not state_directory.is_absolute() or not state_directory.is_dir():
         raise WorkerRequestError("state_directory must be an existing absolute directory")
@@ -94,9 +113,11 @@ def _apply_resource_limits() -> None:
 
 def _apply_sandbox(state_directory: str) -> int:
     sys.path.insert(0, _spack_library_path())
-    from spack.sandbox import get_sandbox
+    from spack.sandbox import LandlockSandbox, get_sandbox
 
     sandbox = get_sandbox()
+    if not isinstance(sandbox, LandlockSandbox):
+        raise RuntimeError("Landlock sandbox is unavailable")
     sandbox.allow_read("/")
     sandbox.allow_write(state_directory)
     sandbox.apply(restrict_filesystem=True, restrict_network=True)
@@ -132,7 +153,9 @@ def _configure_state(request: Dict[str, Any]):
             raise WorkerRequestError("clingo paths must be absolute strings")
         sys.path.insert(0, path)
 
-    import clingo  # noqa: F401
+    import importlib
+
+    importlib.import_module("clingo")
     import spack.caches
     import spack.config
     import spack.repo
@@ -195,6 +218,18 @@ def _concretize(request: Dict[str, Any]):
     return spec_data, package_hashes
 
 
+def _diagnose(request: Dict[str, Any]):
+    from spack.solver.concretize_diagnostics import concretization_fingerprint
+
+    os.environ["SPACK_CONCRETIZER_REQUIRE_CHECKSUM"] = "yes"
+    with contextlib.redirect_stdout(sys.stderr):
+        return concretization_fingerprint(
+            request["spec"],
+            tests=request["tests"],
+            excerpt_predicates=request["diagnostic_predicates"],
+        )
+
+
 def _response(ok: bool, **kwargs) -> None:
     response = {"protocol_version": PROTOCOL_VERSION, "ok": ok, **kwargs}
     sys.stdout.write(json.dumps(response, allow_nan=False, separators=(",", ":")))
@@ -209,22 +244,40 @@ def main() -> None:
         phase = "sandbox"
         abi_version = _apply_sandbox(request["state_directory"])
         phase = "prepare"
-        repositories = _configure_state(request)
-        phase = "concretize"
-        spec, package_hashes = _concretize(request)
-        phase = "serialize"
-        _response(
-            True,
-            sandbox={
+        import spack.platforms
+
+        platform = spack.platforms.by_name(request["platform"])
+        if platform is None:
+            raise WorkerRequestError(f"unsupported platform: {request['platform']}")
+        with spack.platforms.use_platform(platform):
+            repositories = _configure_state(request)
+            sandbox = {
                 "backend": "landlock",
                 "abi_version": abi_version,
                 "filesystem_restricted": True,
                 "tcp_restricted": True,
-            },
-            repositories=repositories,
-            package_hashes=package_hashes,
-            spec=spec,
-        )
+            }
+            if request["operation"] == "diagnose_concretization":
+                phase = "diagnose"
+                diagnostics = _diagnose(request)
+                phase = "serialize"
+                _response(
+                    True,
+                    sandbox=sandbox,
+                    repositories=repositories,
+                    diagnostics=diagnostics,
+                )
+            else:
+                phase = "concretize"
+                spec, package_hashes = _concretize(request)
+                phase = "serialize"
+                _response(
+                    True,
+                    sandbox=sandbox,
+                    repositories=repositories,
+                    package_hashes=package_hashes,
+                    spec=spec,
+                )
     except BaseException as error:
         _response(
             False,

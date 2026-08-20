@@ -9,12 +9,22 @@ from typing import Any, cast
 
 import pytest
 
+import spack.config
+import spack.concretize
+import spack.platforms
+import spack.repo
 import spack.sandbox
+import spack.spec
 import spack.solver.concretize_worker as concretize_worker_module
+from spack.solver.concretize_diagnostics import (
+    concretization_fingerprint,
+    concretization_fingerprint_differences,
+)
 from spack.solver.concretize_worker import (
     SandboxedConcretizationError,
     _load_response,
     concretize_one_sandboxed,
+    concretization_diagnostics_sandboxed,
 )
 from spack.solver.repository_snapshot import (
     RepositorySnapshotError,
@@ -27,6 +37,11 @@ from spack.solver.repository_snapshot import (
 def _prepend_recipe_code(repo_builder, package, code):
     recipe = Path(repo_builder._recipe_filename(package))
     recipe.write_text(f"{code}\n{recipe.read_text(encoding='utf-8')}", encoding="utf-8")
+
+
+def _append_recipe_code(repo_builder, package, code):
+    recipe = Path(repo_builder._recipe_filename(package))
+    recipe.write_text(f"{recipe.read_text(encoding='utf-8')}\n{code}\n", encoding="utf-8")
 
 
 def test_repository_snapshot_has_deterministic_identity(tmp_path):
@@ -82,6 +97,135 @@ def test_concretize_one_sandboxed_round_trip(
     assert concrete.name == "sandbox-root"
     assert concrete["sandbox-dependency"].concrete
     assert concrete.namespace == repo_builder.namespace
+
+
+@pytest.mark.use_package_hash
+def test_sandboxed_concretization_matches_ordinary_solver(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-equivalence-leaf")
+    repo_builder.add_package(
+        "sandbox-equivalence-root",
+        dependencies=[("sandbox-equivalence-leaf@2.0", None, None)],
+    )
+    _append_recipe_code(
+        repo_builder,
+        "sandbox-equivalence-root",
+        '    variant("feature", default=False, description="Exercise variant equivalence")',
+    )
+    monkeypatch.setenv("SPACK_CONCRETIZER_REQUIRE_CHECKSUM", "yes")
+
+    with spack.platforms.use_platform(spack.platforms.real_host()):
+        requested = (
+            f"sandbox-equivalence-root@2.0+feature arch={spack.spec.ArchSpec.default_arch()}"
+        )
+        with (
+            spack.config.CONFIG.override("concretizer:reuse", False),
+            spack.config.CONFIG.override("concretizer:concretization_cache:enable", False),
+            spack.repo.use_repositories(repo_builder.root, mock_packages_repo),
+        ):
+            ordinary = spack.concretize.concretize_one(requested)
+        sandboxed = concretize_one_sandboxed(
+            requested, repositories=[repo_builder.root, mock_packages_repo]
+        )
+
+    sandboxed_nodes = {node["name"]: node for node in sandboxed.to_dict()["spec"]["nodes"]}
+    ordinary_nodes = {node["name"]: node for node in ordinary.to_dict()["spec"]["nodes"]}
+    differences = {
+        name: {
+            key: (sandboxed_nodes[name].get(key), ordinary_nodes[name].get(key))
+            for key in sandboxed_nodes[name].keys() | ordinary_nodes[name].keys()
+            if sandboxed_nodes[name].get(key) != ordinary_nodes[name].get(key)
+        }
+        for name in sandboxed_nodes.keys() | ordinary_nodes.keys()
+        if sandboxed_nodes.get(name) != ordinary_nodes.get(name)
+    }
+    assert not differences
+    assert sandboxed.satisfies("@2.0+feature")
+    assert sandboxed["sandbox-equivalence-leaf"].satisfies("@2.0")
+
+
+def test_sandboxed_solver_diagnostics_identify_process_state(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-diagnostic-provider")
+    _append_recipe_code(
+        repo_builder,
+        "sandbox-diagnostic-provider",
+        f'    version("4.0", sha256={"0" * 64!r})\n'
+        '    provides("sandbox-diagnostic-virtual@2", when="@4.0")',
+    )
+    repo_builder.add_package(
+        "sandbox-diagnostic-root",
+        dependencies=[("sandbox-diagnostic-virtual@2", None, None)],
+    )
+    monkeypatch.setenv("SPACK_CONCRETIZER_REQUIRE_CHECKSUM", "yes")
+
+    with spack.platforms.use_platform(spack.platforms.real_host()):
+        requested = (
+            f"sandbox-diagnostic-root@2.0 ^sandbox-diagnostic-provider@4.0 "
+            f"arch={spack.spec.ArchSpec.default_arch()}"
+        )
+        with (
+            spack.config.CONFIG.override("concretizer:reuse", False),
+            spack.config.CONFIG.override("concretizer:concretization_cache:enable", False),
+            spack.repo.use_repositories(repo_builder.root, mock_packages_repo),
+        ):
+            diagnostic_predicates = [
+                "host_libc",
+                "installed_hash",
+                "os",
+                "pkg_fact",
+                "provider",
+                "runtime",
+                "virtual",
+            ]
+            ordinary = concretization_fingerprint(
+                requested, excerpt_predicates=diagnostic_predicates
+            )
+            sandboxed = concretization_diagnostics_sandboxed(
+                requested,
+                repositories=[repo_builder.root, mock_packages_repo],
+                excerpt_predicates=diagnostic_predicates,
+            )
+
+    differences = concretization_fingerprint_differences(sandboxed, ordinary)
+    assert differences
+    assert all(path.startswith("asp.") for path in differences)
+    # The session-scoped compiler fixture monkeypatches only this process, so the ordinary setup
+    # admits fake compilers and emits runtime facts that a fresh worker correctly omits.
+    assert "asp.predicates.runtime" in differences
+    assert "asp.predicates.installed_hash" in differences
+    assert sandboxed["asp"]["excerpts"].get("runtime") is None
+    assert ordinary["asp"]["excerpts"]["runtime"]
+    for fingerprint in (sandboxed, ordinary):
+        package_facts = fingerprint["asp"]["excerpts"]["pkg_fact"]
+        assert any(
+            'pkg_fact("sandbox-diagnostic-provider",possible_provider('
+            '"sandbox-diagnostic-virtual"))' in fact
+            for fact in package_facts
+        )
+
+
+def test_parent_rejects_invalid_solver_diagnostics(
+    concretize_scope, mock_packages_repo, repo_builder, monkeypatch
+):
+    repo_builder.add_package("sandbox-diagnostic-tamper")
+    load_response = concretize_worker_module._load_response
+
+    def load_with_altered_diagnostics(data):
+        response = load_response(data)
+        if response.get("ok"):
+            response["diagnostics"]["asp"]["sha256"] = "invalid"
+        return response
+
+    monkeypatch.setattr(concretize_worker_module, "_load_response", load_with_altered_diagnostics)
+
+    with pytest.raises(SandboxedConcretizationError, match="invalid ASP program digest"):
+        concretization_diagnostics_sandboxed(
+            "sandbox-diagnostic-tamper@1.0",
+            repositories=[repo_builder.root, mock_packages_repo],
+        )
 
 
 def test_concretization_can_use_live_repositories_without_copying(

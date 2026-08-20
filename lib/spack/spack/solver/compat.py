@@ -24,6 +24,12 @@ from typing import Any, Optional, Tuple
 #: Process-global cache of the lazily-imported clingo module.
 _CLINGO_MODULE: Optional[ModuleType] = None
 
+_DEFAULT_CLINGO_OPTIONS = {
+    "configuration": "tweety",
+    "heuristic": "Domain",
+    "optimization_strategy": "usc",
+}
+
 
 def clingo() -> ModuleType:
     """Lazy imports the Python module for clingo, and returns it."""
@@ -240,13 +246,24 @@ def default_clingo_control() -> Any:
     if clingo_flavor() is ClingoFlavor.V6:
         # clingo 6 has no `.configuration` API; pass equivalents as CLI options.
         return _ClingoV6Control(
-            ("--configuration=tweety", "--heuristic=Domain", "--opt-strategy=usc")
+            (
+                f"--configuration={_DEFAULT_CLINGO_OPTIONS['configuration']}",
+                f"--heuristic={_DEFAULT_CLINGO_OPTIONS['heuristic']}",
+                f"--opt-strategy={_DEFAULT_CLINGO_OPTIONS['optimization_strategy']}",
+            )
         )
     control = clingo().Control()
-    control.configuration.configuration = "tweety"
-    control.configuration.solver.heuristic = "Domain"
-    control.configuration.solver.opt_strategy = "usc"
+    control.configuration.configuration = _DEFAULT_CLINGO_OPTIONS["configuration"]
+    control.configuration.solver.heuristic = _DEFAULT_CLINGO_OPTIONS["heuristic"]
+    control.configuration.solver.opt_strategy = _DEFAULT_CLINGO_OPTIONS[
+        "optimization_strategy"
+    ]
     return control
+
+
+def default_clingo_options() -> dict:
+    """Return the semantic Clingo options used by :func:`default_clingo_control`."""
+    return dict(_DEFAULT_CLINGO_OPTIONS)
 
 
 def make_error_control() -> Any:

@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Union
 import spack.config
 import spack.error
 import spack.hash_types as ht
+import spack.platforms
 import spack.repo
 from spack.active_environment import active_environment
 from spack.solver.repository_snapshot import (
@@ -42,7 +43,7 @@ from spack.spec import Spec
 from spack.version.common import is_git_version
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MAX_REQUEST_BYTES = 4 * 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_STDERR_BYTES = 2 * 1024 * 1024
@@ -310,6 +311,37 @@ def _validate_success(
         "spec",
     }:
         raise SandboxedConcretizationError("worker success response has unexpected fields")
+    _validate_worker_context(response, repositories)
+    spec_data = response["spec"]
+    _validate_spec_payload(spec_data)
+    expected_package_hashes = [
+        {"dag_hash": node["hash"], "package_hash": node["package_hash"]}
+        for node in spec_data["spec"]["nodes"]
+    ]
+    if response["package_hashes"] != expected_package_hashes:
+        raise SandboxedConcretizationError("worker returned inconsistent package hash provenance")
+    try:
+        spec = Spec.from_dict(spec_data)
+    except Exception as error:
+        raise SandboxedConcretizationError(
+            f"worker returned an unreadable spec: {error}"
+        ) from error
+    nodes = spec_data["spec"]["nodes"]
+    concrete_nodes = list(spec.traverse())
+    if not spec.concrete or len(concrete_nodes) != len(nodes):
+        raise SandboxedConcretizationError("worker returned an incomplete concrete spec")
+    for concrete_node in concrete_nodes:
+        concrete_node.clear_caches(ignore=(ht.package_hash.attr,))
+    if any(node["hash"] != concrete.dag_hash() for node, concrete in zip(nodes, concrete_nodes)):
+        raise SandboxedConcretizationError("worker returned inconsistent DAG hashes")
+    if spec.name != requested.name or not spec.satisfies(requested):
+        raise SandboxedConcretizationError("worker returned a spec unrelated to the request")
+    return spec
+
+
+def _validate_worker_context(
+    response: Dict[str, Any], repositories: List[Dict[str, Any]]
+) -> None:
     sandbox = response["sandbox"]
     if not isinstance(sandbox, dict) or set(sandbox) != {
         "backend",
@@ -345,54 +377,128 @@ def _validate_success(
             ) from error
         if identity != repository["identity"]:
             raise SandboxedConcretizationError("repository contents changed during concretization")
-    spec_data = response["spec"]
-    _validate_spec_payload(spec_data)
-    expected_package_hashes = [
-        {"dag_hash": node["hash"], "package_hash": node["package_hash"]}
-        for node in spec_data["spec"]["nodes"]
-    ]
-    if response["package_hashes"] != expected_package_hashes:
-        raise SandboxedConcretizationError("worker returned inconsistent package hash provenance")
-    try:
-        spec = Spec.from_dict(spec_data)
-    except Exception as error:
+
+
+def _validate_digest(value: Any, description: str) -> None:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise SandboxedConcretizationError(f"worker returned invalid {description} digest")
+
+
+def _validate_diagnostics(
+    response: Dict[str, Any], repositories: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    if response.get("protocol_version") != PROTOCOL_VERSION:
+        raise SandboxedConcretizationError("worker returned an unsupported protocol version")
+    if response.get("ok") is not True:
+        error = response.get("error")
+        if not isinstance(error, dict):
+            raise SandboxedConcretizationError("worker failed without a structured error")
         raise SandboxedConcretizationError(
-            f"worker returned an unreadable spec: {error}"
-        ) from error
-    nodes = spec_data["spec"]["nodes"]
-    concrete_nodes = list(spec.traverse())
-    if not spec.concrete or len(concrete_nodes) != len(nodes):
-        raise SandboxedConcretizationError("worker returned an incomplete concrete spec")
-    for concrete_node in concrete_nodes:
-        concrete_node.clear_caches(ignore=(ht.package_hash.attr,))
-    if any(node["hash"] != concrete.dag_hash() for node, concrete in zip(nodes, concrete_nodes)):
-        raise SandboxedConcretizationError("worker returned inconsistent DAG hashes")
-    if spec.name != requested.name or not spec.satisfies(requested):
-        raise SandboxedConcretizationError("worker returned a spec unrelated to the request")
-    return spec
+            "worker failed during {} ({}): {}".format(
+                error.get("phase", "unknown"),
+                error.get("type", "Error"),
+                error.get("message", "sandboxed diagnostics failed"),
+            )
+        )
+    if set(response) != {"protocol_version", "ok", "sandbox", "repositories", "diagnostics"}:
+        raise SandboxedConcretizationError("worker diagnostic response has unexpected fields")
+    _validate_worker_context(response, repositories)
+    diagnostics = response["diagnostics"]
+    if not isinstance(diagnostics, dict) or set(diagnostics) != {
+        "schema_version",
+        "platform",
+        "clingo",
+        "configuration",
+        "solver_logic",
+        "asp",
+    }:
+        raise SandboxedConcretizationError("worker returned invalid solver diagnostics")
+    if diagnostics["schema_version"] != 1:
+        raise SandboxedConcretizationError("worker returned unsupported diagnostic schema")
+    platform = diagnostics["platform"]
+    if not isinstance(platform, dict) or set(platform) != {"name", "default_arch"} or not all(
+        isinstance(value, str) and value for value in platform.values()
+    ):
+        raise SandboxedConcretizationError("worker returned invalid platform diagnostics")
+    clingo = diagnostics["clingo"]
+    if not isinstance(clingo, dict) or set(clingo) != {
+        "flavor",
+        "version",
+        "module_sha256",
+        "options",
+    }:
+        raise SandboxedConcretizationError("worker returned invalid Clingo diagnostics")
+    if not isinstance(clingo["flavor"], str) or not isinstance(clingo["version"], str):
+        raise SandboxedConcretizationError("worker returned invalid Clingo runtime diagnostics")
+    _validate_digest(clingo["module_sha256"], "Clingo module")
+    options = clingo["options"]
+    if not isinstance(options, dict) or set(options) != {
+        "configuration",
+        "heuristic",
+        "optimization_strategy",
+    } or not all(isinstance(value, str) for value in options.values()):
+        raise SandboxedConcretizationError("worker returned invalid Clingo option diagnostics")
+    for section in ("configuration", "solver_logic"):
+        values = diagnostics[section]
+        if not isinstance(values, dict) or not values or not all(
+            isinstance(name, str) and name for name in values
+        ):
+            raise SandboxedConcretizationError(f"worker returned invalid {section} diagnostics")
+        for digest in values.values():
+            _validate_digest(digest, section)
+    asp = diagnostics["asp"]
+    if not isinstance(asp, dict) or set(asp) != {
+        "sha256",
+        "line_count",
+        "predicates",
+        "excerpts",
+    }:
+        raise SandboxedConcretizationError("worker returned invalid ASP diagnostics")
+    _validate_digest(asp["sha256"], "ASP program")
+    if not isinstance(asp["line_count"], int) or asp["line_count"] < 1:
+        raise SandboxedConcretizationError("worker returned invalid ASP line count")
+    predicates = asp["predicates"]
+    if not isinstance(predicates, dict) or not predicates or len(predicates) > 1000:
+        raise SandboxedConcretizationError("worker returned invalid ASP predicate diagnostics")
+    for name, values in predicates.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(values, dict)
+            or set(values) != {"sha256", "line_count"}
+            or not isinstance(values["line_count"], int)
+            or values["line_count"] < 1
+        ):
+            raise SandboxedConcretizationError("worker returned invalid ASP predicate diagnostics")
+        _validate_digest(values["sha256"], "ASP predicate")
+    excerpts = asp["excerpts"]
+    if not isinstance(excerpts, dict) or len(excerpts) > 32:
+        raise SandboxedConcretizationError("worker returned invalid ASP diagnostic excerpts")
+    excerpt_count = 0
+    for name, values in excerpts.items():
+        if not isinstance(name, str) or not isinstance(values, list):
+            raise SandboxedConcretizationError("worker returned invalid ASP diagnostic excerpts")
+        excerpt_count += len(values)
+        if any(not isinstance(value, str) or len(value) > MAX_JSON_STRING for value in values):
+            raise SandboxedConcretizationError("worker returned invalid ASP diagnostic excerpts")
+    if excerpt_count > 5000:
+        raise SandboxedConcretizationError("worker returned too many ASP diagnostic excerpts")
+    return diagnostics
 
 
-def concretize_one_sandboxed(
+def _run_worker(
     spec: Union[str, Spec],
     *,
+    operation: str,
     repositories: List[Union[str, spack.repo.Repo]],
     tests: Union[bool, List[str]] = False,
     timeout: float = 120.0,
     repository_snapshots: bool = True,
-) -> Spec:
-    """Concretize one abstract spec in an experimental Landlock-confined worker.
-
-    Repository snapshots are enabled by default so concurrent changes to live repositories cannot
-    affect recipe imports. Developers can set ``repository_snapshots=False`` to avoid copying; the
-    worker and parent still verify repository identities, but this does not prevent changes that are
-    made and reverted between those checks.
-
-    This initial API intentionally rejects active environments, concrete and hash-reference inputs,
-    develop and external specs, and Git versions. It does not alter normal Spack concretization or
-    installation entry points.
-    """
+    diagnostic_predicates: Optional[List[str]] = None,
+) -> Any:
     if not isinstance(repository_snapshots, bool):
         raise SandboxedConcretizationError("repository_snapshots must be a boolean")
+    diagnostic_predicates = diagnostic_predicates or []
     if active_environment() is not None:
         raise SandboxedConcretizationError("active environments are unsupported by this PoC")
     if isinstance(spec, Spec) and spec.concrete:
@@ -412,12 +518,14 @@ def concretize_one_sandboxed(
         repositories_payload = _repository_payload(repositories, snapshot_base)
         request = {
             "protocol_version": PROTOCOL_VERSION,
-            "operation": "concretize_one",
+            "operation": operation,
             "spec": spec_string,
             "tests": tests,
             "configuration": _configuration_payload(),
             "repositories": repositories_payload,
             "clingo_paths": _clingo_paths(),
+            "diagnostic_predicates": diagnostic_predicates,
+            "platform": spack.platforms.host().name,
             "state_directory": state_directory,
         }
         request_bytes = _json_bytes(request, MAX_REQUEST_BYTES)
@@ -457,4 +565,63 @@ def concretize_one_sandboxed(
             raise SandboxedConcretizationError(
                 f"worker exited with status {process.returncode}: {detail}"
             )
-        return _validate_success(_load_response(stdout), requested, repositories_payload)
+        response = _load_response(stdout)
+        if operation == "concretize_one":
+            return _validate_success(response, requested, repositories_payload)
+        return _validate_diagnostics(response, repositories_payload)
+
+
+def concretize_one_sandboxed(
+    spec: Union[str, Spec],
+    *,
+    repositories: List[Union[str, spack.repo.Repo]],
+    tests: Union[bool, List[str]] = False,
+    timeout: float = 120.0,
+    repository_snapshots: bool = True,
+) -> Spec:
+    """Concretize one abstract spec in an experimental Landlock-confined worker.
+
+    Repository snapshots are enabled by default so concurrent changes to live repositories cannot
+    affect recipe imports. Developers can set ``repository_snapshots=False`` to avoid copying; the
+    worker and parent still verify repository identities, but this does not prevent changes that are
+    made and reverted between those checks.
+
+    This initial API intentionally rejects active environments, concrete and hash-reference inputs,
+    develop and external specs, and Git versions. It does not alter normal Spack concretization or
+    installation entry points.
+    """
+    return _run_worker(
+        spec,
+        operation="concretize_one",
+        repositories=repositories,
+        tests=tests,
+        timeout=timeout,
+        repository_snapshots=repository_snapshots,
+        diagnostic_predicates=[],
+    )
+
+
+def concretization_diagnostics_sandboxed(
+    spec: Union[str, Spec],
+    *,
+    repositories: List[Union[str, spack.repo.Repo]],
+    tests: Union[bool, List[str]] = False,
+    timeout: float = 120.0,
+    repository_snapshots: bool = True,
+    excerpt_predicates: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return a bounded fingerprint of confined solver setup without running Clingo.
+
+    ``excerpt_predicates`` can request canonical ASP lines beginning with selected predicates when
+    hashes and counts identify a difference but do not explain it. Digest-only diagnostics are the
+    default. Excerpts may include facts or fragments of multiline rules.
+    """
+    return _run_worker(
+        spec,
+        operation="diagnose_concretization",
+        repositories=repositories,
+        tests=tests,
+        timeout=timeout,
+        repository_snapshots=repository_snapshots,
+        diagnostic_predicates=excerpt_predicates,
+    )
