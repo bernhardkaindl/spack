@@ -9,13 +9,17 @@ from typing import Any, cast
 
 import pytest
 
+import spack.compilers.libraries
 import spack.config
 import spack.concretize
 import spack.platforms
 import spack.repo
 import spack.sandbox
 import spack.spec
+import spack.solver.asp
 import spack.solver.concretize_worker as concretize_worker_module
+import spack.util.elf
+import spack.util.libc
 from spack.solver.concretize_diagnostics import (
     concretization_fingerprint,
     concretization_fingerprint_differences,
@@ -205,6 +209,135 @@ def test_sandboxed_solver_diagnostics_identify_process_state(
             '"sandbox-diagnostic-virtual"))' in fact
             for fact in package_facts
         )
+
+
+@pytest.mark.use_package_hash
+def test_sandboxed_virtual_provider_matches_with_working_compiler(
+    concretize_scope,
+    mock_packages_repo,
+    repo_builder,
+    monkeypatch,
+    real_compiler_detection,
+    temporary_store,
+    tmp_path,
+):
+    dynamic_linker = spack.util.elf.pt_interp(sys.executable)
+    libc = spack.util.libc.libc_from_dynamic_linker(dynamic_linker) if dynamic_linker else None
+    if not dynamic_linker or not libc or not libc.external_path:
+        pytest.skip("test requires a detectable host dynamic linker and libc")
+    assert not temporary_store.db.query("gcc")
+
+    compiler = tmp_path / "bin" / "gcc"
+    compiler.parent.mkdir()
+    compiler.write_text(
+        "#!/bin/sh\n"
+        "output=\n"
+        'while [ "$#" -gt 0 ]; do\n'
+        '    if [ "$1" = "-o" ] && [ "$#" -gt 1 ]; then\n'
+        "        shift\n"
+        '        output="$1"\n'
+        "    fi\n"
+        "    shift\n"
+        "done\n"
+        'if [ -n "$output" ]; then\n'
+        '    : > "$output"\n'
+        "fi\n"
+        f"printf '%s\\n' 'collect2 -dynamic-linker {dynamic_linker}'\n",
+        encoding="utf-8",
+    )
+    compiler.chmod(0o755)
+
+    c_compiler_runs, default_libc = real_compiler_detection
+    monkeypatch.setattr(spack.solver.asp, "c_compiler_runs", c_compiler_runs)
+    monkeypatch.setattr(
+        spack.compilers.libraries.CompilerPropertyDetector, "default_libc", default_libc
+    )
+
+    repo_builder.add_package("sandbox-provider-equivalence-provider")
+    _append_recipe_code(
+        repo_builder,
+        "sandbox-provider-equivalence-provider",
+        f'    version("4.0", sha256={"0" * 64!r})\n'
+        '    provides("sandbox-provider-equivalence-virtual@2", when="@4.0")',
+    )
+    repo_builder.add_package(
+        "sandbox-provider-equivalence-root",
+        dependencies=[("sandbox-provider-equivalence-virtual@2", None, None)],
+    )
+    monkeypatch.setenv("SPACK_CONCRETIZER_REQUIRE_CHECKSUM", "yes")
+
+    with spack.platforms.use_platform(spack.platforms.real_host()):
+        architecture = spack.spec.ArchSpec.default_arch()
+        requested = (
+            "sandbox-provider-equivalence-root@2.0 "
+            "^sandbox-provider-equivalence-provider@4.0 "
+            f"arch={architecture}"
+        )
+        packages = {
+            "all": {"providers": {"c": ["gcc"], "cxx": ["gcc"], "libc": ["glibc"]}},
+            "gcc": {
+                "buildable": False,
+                "externals": [
+                    {
+                        "spec": f"gcc@10.2.1 languages='c,c++' os={architecture.os}",
+                        "prefix": str(tmp_path),
+                        "extra_attributes": {
+                            "compilers": {"c": str(compiler), "cxx": str(compiler)}
+                        },
+                    }
+                ],
+            },
+            "glibc": {
+                "buildable": False,
+                "externals": [
+                    {
+                        "spec": f"glibc@={libc.version}",
+                        "prefix": libc.external_path,
+                    }
+                ],
+            },
+        }
+        packages_scope = spack.config.InternalConfigScope(
+            "sandbox-compiler-packages", data={"packages:": packages}
+        )
+        with (
+            spack.config.CONFIG.override(packages_scope),
+            spack.config.CONFIG.override("concretizer:reuse", False),
+            spack.config.CONFIG.override("concretizer:concretization_cache:enable", False),
+            spack.repo.use_repositories(repo_builder.root, mock_packages_repo),
+        ):
+            ordinary_diagnostics = concretization_fingerprint(
+                requested, excerpt_predicates=["max_dupes"]
+            )
+            sandboxed_diagnostics = concretization_diagnostics_sandboxed(
+                requested,
+                repositories=[repo_builder.root, mock_packages_repo],
+                excerpt_predicates=["max_dupes"],
+            )
+            differences = concretization_fingerprint_differences(
+                sandboxed_diagnostics, ordinary_diagnostics
+            )
+            sandboxed_max_dupes = set(sandboxed_diagnostics["asp"]["excerpts"]["max_dupes"])
+            ordinary_max_dupes = set(ordinary_diagnostics["asp"]["excerpts"]["max_dupes"])
+            difference_report = [f"paths: {', '.join(sorted(differences))}"]
+            difference_report.extend(
+                f"sandboxed only: {value}"
+                for value in sorted(sandboxed_max_dupes - ordinary_max_dupes)
+            )
+            difference_report.extend(
+                f"ordinary only: {value}"
+                for value in sorted(ordinary_max_dupes - sandboxed_max_dupes)
+            )
+            assert not differences, "\n".join(difference_report)
+            ordinary = spack.concretize.concretize_one(requested)
+            sandboxed = concretize_one_sandboxed(
+                requested, repositories=[repo_builder.root, mock_packages_repo]
+            )
+
+    assert sandboxed.to_dict() == ordinary.to_dict()
+    assert sandboxed["sandbox-provider-equivalence-virtual"].name == (
+        "sandbox-provider-equivalence-provider"
+    )
 
 
 def test_parent_rejects_invalid_solver_diagnostics(

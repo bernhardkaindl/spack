@@ -2455,16 +2455,24 @@ def _libc_from_python(self):
     return spack.spec.Spec("glibc@=2.28", external_path="/some/path")
 
 
+@pytest.fixture(scope="session")
+def real_compiler_detection():
+    """Capture production detectors before the session-scoped test overrides."""
+    return (
+        spack.solver.asp.c_compiler_runs,
+        spack.compilers.libraries.CompilerPropertyDetector.default_libc,
+    )
+
+
 @pytest.fixture()
 def do_not_check_runtimes_on_reuse(monkeypatch):
     monkeypatch.setattr(spack.solver.reuse, "_has_runtime_dependencies", _true)
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _c_compiler_always_exists():
-    fn = spack.solver.asp.c_compiler_runs
+def _c_compiler_always_exists(real_compiler_detection):
+    fn, mthd = real_compiler_detection
     spack.solver.asp.c_compiler_runs = _true
-    mthd = spack.compilers.libraries.CompilerPropertyDetector.default_libc
     spack.compilers.libraries.CompilerPropertyDetector.default_libc = _libc_from_python
     yield
     spack.solver.asp.c_compiler_runs = fn
