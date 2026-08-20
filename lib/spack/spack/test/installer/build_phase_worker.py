@@ -18,6 +18,7 @@ import pytest
 
 import spack.config
 import spack.hooks
+import spack.hooks.sbang
 import spack.installer.build_phase_worker
 import spack.repo
 import spack.spec
@@ -499,6 +500,155 @@ def test_install_prepared_runs_typed_permission_action(
         }
     ]
     assert response["install_metadata"]["install_tree"] == install_tree_metadata(prefix)
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_runs_typed_sbang_action(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
+):
+    """Rewrite long executable shebangs using the registered store's sbang path."""
+    long_interpreter = "/" + "i" * (spack.hooks.sbang.system_shebang_limit + 10)
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-sbang",
+        """    def install(self, spec, prefix):
+        from pathlib import Path
+        executable = Path(prefix).joinpath("script")
+        executable.write_text({contents!r} + "x" * (1024 * 1024 + 17))
+        executable.chmod(0o700)
+        Path(prefix).joinpath("data").write_text({contents!r})
+""".format(contents="#!{0}\noutput\n".format(long_interpreter)),
+    )
+
+    response = install_prepared_registered_sandboxed(
+        concrete,
+        plan,
+        prepared,
+        ["install"],
+        store=temporary_store,
+        repositories=repositories,
+        post_actions=["sbang", "set_permissions"],
+    )
+
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    sbang_line = "#!/bin/sh {0}/bin/sbang\n".format(temporary_store.unpadded_root)
+    script = (prefix / "script").read_text(encoding="utf-8")
+    expected_prefix = sbang_line + "#!{0}\noutput\n".format(long_interpreter)
+    assert script.startswith(expected_prefix)
+    assert script[len(expected_prefix) :] == "x" * (1024 * 1024 + 17)
+    assert (
+        (prefix / "data")
+        .read_text(encoding="utf-8")
+        .startswith("#!{0}\n".format(long_interpreter))
+    )
+    assert [action["type"] for action in response["post_actions"]["actions"]] == [
+        "sbang",
+        "set_permissions",
+    ]
+    assert response["post_actions"]["actions"][0]["patched"] == 1
+    assert response["install_metadata"]["install_tree"] == install_tree_metadata(prefix)
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_rejects_post_actions_out_of_order(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
+):
+    """Reject mutation actions in an order that could undo final permissions."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-action-order",
+        """    def install(self, spec, prefix):
+        from pathlib import Path
+        Path(self.stage.source_path).joinpath("worker-ran").write_text("worker ran")
+""",
+    )
+
+    with pytest.raises(SandboxedBuildPhaseError, match="canonical order"):
+        install_prepared_registered_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            ["install"],
+            store=temporary_store,
+            repositories=repositories,
+            post_actions=["set_permissions", "sbang"],
+        )
+
+    assert not (prepared.path / "worker-ran").exists()
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_rejects_hardlinked_post_action_file(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
+):
+    """Do not let a parent action mutate an inode linked outside the prefix."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-hardlink-action",
+        """    def install(self, spec, prefix):
+        import os
+        from pathlib import Path
+        victim = Path(self.stage.source_path).joinpath("victim")
+        victim.write_text("#!/" + "i" * 300 + "\\noutput\\n")
+        victim.chmod(0o700)
+        os.link(str(victim), str(Path(prefix).joinpath("script")))
+""",
+    )
+    prefix = Path(temporary_store.layout.path_for_spec(concrete))
+    prefix.mkdir(parents=True)
+    (prefix / "original.txt").write_text("original", encoding="utf-8")
+
+    with pytest.raises(SandboxedBuildPhaseError, match="hard-linked install-tree entry"):
+        install_prepared_registered_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            ["install"],
+            store=temporary_store,
+            repositories=repositories,
+            post_actions=["sbang"],
+        )
+
+    assert (prefix / "original.txt").read_text(encoding="utf-8") == "original"
+    assert not (prefix / "script").exists()
+    assert (prepared.path / "victim").read_text(encoding="utf-8").startswith("#!/iii")
+
+
+@pytest.mark.use_package_hash
+def test_install_prepared_rejects_overlong_sbang_path_before_worker(
+    concretize_scope, mock_packages_repo, repo_builder, temporary_store, tmp_path
+):
+    """Reject an unusable store sbang path before launching recipe code."""
+    concrete, plan, prepared, repositories = _prepare_build(
+        repo_builder,
+        mock_packages_repo,
+        tmp_path,
+        "sandbox-install-sbang-path",
+        """    def install(self, spec, prefix):
+        from pathlib import Path
+        Path(self.stage.source_path).joinpath("worker-ran").write_text("worker ran")
+""",
+    )
+    temporary_store.unpadded_root = "/" + "x" * (spack.hooks.sbang.system_shebang_limit + 1)
+
+    with pytest.raises(SandboxedBuildPhaseError, match="too long for sbang"):
+        install_prepared_registered_sandboxed(
+            concrete,
+            plan,
+            prepared,
+            ["install"],
+            store=temporary_store,
+            repositories=repositories,
+            post_actions=["sbang"],
+        )
+
+    assert not (prepared.path / "worker-ran").exists()
 
 
 @pytest.mark.use_package_hash

@@ -7,9 +7,10 @@
 import os
 import stat
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import spack.error
+import spack.hooks.sbang
 import spack.package_prefs
 from spack.installer.install_tree import (
     MAX_INSTALL_TREE_ENTRIES,
@@ -18,13 +19,121 @@ from spack.installer.install_tree import (
 )
 from spack.spec import Spec
 
+SBANG = "sbang"
 SET_PERMISSIONS = "set_permissions"
-SUPPORTED_POST_ACTIONS = frozenset((SET_PERMISSIONS,))
+SUPPORTED_POST_ACTIONS = (SBANG, SET_PERMISSIONS)
 MAX_POST_ACTIONS = 16
+COPY_CHUNK_SIZE = 1024 * 1024
 
 
 class PostActionError(spack.error.SpackError):
     """Raised when a trusted parent post-action cannot be applied safely."""
+
+
+def _reject_hardlinked_file(path: Path, prefix: Path, info: os.stat_result) -> None:
+    if info.st_nlink != 1:
+        raise PostActionError(
+            "refusing hard-linked install-tree entry: {0}".format(path.relative_to(prefix))
+        )
+
+
+def _pwrite_all(descriptor: int, data: bytes, offset: int) -> None:
+    while data:
+        written = os.pwrite(descriptor, data, offset)
+        if written <= 0:
+            raise PostActionError("cannot rewrite install-tree entry")
+        data = data[written:]
+        offset += written
+
+
+def _rewrite_shebang(
+    descriptor: int, size: int, old_shebang: bytes, replacement: bytes, shebang: bytes
+) -> None:
+    prefix = shebang + replacement
+    delta = len(prefix) - len(old_shebang)
+    os.ftruncate(descriptor, size + delta)
+    end = size
+    while end > len(old_shebang):
+        start = max(len(old_shebang), end - COPY_CHUNK_SIZE)
+        chunk = os.pread(descriptor, end - start, start)
+        if len(chunk) != end - start:
+            raise PostActionError("install-tree entry changed during post-action")
+        _pwrite_all(descriptor, chunk, start + delta)
+        end = start
+    _pwrite_all(descriptor, prefix, 0)
+
+
+def validate_sbang_path(sbang_path: Path) -> bytes:
+    """Return the encoded sbang line after validating its explicit store path."""
+    shebang = ("#!/bin/sh {0}\n".format(sbang_path)).encode("utf-8")
+    if len(shebang) - 1 > spack.hooks.sbang.system_shebang_limit:
+        raise PostActionError("store root is too long for sbang shebang rewriting")
+    return shebang
+
+
+def _sbang(prefix: Path, sbang_path: Path) -> Dict[str, Any]:
+    """Rewrite overlong executable shebangs to an explicit store sbang path."""
+    if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "pread", "pwrite")):
+        raise PostActionError("sbang rewriting requires no-follow positional file I/O")
+    shebang = validate_sbang_path(sbang_path)
+    patched = 0
+    entries = 0
+    for root, directories, files in os.walk(prefix, followlinks=False):
+        directories.sort()
+        files.sort()
+        for name in files:
+            entries += 1
+            if entries > MAX_INSTALL_TREE_ENTRIES:
+                raise PostActionError("install tree exceeds the post-action entry limit")
+            path = Path(root) / name
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                continue
+            if not info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                continue
+            _reject_hardlinked_file(path, prefix, info)
+            flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino, opened.st_mode) != (
+                    info.st_dev,
+                    info.st_ino,
+                    info.st_mode,
+                ):
+                    relative = path.relative_to(prefix)
+                    raise PostActionError(
+                        "install-tree entry changed during post-action: {0}".format(relative)
+                    )
+                old_shebang = os.pread(descriptor, 2, 0)
+                if old_shebang != b"#!":
+                    continue
+                candidate = os.pread(descriptor, spack.hooks.sbang.spack_shebang_limit - 2, 2)
+                newline = candidate.find(b"\n")
+                old_shebang += candidate if newline < 0 else candidate[: newline + 1]
+                if len(old_shebang) <= spack.hooks.sbang.system_shebang_limit:
+                    continue
+                if (
+                    len(old_shebang) == spack.hooks.sbang.spack_shebang_limit
+                    and old_shebang[-1:] != b"\n"
+                ):
+                    continue
+                interpreter = spack.hooks.sbang.get_interpreter(old_shebang)
+                if not interpreter:
+                    continue
+                if interpreter[-4:] == b"/lua" or interpreter[-7:] == b"/luajit":
+                    replacement = b"--!" + old_shebang[2:]
+                elif interpreter[-5:] == b"/node":
+                    replacement = b"//!" + old_shebang[2:]
+                elif interpreter[-4:] == b"/php":
+                    replacement = b"<?php " + old_shebang + b" ?>"
+                else:
+                    replacement = old_shebang
+                _rewrite_shebang(descriptor, opened.st_size, old_shebang, replacement, shebang)
+                patched += 1
+            finally:
+                os.close(descriptor)
+    return {"type": SBANG, "entries": entries, "patched": patched, "sbang_path": str(sbang_path)}
 
 
 def _validate_permission_mode(mode: int) -> None:
@@ -74,6 +183,7 @@ def _set_permissions(spec: Spec, prefix: Path) -> Dict[str, Any]:
         if stat.S_ISDIR(info.st_mode):
             mode = directory_mode
         elif stat.S_ISREG(info.st_mode):
+            _reject_hardlinked_file(path, prefix, info)
             mode = file_mode
             if not info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
                 mode &= ~(stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -120,10 +230,17 @@ def validate_post_actions(actions: List[str]) -> None:
         raise PostActionError("invalid parent post-action list")
     if len(set(actions)) != len(actions):
         raise PostActionError("invalid parent post-action list")
+    order = {action: index for index, action in enumerate(SUPPORTED_POST_ACTIONS)}
+    if actions != sorted(actions, key=order.__getitem__):
+        raise PostActionError("parent post-actions are not in canonical order")
 
 
 def run_post_actions(
-    spec: Spec, prefix: Path, actions: List[str], expected_install_tree: Dict[str, Any]
+    spec: Spec,
+    prefix: Path,
+    actions: List[str],
+    expected_install_tree: Dict[str, Any],
+    sbang_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Verify worker output, execute allowlisted actions, and identify the result."""
     validate_post_actions(actions)
@@ -132,7 +249,11 @@ def run_post_actions(
             raise PostActionError("install tree changed before parent post-actions")
         results = []
         for action in actions:
-            if action == SET_PERMISSIONS:
+            if action == SBANG:
+                if sbang_path is None:
+                    raise PostActionError("sbang post-action requires an explicit store path")
+                results.append(_sbang(prefix, sbang_path))
+            elif action == SET_PERMISSIONS:
                 results.append(_set_permissions(spec, prefix))
         final_install_tree = install_tree_metadata(prefix)
     except (InstallTreeError, OSError, KeyError) as error:

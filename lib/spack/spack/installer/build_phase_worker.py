@@ -19,7 +19,12 @@ import spack.store
 import spack.util.lang
 from spack.installer.install_metadata import InstallMetadataError, publish_install_metadata
 from spack.installer.install_tree import InstallTreeError, install_tree_metadata
-from spack.installer.post_actions import PostActionError, run_post_actions, validate_post_actions
+from spack.installer.post_actions import (
+    PostActionError,
+    run_post_actions,
+    validate_post_actions,
+    validate_sbang_path,
+)
 from spack.solver.concretize_worker import (
     MAX_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
@@ -400,6 +405,7 @@ def _install_prepared_sandboxed(
     timeout: float,
     log_path: Optional[Path],
     post_actions: Optional[List[str]] = None,
+    sbang_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Build and publish trusted metadata inside a parent-owned prefix transaction."""
     response = run_build_phases_sandboxed(
@@ -414,7 +420,9 @@ def _install_prepared_sandboxed(
     )
     try:
         actions = [] if post_actions is None else post_actions
-        action_result = run_post_actions(spec, prefix, actions, response["install_tree"])
+        action_result = run_post_actions(
+            spec, prefix, actions, response["install_tree"], sbang_path=sbang_path
+        )
         metadata = publish_install_metadata(spec, prefix, action_result["install_tree"])
     except (InstallMetadataError, PostActionError) as error:
         raise SandboxedBuildPhaseError(str(error)) from error
@@ -438,14 +446,26 @@ def install_prepared_registered_sandboxed(
     """Install at the store projection under its prefix lock and register it."""
     from spack.installer.build import PrefixPivoter
 
-    store = spack.util.lang.ensure_unwrapped(store)
-    if not isinstance(store, spack.store.Store):
+    unwrapped_store = spack.util.lang.ensure_unwrapped(store)
+    if not isinstance(unwrapped_store, spack.store.Store):
         raise SandboxedBuildPhaseError("registered install requires a Store")
+    store = unwrapped_store
     actions = [] if post_actions is None else post_actions
     try:
         validate_post_actions(actions)
     except PostActionError as error:
         raise SandboxedBuildPhaseError(str(error)) from error
+    if "sbang" in actions:
+        sbang_path = Path(store.unpadded_root) / "bin" / "sbang"
+        try:
+            validate_sbang_path(sbang_path)
+            store.install_sbang()
+        except (spack.error.SpackError, OSError, KeyError) as error:
+            raise SandboxedBuildPhaseError(
+                "cannot prepare sbang post-action: {0}".format(error)
+            ) from error
+    else:
+        sbang_path = None
     prefix = Path(store.layout.path_for_spec(spec)).resolve()
     prefix.parent.mkdir(parents=True, exist_ok=True)
     with store.prefix_locker.write_lock(spec):
@@ -460,6 +480,7 @@ def install_prepared_registered_sandboxed(
                 timeout=timeout,
                 log_path=log_path,
                 post_actions=post_actions,
+                sbang_path=sbang_path,
             )
             try:
                 store.db.add(spec, explicit=explicit)
