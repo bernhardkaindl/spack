@@ -31,6 +31,12 @@ from spack.installer.build_phase_worker import (
     install_prepared_sandboxed,
     run_build_phase_sandboxed,
 )
+from spack.installer.install_metadata import (
+    InstallMetadataError,
+    read_install_provenance,
+    validate_install_provenance,
+    verify_install_provenance,
+)
 from spack.installer.install_tree import InstallTreeError, install_tree_metadata
 from spack.solver.concretize_worker import concretize_one_sandboxed, plan_sources_sandboxed
 from spack.solver.prepared_stage import (
@@ -351,6 +357,9 @@ def test_install_prepared_publishes_trusted_metadata(
     installed_spec = spack.spec.Spec.from_json((prefix / metadata["spec_path"]).read_text())
     assert installed_spec.dag_hash() == concrete.dag_hash()
     provenance = json.loads((prefix / metadata["provenance_path"]).read_text(encoding="utf-8"))
+    assert read_install_provenance(prefix) == provenance
+    assert validate_install_provenance(concrete, provenance) == provenance
+    assert verify_install_provenance(concrete, prefix) == provenance
     assert provenance["schema_version"] == 1
     assert provenance["spec"] == {
         "dag_hash": concrete.dag_hash(),
@@ -377,6 +386,31 @@ def test_install_prepared_publishes_trusted_metadata(
     }
     installed_spec.set_prefix(str(prefix))
     assert not spack.verify.check_spec_manifest(installed_spec).has_errors()
+
+    tampered = copy.deepcopy(provenance)
+    tampered["source_plan"]["source"]["sha256"] = "0" * 64
+    with pytest.raises(InstallMetadataError, match="SourcePlan digest"):
+        validate_install_provenance(concrete, tampered)
+
+    tampered = copy.deepcopy(provenance)
+    tampered["parent"]["actions"] = ["arbitrary_hook"]
+    with pytest.raises(InstallMetadataError, match="post-action"):
+        validate_install_provenance(concrete, tampered)
+
+    provenance_path = prefix / metadata["provenance_path"]
+    provenance_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(InstallMetadataError, match="manifest failed provenance verification"):
+        verify_install_provenance(concrete, prefix)
+
+
+def test_read_install_provenance_is_bounded(tmp_path):
+    """Reject oversized provenance before attempting JSON decoding."""
+    metadata = tmp_path / ".spack"
+    metadata.mkdir()
+    (metadata / "sandbox_provenance.json").write_bytes(b" " * (1024 * 1024 + 1))
+
+    with pytest.raises(InstallMetadataError, match="invalid sandbox install provenance file"):
+        read_install_provenance(tmp_path)
 
 
 @pytest.mark.use_package_hash

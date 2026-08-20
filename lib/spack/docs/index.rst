@@ -112,6 +112,7 @@ If you're new to Spack and want to start using it, see :doc:`getting_started`, o
    roles_and_responsibilities
    contribution_guide
    developer_guide
+   sandboxed_installer_provenance
    package_review_guide
 
 .. toctree::

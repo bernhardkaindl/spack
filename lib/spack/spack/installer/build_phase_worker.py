@@ -22,7 +22,11 @@ from spack.installer.install_metadata import (
     create_install_provenance,
     publish_install_metadata,
 )
-from spack.installer.install_tree import InstallTreeError, install_tree_metadata
+from spack.installer.install_tree import (
+    InstallTreeError,
+    install_tree_metadata,
+    validate_install_tree_metadata,
+)
 from spack.installer.post_actions import (
     PostActionError,
     run_post_actions,
@@ -91,21 +95,9 @@ def _repository_identities(repositories: List[Dict[str, Any]]) -> List[Dict[str,
 
 def _validate_install_tree_metadata(metadata: Any) -> None:
     """Validate bounded install-tree metadata returned by the worker."""
-    if not isinstance(metadata, dict) or set(metadata) != {"sha256", "entries", "bytes"}:
-        raise SandboxedBuildPhaseError("worker returned invalid install-tree metadata")
-    if (
-        not isinstance(metadata["sha256"], str)
-        or re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is None
-    ):
-        raise SandboxedBuildPhaseError("worker returned invalid install-tree metadata")
-    if (
-        not isinstance(metadata["entries"], int)
-        or isinstance(metadata["entries"], bool)
-        or metadata["entries"] < 1
-        or not isinstance(metadata["bytes"], int)
-        or isinstance(metadata["bytes"], bool)
-        or metadata["bytes"] < 0
-    ):
+    try:
+        validate_install_tree_metadata(metadata)
+    except InstallTreeError:
         raise SandboxedBuildPhaseError("worker returned invalid install-tree metadata")
 
 

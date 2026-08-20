@@ -7,6 +7,7 @@
 import hashlib
 import json
 import os
+import re
 import stat
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Tuple
@@ -18,6 +19,25 @@ MAX_INSTALL_TREE_ENTRIES = 1_000_000
 
 class InstallTreeError(spack.error.SpackError):
     """Raised when an install tree cannot be represented safely."""
+
+
+def validate_install_tree_metadata(metadata: Any) -> Dict[str, Any]:
+    """Validate and return a bounded canonical install-tree identity."""
+    if not isinstance(metadata, dict) or set(metadata) != {"sha256", "entries", "bytes"}:
+        raise InstallTreeError("invalid install-tree metadata")
+    if (
+        not isinstance(metadata["sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]) is None
+        or not isinstance(metadata["entries"], int)
+        or isinstance(metadata["entries"], bool)
+        or metadata["entries"] < 1
+        or metadata["entries"] > MAX_INSTALL_TREE_ENTRIES
+        or not isinstance(metadata["bytes"], int)
+        or isinstance(metadata["bytes"], bool)
+        or metadata["bytes"] < 0
+    ):
+        raise InstallTreeError("invalid install-tree metadata")
+    return metadata
 
 
 def verified_hardlink_inodes(root: Path) -> Dict[Tuple[int, int], int]:
