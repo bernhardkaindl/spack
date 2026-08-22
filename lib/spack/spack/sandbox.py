@@ -16,6 +16,7 @@ build jobservers.
 
 import ctypes
 import enum
+import errno
 import os
 import platform
 import stat
@@ -44,6 +45,54 @@ LANDLOCK_RULE_PATH_BENEATH = 1
 LANDLOCK_ACCESS_NET_BIND_TCP = 1 << 0
 LANDLOCK_ACCESS_NET_CONNECT_TCP = 1 << 1
 LANDLOCK_RESTRICT_SELF_TSYNC = 1 << 3
+SECCOMP_RET_ALLOW = 0x7FFF0000
+SECCOMP_RET_ERRNO = 0x00050000
+
+_SOCKET_SYSCALLS = (
+    "accept",
+    "accept4",
+    "bind",
+    "connect",
+    "getpeername",
+    "getsockname",
+    "getsockopt",
+    "listen",
+    "recvmmsg",
+    "recvfrom",
+    "recvmsg",
+    "sendmmsg",
+    "sendmsg",
+    "sendto",
+    "setsockopt",
+    "shutdown",
+    "socket",
+    "socketcall",
+    "socketpair",
+)
+
+_PROCESS_EXEC_SYSCALLS = ("clone", "clone3", "fork", "vfork", "execve", "execveat")
+
+_IPC_SYSCALLS = (
+    "ipc",
+    "semctl",
+    "semget",
+    "semop",
+    "semtimedop",
+    "shmat",
+    "shmctl",
+    "shmdt",
+    "shmget",
+    "msgctl",
+    "msgget",
+    "msgrcv",
+    "msgsnd",
+    "mq_open",
+    "mq_unlink",
+    "mq_timedsend",
+    "mq_timedreceive",
+    "mq_notify",
+    "mq_getsetattr",
+)
 
 
 class FSAccess(enum.IntFlag):
@@ -261,6 +310,83 @@ class LandlockSandbox(Sandbox):
             self._syscall_restrict_self(ruleset_fd, tsync_flag)
         finally:
             os.close(ruleset_fd)
+
+
+class SeccompSandbox:
+    """Deny dangerous syscall groups while preserving the Python runtime."""
+
+    def __init__(self, libc=None):
+        self.libc = libc if libc is not None else ctypes.CDLL(None, use_errno=True)
+        self.libseccomp = ctypes.CDLL("libseccomp.so.2", use_errno=True)
+        self.libseccomp.seccomp_init.argtypes = [ctypes.c_uint32]
+        self.libseccomp.seccomp_init.restype = ctypes.c_void_p
+        self.libseccomp.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+        self.libseccomp.seccomp_syscall_resolve_name.restype = ctypes.c_int
+        self.libseccomp.seccomp_rule_add.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint,
+        ]
+        self.libseccomp.seccomp_rule_add.restype = ctypes.c_int
+        self.libseccomp.seccomp_load.argtypes = [ctypes.c_void_p]
+        self.libseccomp.seccomp_load.restype = ctypes.c_int
+        self.libseccomp.seccomp_release.argtypes = [ctypes.c_void_p]
+        self.libseccomp.seccomp_release.restype = None
+
+    def _prctl_no_new_privs(self) -> None:
+        _check_syscall(
+            self.libc.prctl(
+                ctypes.c_int(PR_SET_NO_NEW_PRIVS),
+                ctypes.c_ulong(1),
+                ctypes.c_ulong(0),
+                ctypes.c_ulong(0),
+                ctypes.c_ulong(0),
+            ),
+            "prctl(PR_SET_NO_NEW_PRIVS)",
+        )
+
+    def _get_syscall_number(self, name: str) -> int:
+        return self.libseccomp.seccomp_syscall_resolve_name(name.encode("ascii"))
+
+    def _rule_add(self, context, syscall: int) -> None:
+        result = self.libseccomp.seccomp_rule_add(
+            context, ctypes.c_uint32(SECCOMP_RET_ERRNO | errno.EPERM), ctypes.c_int(syscall), 0
+        )
+        if result < 0:
+            raise OSError(-result, f"seccomp_rule_add({syscall}): {os.strerror(-result)}")
+
+    def _load(self, context) -> None:
+        result = self.libseccomp.seccomp_load(context)
+        if result < 0:
+            raise OSError(-result, f"seccomp_load: {os.strerror(-result)}")
+
+    def apply(
+        self, block_sockets: bool = True, block_process: bool = False, block_ipc: bool = False
+    ) -> None:
+        """Install an irreversible seccomp filter denying specified syscall groups."""
+        self._prctl_no_new_privs()
+
+        syscall_groups = []
+        if block_sockets:
+            syscall_groups.append(_SOCKET_SYSCALLS)
+        if block_process:
+            syscall_groups.append(_PROCESS_EXEC_SYSCALLS)
+        if block_ipc:
+            syscall_groups.append(_IPC_SYSCALLS)
+
+        context = self.libseccomp.seccomp_init(ctypes.c_uint32(SECCOMP_RET_ALLOW))
+        if not context:
+            raise OSError(errno.ENOMEM, "seccomp_init failed")
+        try:
+            for group in syscall_groups:
+                for name in group:
+                    syscall = self._get_syscall_number(name)
+                    if syscall >= 0:
+                        self._rule_add(context, syscall)
+            self._load(context)
+        finally:
+            self.libseccomp.seccomp_release(context)
 
 
 def get_sandbox() -> Sandbox:
