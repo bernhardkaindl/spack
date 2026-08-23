@@ -2,10 +2,13 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
+import functools
+import json
 import re
 
 import pytest
 
+import spack.cmd.info as info_command
 from spack.main import SpackCommand, SpackCommandError
 from spack.repo import UnknownPackageError
 
@@ -14,10 +17,69 @@ pytestmark = [pytest.mark.usefixtures("mock_packages")]
 info = SpackCommand("info")
 
 
+def test_info_uses_launcher_neutral_request(monkeypatch):
+    requests = []
+
+    def render(request):
+        requests.append(request)
+        return "package info\n"
+
+    def run_worker(request, worker, setup):
+        assert isinstance(setup, functools.partial)
+        assert setup.func is info_command.spack.sandbox.restrict_recipe_import
+        assert setup.keywords["repository_roots"]
+        return worker(request)
+
+    monkeypatch.setattr(info_command, "render_package_info", render)
+    monkeypatch.setattr(info_command.spack.util.sandbox, "run_json_worker", run_worker)
+    monkeypatch.setattr(
+        info_command.spack.sandbox, "recipe_import_sandbox_available", lambda: True
+    )
+
+    assert info("zlib") == "package info\n"
+    json.dumps(requests[0])
+    assert requests[0]["spec"] == ["zlib"]
+    assert isinstance(requests[0]["color"], bool)
+
+
+def test_info_falls_back_without_recipe_import_sandbox(monkeypatch):
+    monkeypatch.setattr(
+        info_command.spack.sandbox, "recipe_import_sandbox_available", lambda: False
+    )
+    monkeypatch.setattr(
+        info_command.spack.util.sandbox,
+        "run_json_worker",
+        lambda request, worker, setup: pytest.fail("worker should not start"),
+    )
+    monkeypatch.setattr(info_command, "render_package_info", lambda request: "package info\n")
+
+    assert info_command.render_package_info_worker({"spec": ["zlib"]}) == "package info\n"
+
+
+def test_info_rejects_nonstring_worker_response(monkeypatch):
+    monkeypatch.setattr(
+        info_command.spack.util.sandbox, "run_json_worker", lambda request, worker, setup: []
+    )
+
+    with pytest.raises(ValueError, match="must be a string"):
+        info_command.render_package_info_worker({"spec": ["zlib"]})
+
+
 def test_package_suggestion():
     with pytest.raises(UnknownPackageError) as exc_info:
         info("vtk")
     assert "Did you mean one of the following packages?" in str(exc_info.value)
+
+
+def test_unknown_package_does_not_start_worker(monkeypatch):
+    monkeypatch.setattr(
+        info_command.spack.util.sandbox,
+        "run_json_worker",
+        lambda request, worker, setup: pytest.fail("worker should not start"),
+    )
+
+    with pytest.raises(UnknownPackageError):
+        info("vtk")
 
 
 def test_deprecated_option_warns():

@@ -246,6 +246,11 @@ properties: Dict[str, Any] = {
                         "type": "boolean",
                         "description": "Allow TCP network access during the build phase.",
                     },
+                    "allow_fallback": {
+                        "type": "boolean",
+                        "description": "Allow sandboxed commands to use their trusted direct "
+                        "path when worker confinement is unavailable.",
+                    },
                     "allow_read": {
                         "type": "array",
                         "items": {"type": "string"},

@@ -5,6 +5,9 @@
 
 import argparse
 import collections
+import contextlib
+import functools
+import io
 import shutil
 import sys
 import textwrap
@@ -18,8 +21,11 @@ import spack.deptypes as dt
 import spack.fetch_strategy as fs
 import spack.install_test
 import spack.package_base
+import spack.paths
 import spack.repo
+import spack.sandbox
 import spack.spec
+import spack.util.sandbox
 import spack.variant
 import spack.version
 from spack.cmd.common import arguments
@@ -39,6 +45,32 @@ plain_format = "@."
 #: Allow at least this much room for values when formatting definitions
 #: Wrap after a long variant name/condition if we need to do so to preserve this width.
 MIN_VALUES_WIDTH = 30
+
+_INFO_OPTION_NAMES = (
+    "all",
+    "by_name",
+    "detectable",
+    "maintainers",
+    "namespace",
+    "no_dependencies",
+    "no_variants",
+    "no_versions",
+    "phases",
+    "tags",
+    "tests",
+    "virtuals",
+)
+
+
+class _InfoBuffer(io.StringIO):
+    """Text buffer that preserves the parent command's resolved color behavior."""
+
+    def __init__(self, color: bool) -> None:
+        super().__init__()
+        self.color = color
+
+    def isatty(self) -> bool:
+        return self.color
 
 
 class Formatter:
@@ -95,7 +127,6 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
     subparser.add_argument(
         "-a", "--all", action="store_true", default=False, help="output all package information"
     )
-
     by = subparser.add_mutually_exclusive_group()
     by.add_argument(
         "--by-name",
@@ -634,14 +665,8 @@ def print_virtuals(pkg: PackageBase, args: Namespace) -> None:
         color.cprint("    None")
 
 
-def info(parser: argparse.ArgumentParser, args: Namespace) -> None:
-    specs = spack.cmd.parse_specs(args.spec)
-    if len(specs) > 1:
-        args.subparser.error(f"requires exactly one spec, got {len(specs)}")
-    if len(specs) == 0:
-        args.subparser.error("requires a spec")
-
-    spec = specs[0]
+def _print_package_info(spec: spack.spec.Spec, args: Namespace) -> None:
+    """Render package information to the current standard output stream."""
     pkg_cls = spack.repo.PATH.get_pkg_class(spec.fullname)
     pkg_cls.validate_variant_names(spec)
     pkg = pkg_cls(spec)
@@ -681,3 +706,61 @@ def info(parser: argparse.ArgumentParser, args: Namespace) -> None:
     print_dependency_suggestion(pkg)
 
     color.cprint("")
+
+
+def render_package_info(request: Dict[str, Any]) -> str:
+    """Return rendered package information for a launcher-neutral request."""
+    specs = spack.cmd.parse_specs(request["spec"])
+    if len(specs) != 1:
+        raise ValueError(f"package info requires exactly one spec, got {len(specs)}")
+
+    output = _InfoBuffer(request["color"])
+    args = Namespace(**request["options"])
+    with contextlib.redirect_stdout(output):
+        _print_package_info(specs[0], args)
+    return output.getvalue()
+
+
+def render_package_info_worker(request: Dict[str, Any]) -> str:
+    """Render package information through the sandbox worker."""
+    if not spack.sandbox.recipe_import_sandbox_available():
+        return render_package_info(request)
+
+    repository_roots = []
+    for repo in spack.repo.PATH.repos:
+        repository_roots.append(repo.root)
+        if repo.python_path:
+            repository_roots.append(repo.python_path)
+    read_roots = repository_roots + [spack.paths.lib_path]
+    rendered = spack.util.sandbox.run_json_worker(
+        request,
+        render_package_info,
+        setup=functools.partial(spack.sandbox.restrict_recipe_import, repository_roots=read_roots),
+    )
+    if not isinstance(rendered, str):
+        raise ValueError("package info renderer response must be a string")
+    return rendered
+
+
+def _ensure_package_exists(spec: spack.spec.Spec) -> None:
+    """Raise the normal unknown-package error without importing a recipe."""
+    repo = spack.repo.PATH.repo_for_pkg(spec)
+    if not repo.exists(spec.name):
+        raise spack.repo.UnknownPackageError(spec.fullname)
+
+
+def info(parser: argparse.ArgumentParser, args: Namespace) -> None:
+    specs = spack.cmd.parse_specs(args.spec)
+    if len(specs) > 1:
+        args.subparser.error(f"requires exactly one spec, got {len(specs)}")
+    if len(specs) == 0:
+        args.subparser.error("requires a spec")
+
+    _ensure_package_exists(specs[0])
+
+    request = {
+        "spec": list(args.spec),
+        "options": {name: bool(getattr(args, name)) for name in _INFO_OPTION_NAMES},
+        "color": color.get_color_when(),
+    }
+    sys.stdout.write(render_package_info_worker(request))

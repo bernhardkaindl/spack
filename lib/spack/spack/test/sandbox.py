@@ -12,6 +12,7 @@ if sys.platform != "linux":
 
 import os
 import pathlib
+import socket
 import tempfile
 from typing import List, Tuple
 
@@ -19,6 +20,7 @@ import spack.concretize
 import spack.sandbox
 import spack.store
 from spack.installer.build import _enable_sandbox
+from spack.util.sandbox import run_json_worker
 
 
 class SpyLandlockSandbox(spack.sandbox.LandlockSandbox):
@@ -109,22 +111,145 @@ def test_landlock_sandbox_syscall_args(tmp_path: pathlib.Path):
     assert sandbox.prctl_called
 
 
-def test_landlock_sandbox_network_args():
-    """Test that block_network=True sets the correct net flags in the ruleset."""
+def test_landlock_sandbox_network_uses_internal_seccomp(monkeypatch):
+    """Test that network blocking uses seccomp instead of Landlock TCP rules."""
     sandbox = SpyLandlockSandbox(abi_version=4)
+    seccomp = MockSeccompSandbox()
+    monkeypatch.setattr(spack.sandbox, "SeccompSandbox", lambda: seccomp)
     sandbox.apply(block_network=True)
 
     [(_, net_flags)] = sandbox.create_ruleset_calls
-    assert net_flags & spack.sandbox.LANDLOCK_ACCESS_NET_CONNECT_TCP
-    assert net_flags & spack.sandbox.LANDLOCK_ACCESS_NET_BIND_TCP
+    assert net_flags == 0
+    assert seccomp.apply_calls == 1
+    assert seccomp.block_sockets
     assert sandbox.prctl_called
+
+
+def test_recipe_import_sandbox_policy(monkeypatch):
+    sandbox = MockSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    rlimits = []
+    monkeypatch.setattr(
+        spack.sandbox, "set_recipe_import_rlimits", lambda limit: rlimits.append(limit)
+    )
+
+    spack.sandbox.restrict_recipe_import(["/tmp", "/var"])
+
+    assert sandbox.read_calls == [
+        (pathlib.Path("/tmp").absolute(), pathlib.Path("/tmp").resolve()),
+        (pathlib.Path("/var").absolute(), pathlib.Path("/var").resolve()),
+    ]
+    assert sandbox.write_calls == []
+    assert sandbox.apply_calls == [(True, True, True, False)]
+    assert rlimits == [1024 * 1024 * 1024]
+
+
+def test_network_worker_sandbox_policy(monkeypatch):
+    sandbox = MockSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    rlimits = []
+    monkeypatch.setattr(
+        spack.sandbox, "set_network_worker_rlimits", lambda limit: rlimits.append(limit)
+    )
+
+    spack.sandbox.restrict_network_worker(["/tmp"], ["/var"])
+
+    assert sandbox.read_calls == [
+        (pathlib.Path("/tmp").absolute(), pathlib.Path("/tmp").resolve())
+    ]
+    assert sandbox.write_calls == [
+        (pathlib.Path("/var").absolute(), pathlib.Path("/var").resolve())
+    ]
+    assert sandbox.apply_calls == [(False, True, True, False)]
+    assert rlimits == [1024 * 1024 * 1024]
+
+
+def test_recipe_import_sandbox_availability_honors_fallback(monkeypatch):
+    monkeypatch.setattr(
+        spack.sandbox,
+        "get_recipe_import_sandbox",
+        lambda: (_ for _ in ()).throw(spack.sandbox.SandboxError("unavailable")),
+    )
+    monkeypatch.setattr(spack.sandbox, "sandbox_fallback_allowed", lambda: True)
+
+    assert not spack.sandbox.recipe_import_sandbox_available()
+
+
+def test_sandbox_fallback_config(mutable_config):
+    assert not spack.sandbox.sandbox_fallback_allowed()
+
+    mutable_config.set("config:sandbox:allow_fallback", True)
+
+    assert spack.sandbox.sandbox_fallback_allowed()
+
+
+def test_recipe_import_sandbox_non_linux_uses_configured_fallback(monkeypatch):
+    monkeypatch.setattr(spack.sandbox.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(spack.sandbox, "sandbox_fallback_allowed", lambda: True)
+    monkeypatch.setattr(
+        spack.sandbox,
+        "get_recipe_import_sandbox",
+        lambda: pytest.fail("Landlock should not be probed"),
+    )
+    monkeypatch.setattr(
+        spack.sandbox, "SeccompSandbox", lambda: pytest.fail("seccomp should not be probed")
+    )
+
+    assert not spack.sandbox.recipe_import_sandbox_available()
+
+
+def test_recipe_import_sandbox_non_linux_fails_without_fallback(monkeypatch):
+    monkeypatch.setattr(spack.sandbox.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(spack.sandbox, "sandbox_fallback_allowed", lambda: False)
+
+    with pytest.raises(spack.sandbox.SandboxError, match="only supported on Linux"):
+        spack.sandbox.recipe_import_sandbox_available()
+
+
+def test_recipe_import_sandbox_allows_pre_v4_landlock(monkeypatch):
+    sandbox = MockSandbox()
+    sandbox.abi_version = 1
+    monkeypatch.setattr(spack.sandbox, "get_recipe_import_sandbox", lambda: sandbox)
+
+    assert spack.sandbox.recipe_import_sandbox_available()
+
+
+def test_recipe_import_sandbox_falls_back_without_seccomp(monkeypatch):
+    sandbox = MockSandbox()
+    sandbox.network_isolation_result = False
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    monkeypatch.setattr(spack.sandbox, "sandbox_fallback_allowed", lambda: True)
+
+    assert not spack.sandbox.recipe_import_sandbox_available()
+
+
+def test_recipe_import_sandbox_requires_full_network_isolation(monkeypatch):
+    sandbox = MockSandbox()
+    sandbox.network_isolation_result = False
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    monkeypatch.setattr(spack.sandbox, "sandbox_fallback_allowed", lambda: False)
+
+    with pytest.raises(spack.sandbox.SandboxError, match="network isolation"):
+        spack.sandbox.recipe_import_sandbox_available()
+
+
+def test_landlock_sandbox_uses_tcp_fallback_when_seccomp_load_fails(monkeypatch):
+    sandbox = SpyLandlockSandbox(abi_version=4)
+    seccomp = FailingSeccompSandbox()
+    monkeypatch.setattr(spack.sandbox, "SeccompSandbox", lambda: seccomp)
+
+    sandbox.apply(block_network=True, allow_tcp_network_fallback=True)
+    assert [net_flags for _, net_flags in sandbox.create_ruleset_calls] == [0, 3]
+    assert seccomp.apply_calls == 1
 
 
 class MockSandbox(spack.sandbox.Sandbox):
     def __init__(self):
+        self.abi_version = 4
         self.read_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
         self.write_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
-        self.apply_calls: List[bool] = []
+        self.apply_calls = []
+        self.network_isolation_result = True
 
     def _allow_read(self, original: pathlib.Path, resolved: pathlib.Path):
         self.read_calls.append((original, resolved))
@@ -132,8 +257,39 @@ class MockSandbox(spack.sandbox.Sandbox):
     def _allow_write(self, original: pathlib.Path, resolved: pathlib.Path):
         self.write_calls.append((original, resolved))
 
-    def apply(self, block_network=False):
-        self.apply_calls.append(block_network)
+    def network_isolation_available(self, allow_tcp_network_fallback=False):
+        return self.network_isolation_result
+
+    def apply(
+        self,
+        block_network=False,
+        block_process=False,
+        block_ipc=False,
+        allow_tcp_network_fallback=False,
+    ):
+        self.apply_calls.append(
+            (block_network, block_process, block_ipc, allow_tcp_network_fallback)
+        )
+
+
+class MockSeccompSandbox:
+    def __init__(self):
+        self.apply_calls = 0
+        self.block_sockets = None
+        self.block_process = None
+        self.block_ipc = None
+
+    def apply(self, block_sockets=True, block_process=False, block_ipc=False):
+        self.apply_calls += 1
+        self.block_sockets = block_sockets
+        self.block_process = block_process
+        self.block_ipc = block_ipc
+
+
+class FailingSeccompSandbox(MockSeccompSandbox):
+    def apply(self, block_sockets=True, block_process=False, block_ipc=False):
+        super().apply(block_sockets, block_process, block_ipc)
+        raise OSError("seccomp_load failed")
 
 
 def test_enable_sandbox_paths(
@@ -192,14 +348,58 @@ def test_enable_sandbox_paths(
     assert custom_write.resolve() in allow_write_resolved
     assert pathlib.Path(tempfile.gettempdir()).resolve() in allow_write_resolved
 
-    assert mock_sandbox.apply_calls == [False]
+    assert mock_sandbox.apply_calls == [(False, False, False, False)]
 
 
-def test_sandbox_network_blocking_requires_abi_v4():
-    """Test that blocking network access on an older kernel raises a RuntimeError."""
+def test_sandbox_tcp_network_fallback_requires_abi_v4(monkeypatch):
+    """Test that the Landlock TCP fallback requires ABI v4."""
     sandbox = SpyLandlockSandbox(abi_version=3)
+    monkeypatch.setattr(
+        spack.sandbox, "SeccompSandbox", lambda: (_ for _ in ()).throw(OSError("unavailable"))
+    )
 
-    with pytest.raises(
-        spack.sandbox.SandboxError, match="Blocking network access requires Landlock ABI v4\\+"
-    ):
-        sandbox.apply(block_network=True)
+    with pytest.raises(spack.sandbox.SandboxError, match="Seccomp sandboxing is unavailable"):
+        sandbox.apply(block_network=True, allow_tcp_network_fallback=True)
+
+
+def test_recipe_import_sandbox_denies_writes_and_socket_communication(tmp_path):
+    try:
+        sandbox = spack.sandbox.get_recipe_import_sandbox()
+        if not sandbox.network_isolation_available():
+            pytest.skip("recipe-import network isolation is unavailable")
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    write_path = tmp_path / "denied"
+
+    def worker(request):
+        try:
+            write_path.write_text("denied")
+        except OSError as error:
+            write_errno = error.errno
+        else:
+            write_errno = None
+
+        socket_errnos = []
+        for family, socket_type, protocol in (
+            (socket.AF_INET, socket.SOCK_STREAM, 0),
+            (socket.AF_INET, socket.SOCK_DGRAM, 0),
+            (socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP),
+            (socket.AF_UNIX, socket.SOCK_STREAM, 0),
+        ):
+            try:
+                network_socket = socket.socket(family, socket_type, protocol)
+            except OSError as error:
+                socket_errnos.append(error.errno)
+            else:
+                network_socket.close()
+                socket_errnos.append(None)
+
+        return {"socket_errnos": socket_errnos, "write_errno": write_errno}
+
+    repository_root = pathlib.Path(__file__).parents[4]
+    result = run_json_worker(
+        {}, worker, setup=lambda: spack.sandbox.restrict_recipe_import([repository_root])
+    )
+    assert result["write_errno"] in (1, 13)
+    assert all(error_number in (1, 13) for error_number in result["socket_errnos"])
