@@ -4,6 +4,8 @@
 
 import argparse
 import pathlib
+from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +22,151 @@ from spack.stage import interactive_version_filter
 from spack.version import Version
 
 spack_checksum = SpackCommand("checksum")
+
+
+def test_checksum_requires_network_worker_without_fallback(monkeypatch):
+    monkeypatch.setattr(spack.sandbox, "network_supervision_available", lambda: False)
+    monkeypatch.setattr(spack.sandbox, "sandbox_fallback_allowed", lambda: False)
+
+    with pytest.raises(spack.sandbox.SandboxError, match="network supervision.*disabled"):
+        spack.cmd.checksum.checksum(None, Namespace(package="zlib"))
+
+
+def test_checksum_uses_trusted_path_with_fallback(monkeypatch):
+    args = Namespace(package="zlib")
+    monkeypatch.setattr(spack.sandbox, "network_supervision_available", lambda: False)
+    monkeypatch.setattr(spack.sandbox, "sandbox_fallback_allowed", lambda: True)
+    monkeypatch.setattr(spack.cmd.checksum, "_direct_checksum_package", lambda args: None)
+    monkeypatch.setattr(spack.cmd.checksum, "_checksum_in_process", lambda args: "direct")
+
+    assert spack.cmd.checksum.checksum(None, args) == "direct"
+
+
+def test_checksum_uses_network_worker_when_supported(monkeypatch):
+    args = Namespace(package="zlib")
+    package = SimpleNamespace()
+    monkeypatch.setattr(spack.sandbox, "network_supervision_available", lambda: True)
+    monkeypatch.setattr(
+        spack.cmd.checksum, "_network_checksum_package", lambda args: (package, {}, set())
+    )
+
+    def checksum_urls(actual_package, spec, actual_args, urls, changed, network_worker=False):
+        assert actual_package is package
+        assert actual_args is args
+        assert spec == spack.spec.Spec("zlib")
+        assert network_worker
+        return "worker"
+
+    monkeypatch.setattr(spack.cmd.checksum, "_checksum_urls", checksum_urls)
+
+    assert spack.cmd.checksum.checksum(None, args) == "worker"
+
+
+def test_direct_checksum_uses_recipe_worker(monkeypatch):
+    request = {}
+
+    def run_worker(worker_request, worker, setup):
+        request.update(worker_request)
+        assert worker is spack.cmd.checksum._checksum_direct_url_discovery
+        assert setup is not None
+        return {
+            "deprecated": [],
+            "download_instr": "",
+            "fetch_options": {},
+            "manual_download": False,
+            "name": "zlib",
+            "urls": {"1.0": ["https://example.com/zlib-1.0.tar.gz"]},
+            "versions": {"1.0": "abc"},
+        }
+
+    monkeypatch.setattr(spack.sandbox, "recipe_import_sandbox_available", lambda: True)
+    monkeypatch.setattr(spack.util.sandbox, "run_json_worker", run_worker)
+    monkeypatch.setattr(spack.util.web, "url_exists", lambda url: True)
+
+    args = Namespace(latest=False, package="zlib", preferred=False, versions=["1.0"])
+    package, urls = spack.cmd.checksum._direct_checksum_package(args)
+
+    assert request == {"package": "zlib", "preferred": False, "versions": ["1.0"]}
+    assert package.name == "zlib"
+    assert urls == {Version("1.0"): "https://example.com/zlib-1.0.tar.gz"}
+
+
+def test_direct_checksum_falls_back_without_recipe_import_sandbox(monkeypatch):
+    monkeypatch.setattr(spack.sandbox, "recipe_import_sandbox_available", lambda: False)
+    monkeypatch.setattr(
+        spack.util.sandbox,
+        "run_json_worker",
+        lambda request, worker, setup: pytest.fail("worker should not start"),
+    )
+
+    args = Namespace(latest=False, package="zlib", preferred=False, versions=["1.0"])
+    assert spack.cmd.checksum._direct_checksum_package(args) is None
+
+
+def test_network_checksum_package_uses_supervised_worker(monkeypatch):
+    calls = []
+
+    def run_worker(request, worker, policy, setup):
+        calls.append((request, worker, policy, setup))
+        return {
+            "deprecated": ["1.0"],
+            "download_instr": "",
+            "fetch_options": {},
+            "manual_download": False,
+            "name": "zlib",
+            "url_changed": [],
+            "urls": {"1.0": "https://example.com/zlib-1.0.tar.gz"},
+            "versions": {"1.0": "abc"},
+        }
+
+    monkeypatch.setattr(spack.util.sandbox, "run_json_worker_with_network", run_worker)
+    args = Namespace(latest=False, package="zlib", preferred=False, versions=["1.0"])
+
+    package, urls, changed = spack.cmd.checksum._network_checksum_package(args)
+
+    assert calls[0][0] == {
+        "latest": False,
+        "package": "zlib",
+        "preferred": False,
+        "versions": ["1.0"],
+    }
+    assert calls[0][1] is spack.cmd.checksum._checksum_network_discovery
+    assert calls[0][3] is spack.cmd.checksum._network_worker_setup
+    assert package.name == "zlib"
+    assert urls == {Version("1.0"): "https://example.com/zlib-1.0.tar.gz"}
+    assert changed == set()
+
+
+def test_checksum_urls_uses_supervised_fetch_worker(monkeypatch, capsys):
+    requests = []
+
+    def run_worker(request, worker, policy, setup):
+        requests.append(request)
+        assert worker is spack.cmd.checksum._checksum_network_fetch
+        return {"1.0": "abc"}
+
+    monkeypatch.setattr(spack.util.sandbox, "run_json_worker_with_network", run_worker)
+    package = SimpleNamespace(fetch_options={}, name="zlib", versions={})
+    args = Namespace(add_to_package=False, batch=True, keep_stage=False, verify=False)
+
+    spack.cmd.checksum._checksum_urls(
+        package,
+        spack.spec.Spec("zlib"),
+        args,
+        {Version("1.0"): "https://example.com/zlib-1.0.tar.gz"},
+        set(),
+        network_worker=True,
+    )
+
+    assert requests == [
+        {
+            "fetch_options": {},
+            "keep_stage": False,
+            "name": "zlib",
+            "urls": {"1.0": "https://example.com/zlib-1.0.tar.gz"},
+        }
+    ]
+    assert 'version("1.0", sha256="abc")' in capsys.readouterr().out
 
 
 @pytest.fixture

@@ -178,6 +178,9 @@ config:
   # only works with the new installer.
   sandbox:
     enable: false
+    # Allow sandboxed commands to use their trusted direct implementation when
+    # worker confinement is unavailable.
+    allow_fallback: false
     # Allow TCP network access during the build phase.
     allow_network: true
     # Additional paths with read and execute permissions.
