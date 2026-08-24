@@ -156,6 +156,32 @@ def _is_node_in_table(node: nodes.Node) -> bool:
     return False
 
 
+def _is_in_list_table_body(src_lines: List[str], line: int) -> bool:
+    """Return whether a one-based source line is inside a ``list-table`` body.
+
+    Docutils does not consistently retain the table as a paragraph ancestor while
+    parsing list-table cells. Reindenting those paragraphs breaks the directive.
+    """
+    source_line = src_lines[line - 1]
+    current_indent = len(source_line) - len(source_line.lstrip())
+
+    for index in range(line - 2, -1, -1):
+        candidate = src_lines[index]
+        if not candidate.lstrip().startswith(".. list-table::"):
+            continue
+
+        directive_indent = len(candidate) - len(candidate.lstrip())
+        if current_indent <= directive_indent:
+            return False
+
+        for body_line in src_lines[index + 1 : line - 1]:
+            if body_line.strip() and len(body_line) - len(body_line.lstrip()) <= directive_indent:
+                return False
+        return True
+
+    return False
+
+
 def _is_glossary_term_paragraph(node: nodes.Node) -> bool:
     """A paragraph that is a direct child of a ``glossary`` container is a misparsed
     multi-term alias group (e.g. ``package`` / ``recipe``). Definition bodies live one
@@ -239,6 +265,7 @@ def _format_paragraphs(document: nodes.document, path: str, src_lines: List[str]
         if p.line is not None
         and p.rawsource
         and not _is_node_in_table(p)
+        and not _is_in_list_table_body(src_lines, p.line)
         and not _is_glossary_term_paragraph(p)
     ]
 
