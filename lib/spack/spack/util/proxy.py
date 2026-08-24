@@ -22,7 +22,13 @@ import urllib.parse
 from typing import Callable, FrozenSet, Iterable, NamedTuple, Optional, Tuple
 
 import spack.util.tty as tty
-from spack.sandbox import SECCOMP_ADDFD_FLAG_SEND, SeccompNotification, SeccompSandbox, pidfd_getfd
+from spack.sandbox import (
+    SECCOMP_ADDFD_FLAG_SEND,
+    SeccompNotification,
+    SeccompSandbox,
+    pidfd_getfd,
+    pidfd_open,
+)
 
 
 class ProxyPolicyError(ValueError):
@@ -187,6 +193,7 @@ class LocalHTTPProxy:
         credential: str,
         timeout: float = 30.0,
         denial_logger: Optional[Callable[[Destination, str], None]] = None,
+        request_logger: Optional[Callable[[Destination, bool], None]] = None,
         address_allowed: Callable[[str], bool] = global_address,
     ):
         if not credential:
@@ -195,6 +202,7 @@ class LocalHTTPProxy:
         self.credential = credential
         self.timeout = timeout
         self.denial_logger = denial_logger or self._log_denial
+        self.request_logger = request_logger
         self.address_allowed = address_allowed
         self._server: Optional[_ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -220,6 +228,14 @@ class LocalHTTPProxy:
         return "http://{0}:{1}@{2}".format(
             _PROXY_USERNAME, urllib.parse.quote(self.credential, safe=""), self.url[7:]
         )
+
+    @property
+    def address(self) -> Tuple[str, int]:
+        """Return the bound loopback address used by the socket supervisor."""
+        if self._server is None:
+            raise RuntimeError("proxy is not running")
+        host, port = self._server.server_address[:2]
+        return host, port
 
     def bind(self) -> None:
         """Bind an ephemeral IPv4 loopback listener without starting a thread."""
@@ -439,7 +455,12 @@ class LocalHTTPProxy:
                 return Destination("https", host, port)
 
             def _authorize(self, destination: Destination) -> bool:
-                if proxy.policy.allows(destination.scheme, destination.host, destination.port):
+                allowed = proxy.policy.allows(
+                    destination.scheme, destination.host, destination.port
+                )
+                if proxy.request_logger is not None:
+                    proxy.request_logger(destination, allowed)
+                if allowed:
                     return True
                 proxy.denial_logger(destination, "destination is not authorized")
                 self.send_error(403, "proxy destination denied")
@@ -521,6 +542,7 @@ class ConnectSupervisor:
         seccomp: Optional[SeccompSandbox] = None,
         duplicate_fd: Callable[[int, int], int] = pidfd_getfd,
         thread_group_id: Callable[[int, Callable[[], bool]], Optional[int]] = _thread_group_id,
+        executable_logger: Optional[Callable[[str], None]] = None,
     ):
         self.listener_fd = listener_fd
         self.worker_pid = worker_pid
@@ -530,14 +552,26 @@ class ConnectSupervisor:
         self.seccomp = seccomp or SeccompSandbox()
         self.duplicate_fd = duplicate_fd
         self.thread_group_id = thread_group_id
+        self.executable_logger = executable_logger
         self._connect_syscall = self.seccomp._get_syscall_number("connect")
         self._socket_syscall = self.seccomp._get_syscall_number("socket")
+        self._exec_syscalls = (
+            {
+                self.seccomp._get_syscall_number("execve"),
+                self.seccomp._get_syscall_number("execveat"),
+            }
+            if executable_logger is not None
+            else set()
+        )
 
     def handle_once(self) -> None:
         """Receive and answer one connect notification without continuing it."""
         notification = self.seccomp.receive_notification(self.listener_fd)
         if notification.data.nr == self._socket_syscall:
             self._handle_socket(notification)
+            return
+        if notification.data.nr in self._exec_syscalls and self.executable_logger is not None:
+            self._handle_exec(notification)
             return
         error = self._handle(notification)
         try:
@@ -560,6 +594,19 @@ class ConnectSupervisor:
                         return
                     raise
 
+    def _handle_exec(self, notification: SeccompNotification) -> None:
+        try:
+            path = self.seccomp.resolved_executable_path(notification)
+            self.executable_logger(path)
+        except (OSError, UnicodeError):
+            pass
+        finally:
+            try:
+                if self.seccomp.notification_is_valid(self.listener_fd, notification.id):
+                    self.seccomp.continue_notification(self.listener_fd, notification.id)
+            except OSError:
+                pass
+
     def _handle(self, notification: SeccompNotification) -> int:
         if not self._notification_is_from_worker(notification):
             return errno.EPERM
@@ -569,10 +616,16 @@ class ConnectSupervisor:
             return errno.ENOENT
 
         target_fd = notification.data.args[0]
+        notification_pidfd = self.pidfd
         try:
-            duplicated_fd = self.duplicate_fd(self.pidfd, target_fd)
+            if notification.pid != self.worker_pid:
+                notification_pidfd = pidfd_open(notification.pid)
+            duplicated_fd = self.duplicate_fd(notification_pidfd, target_fd)
         except OSError as error:
             return error.errno or errno.EBADF
+        finally:
+            if notification_pidfd != self.pidfd:
+                os.close(notification_pidfd)
         try:
             return self._connect_to_proxy(duplicated_fd, notification.id)
         finally:

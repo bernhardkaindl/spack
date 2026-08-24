@@ -8,6 +8,7 @@ import os
 import spack.cmd
 import spack.config
 import spack.environment as ev
+import spack.install_worker
 import spack.package_base
 import spack.store
 import spack.traverse
@@ -115,7 +116,12 @@ def _stage_env(env: ev.Environment, filter):
 def _stage(pkg: spack.package_base.PackageBase):
     # Use context manager to ensure we don't restage while an installation is in progress
     # keep = True ensures that the stage is not removed after exiting the context manager
-    pkg.stage.keep = True
-    with pkg.stage:
-        pkg.do_stage()
-    tty.msg(f"Staged {pkg.name} in {pkg.stage.path}")
+    selection = spack.install_worker.select_execution()
+    if selection.mode == spack.install_worker.WORKER:
+        stage_path = spack.install_worker.stage_package(pkg)
+    else:
+        pkg.stage.keep = True
+        with pkg.stage:
+            pkg.do_stage()
+        stage_path = pkg.stage.path
+    tty.msg(f"Staged {pkg.name} in {stage_path}")
