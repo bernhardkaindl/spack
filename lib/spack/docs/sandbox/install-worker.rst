@@ -137,14 +137,12 @@ Grant stage-root write access, parent-selected package inputs, and proxy configu
 Use ``run_json_worker_with_network`` or a narrow evolution of that mechanism.
 Do not recreate proxy or fetch logic.
 
-Normal staging may invoke only individually resolved ``tar``, ``unzip``, ``patch``, compression
-fallback tools, and subordinate helpers such as GNU tar's ``gunzip`` and its shell interpreter.
-Their loader/library paths are readable.  For a tool selected from the concrete DAG, only that
-tool's link/run dependency closure is added; an unselected executable remains inaccessible.
-Stage and build workers currently impose no installer memory ceiling because package builds can
-legitimately require most of a large host.  They retain limits inherited from the invoking process or
-service.  Future adaptive admission and throttling have a dedicated planning page in the sandbox
-documentation.
+Normal staging may invoke only individually resolved ``tar``, ``unzip``, ``patch``, compression fallback tools, and subordinate helpers such as GNU tar's ``gunzip`` and its shell interpreter.
+Their loader/library paths are readable.
+For a tool selected from the concrete DAG, only that tool's link/run dependency closure is added; an unselected executable remains inaccessible.
+Stage and build workers currently impose no installer memory ceiling because package builds can legitimately require most of a large host.
+They retain limits inherited from the invoking process or service.
+Future adaptive admission and throttling have a dedicated planning page in the sandbox documentation.
 
 Preserve:
 
@@ -197,10 +195,14 @@ The parent derives capabilities from the concrete spec and trusted configuration
 Discover compiler drivers dynamically from concrete ``c``, ``cxx``, and ``fortran`` virtual edges.
 Query each selected driver for subordinate programs and plugin files.
 Do not grant compiler directories wholesale.
-The Linux system-tool baseline is derived from real package builds and allows tools only as
-individual resolved paths.  Its fixed host reads are ``/lib``, ``/lib64``, ``/usr/lib``,
-``/usr/lib64``, dynamic-loader configuration, ``/proc/cpuinfo``, distribution and MIME metadata,
-``/bin/sh``, and ``/usr/include`` when a selected compiler resolves below ``/usr``.
+The Linux system-tool baseline is derived from real package builds and allows tools only as individual resolved paths.
+Its fixed host reads include ``/lib``, ``/lib64``, ``/usr/lib``, ``/usr/lib64``, dynamic-loader configuration, ``/proc/cpuinfo``, distribution and MIME metadata, and ``/bin/sh``.
+System compilers do not receive a recursive ``/usr/include`` grant.
+The trusted, shipped ``share/spack/sandbox/linux-header-policy.yaml`` file lists individual glibc headers and glibc and Linux UAPI subdirectories relative to the system include root.
+The listed glibc-compatible files include ``crypt.h`` because Perl requires the libxcrypt interface while bootstrapping, and making libxcrypt a build dependency would introduce a dependency cycle.
+Spack expands target-specific entries using the GCC installation tuple reported by selected compiler drivers and grants only one compatible libstdc++ version.
+Missing policy paths are ignored, so the same immutable policy supports different glibc-based Linux distribution layouts without querying ``dpkg``, RPM, APK, or another package manager at runtime.
+Missing, malformed, or unsupported policy data fails sandbox setup instead of restoring broad header access.
 Every added tool or path requires a focused test demonstrating why it is needed.
 
 An optional alpha learning mode may propose package-specific executable grants.
@@ -208,13 +210,10 @@ It is disabled by default and must name an already loaded configuration file as 
 The trusted installer parent, never package code, updates that file through Spack's structured configuration API.
 Learned entries use package-name selectors and individually resolved executable paths; they never grant an executable's parent directory.
 
-Learning mode also routes build-phase TCP through an invocation-scoped proxy owned by the trusted
-installer parent.  It permits public HTTP, HTTPS, and FTP destinations for discovery, warns
-immediately for each new canonical destination, and prints a deduplicated package summary after the
-build attempt.  The parent records each destination in a reusable ``network-allow-<host>`` group and
-adds the package-name selector.  Outside learning mode, only matching network groups may use the
-proxy; builds never receive direct socket access unless the explicit legacy ``allow_network`` option
-is enabled.
+Learning mode also routes build-phase TCP through an invocation-scoped proxy owned by the trusted installer parent.
+It permits public HTTP, HTTPS, and FTP destinations for discovery, warns immediately for each new canonical destination, and prints a deduplicated package summary after the build attempt.
+The parent records each destination in a reusable ``network-allow-<host>`` group and adds the package-name selector.
+Outside learning mode, only matching network groups may use the proxy; builds never receive direct socket access unless the explicit legacy ``allow_network`` option is enabled.
 
 Landlock does not report denied paths.
 Learning therefore combines three signals before granting an executable:
@@ -238,8 +237,7 @@ Acceptance checks:
 * [ ] learning is disabled by default, validates traced executable paths in the trusted parent, and never grants from log text alone;
 * [ ] learned package-name whitelists are written only to the configured loaded scope; and
 * [ ] learning retries preserve locks, dependency ordering, failure propagation, and database behavior and stop on repeated denials.
-* [ ] learning reports and persists canonical build download destinations through the trusted
-  proxy, and learned groups remain enforceable after learning is disabled;
+* [ ] learning reports and persists canonical build download destinations through the trusted proxy, and learned groups remain enforceable after learning is disabled;
 
 Concretization Dependency
 -------------------------
