@@ -3,11 +3,13 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import pathlib
+from types import SimpleNamespace
 
 import pytest
 
 import spack.database
 import spack.environment as ev
+import spack.install_worker
 import spack.package_base
 import spack.store
 import spack.traverse
@@ -21,6 +23,16 @@ stage = SpackCommand("stage")
 env = SpackCommand("env")
 
 pytestmark = pytest.mark.usefixtures("install_mockery", "mock_packages")
+
+
+@pytest.fixture(autouse=True)
+def direct_stage_fallback(monkeypatch):
+    """Keep legacy command assertions in the explicitly selected fallback path."""
+    monkeypatch.setattr(
+        spack.install_worker,
+        "select_execution",
+        lambda: SimpleNamespace(mode=spack.install_worker.FALLBACK),
+    )
 
 
 @pytest.mark.disable_clean_stage_check
@@ -37,6 +49,25 @@ def test_stage_spec(monkeypatch):
     stage("trivial-install-test-package", "mpileaks")
 
     assert len(expected) == 0
+
+
+@pytest.mark.disable_clean_stage_check
+def test_stage_spec_uses_worker(monkeypatch):
+    staged = []
+    monkeypatch.setattr(
+        spack.install_worker,
+        "select_execution",
+        lambda: SimpleNamespace(mode=spack.install_worker.WORKER),
+    )
+    monkeypatch.setattr(
+        spack.install_worker,
+        "stage_package",
+        lambda pkg: staged.append(pkg.name) or "/tmp/worker-stage",
+    )
+
+    stage("trivial-install-test-package")
+
+    assert staged == ["trivial-install-test-package"]
 
 
 @pytest.fixture(scope="function")

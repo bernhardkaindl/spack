@@ -376,14 +376,37 @@ def test_proxy_rejects_non_global_address_after_dns(monkeypatch):
     ]
 
 
+def test_proxy_reports_canonical_authorization_attempt(upstream_server):
+    attempts = []
+    host, port = upstream_server.server_address
+    target = "http://{0}:{1}/attempt".format(host, port)
+    local_proxy = _test_proxy(
+        DestinationPolicy.from_urls([target]),
+        request_logger=lambda destination, allowed: attempts.append((destination, allowed)),
+    )
+    local_proxy.bind()
+    local_proxy.start()
+    try:
+        connection = _proxy_connection(local_proxy)
+        connection.request("GET", target, headers=_proxy_headers(local_proxy))
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+    finally:
+        local_proxy.stop()
+
+    assert attempts == [(destination_from_url(target), True)]
+
+
 class _FakeSeccomp:
     def __init__(self, notification):
         self.notification = notification
         self.added_fds = []
         self.responses = []
+        self.continued = []
 
     def _get_syscall_number(self, name):
-        return {"connect": 42, "socket": 41}[name]
+        return {"connect": 42, "socket": 41, "execve": 59, "execveat": 322}[name]
 
     def receive_notification(self, listener_fd):
         return self.notification
@@ -393,6 +416,12 @@ class _FakeSeccomp:
 
     def respond_to_notification(self, listener_fd, notification_id, value=0, error=0):
         self.responses.append((notification_id, value, error))
+
+    def resolved_executable_path(self, notification):
+        return "/usr/bin/tool"
+
+    def continue_notification(self, listener_fd, notification_id):
+        self.continued.append(notification_id)
 
     def addfd_to_notification(
         self, listener_fd, notification_id, source_fd, flags=0, newfd=0, newfd_flags=0
@@ -431,6 +460,67 @@ def test_connect_supervisor_connects_shared_socket_to_proxy():
     finally:
         worker_socket.close()
         listener.close()
+
+
+def test_connect_supervisor_duplicates_descendant_socket(monkeypatch):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    worker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    worker_fd = worker_socket.fileno()
+    seccomp = _FakeSeccomp(_notification(pid=456, target_fd=worker_fd))
+    opened = []
+    duplicated = []
+    monkeypatch.setattr(
+        proxy_util,
+        "pidfd_open",
+        lambda pid: opened.append(pid) or os.open(os.devnull, os.O_RDONLY),
+    )
+
+    def duplicate(pidfd, target_fd):
+        duplicated.append((pidfd, target_fd))
+        return os.dup(worker_socket.fileno())
+
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=listener.getsockname(),
+        seccomp=cast(Any, seccomp),
+        duplicate_fd=duplicate,
+        thread_group_id=lambda thread_id, is_valid: 123,
+    )
+    try:
+        supervisor.handle_once()
+        accepted, _address = listener.accept()
+        accepted.close()
+    finally:
+        worker_socket.close()
+        listener.close()
+
+    assert opened == [456]
+    assert duplicated[0][0] != 11
+    assert duplicated[0][1] == worker_fd
+    assert seccomp.responses == [(99, 0, 0)]
+
+
+def test_connect_supervisor_records_and_continues_exec():
+    seccomp = _FakeSeccomp(_notification(syscall=59))
+    executables = []
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=("127.0.0.1", 1234),
+        seccomp=cast(Any, seccomp),
+        executable_logger=executables.append,
+    )
+
+    supervisor.handle_once()
+
+    assert executables == ["/usr/bin/tool"]
+    assert seccomp.continued == [99]
+    assert seccomp.responses == []
 
 
 @pytest.mark.parametrize(

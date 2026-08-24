@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Unit tests for Linux Landlock sandboxing in the new installer."""
 
+import array
 import sys
 
 import pytest
@@ -14,13 +15,375 @@ import os
 import pathlib
 import socket
 import tempfile
-from typing import List, Tuple
+from types import SimpleNamespace
+from typing import List, Tuple, cast
 
 import spack.concretize
+import spack.installer.build
 import spack.sandbox
 import spack.store
 from spack.installer.build import _enable_sandbox
+from spack.util.executable import which_string
 from spack.util.sandbox import run_json_worker
+
+
+def test_sandbox_policy_is_loaded_from_yaml():
+    policy = spack.installer.build._load_sandbox_policy(spack.installer.build.SANDBOX_POLICY_PATH)
+
+    assert tuple(policy["commands"]) == spack.installer.build.SANDBOX_COMMANDS
+    assert (
+        tuple(policy["host_runtime_read_paths"]) == spack.installer.build.HOST_RUNTIME_READ_PATHS
+    )
+    assert "tee" in policy["coreutils_file_programs"]
+    assert "sha384sum" in policy["build_utilities_programs"]
+
+
+def test_default_hide_as_empty_dirs_skips_external_autoconf(monkeypatch):
+    external_autoconf = SimpleNamespace(
+        name="autoconf", external=True, edges_to_dependencies=lambda: [], extra_attributes={}
+    )
+    spec = SimpleNamespace(
+        traverse=lambda root=False: [external_autoconf] if not root else [],
+        edges_to_dependencies=lambda: [],
+    )
+
+    assert spack.installer.build.default_hide_as_empty_dirs(spec) == []
+
+
+def test_default_hide_as_empty_dirs_masks_host_aclocal():
+    spec = SimpleNamespace(traverse=lambda root=False: [], edges_to_dependencies=lambda: [])
+
+    assert spack.installer.build.default_hide_as_empty_dirs(spec) == ["/usr/share/aclocal"]
+
+
+def system_gcc_layout(tmp_path, *, older_headers=True):
+    install_root = tmp_path / "lib" / "gcc"
+    target = install_root / "test-linux-gnu"
+    if older_headers:
+        (target / "15").mkdir(parents=True)
+    (target / "16").mkdir(parents=True)
+    include_root = tmp_path / "include"
+    header_root = include_root / "c++"
+    if older_headers:
+        (header_root / "15").mkdir(parents=True)
+    (header_root / "16").mkdir(parents=True)
+    for version in ["15", "16"] if older_headers else ["16"]:
+        (include_root / target.name / "c++" / version).mkdir(parents=True)
+    return install_root, target, include_root
+
+
+def compiler_spec(name, version, compilers, additional_compilers=()):
+    compiler = SimpleNamespace(
+        name=name, version=version, extra_attributes={"compilers": compilers}
+    )
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    additional_edges = [
+        SimpleNamespace(spec=spec, virtuals=(language,)) for language, spec in additional_compilers
+    ]
+    root = SimpleNamespace(
+        name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge] + additional_edges
+    )
+    return SimpleNamespace(traverse=lambda: [root])
+
+
+def linux_header_policy(include_root):
+    return {
+        "version": 1,
+        "system_include_root": str(include_root),
+        "glibc": {
+            "files": ["stdio.h"],
+            "directories": ["arpa"],
+            "target_files": ["fpu_control.h"],
+            "target_directories": ["bits", "sys"],
+        },
+        "linux": {"directories": ["linux"], "target_directories": ["asm"]},
+        "libstdcxx": {"maximum_major_for_non_gcc": 15},
+    }
+
+
+def test_system_compiler_headers_allow_only_safe_libstdcxx(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/clang++-18"})
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    allowed = spack.installer.build.system_compiler_header_paths(spec, policy)
+
+    assert str(include_root) not in allowed
+    assert str(include_root / "stdio.h") in allowed
+    assert str(include_root / "arpa") in allowed
+    assert str(include_root / "linux") in allowed
+    assert str(include_root / "bits") in allowed
+    assert str(include_root / "asm") in allowed
+    assert str(include_root / target.name / "bits") in allowed
+    assert str(include_root / target.name / "asm") in allowed
+    assert str(include_root / "c++" / "15") in allowed
+    assert str(include_root / target.name / "c++" / "15") in allowed
+    assert str(include_root / "c++" / "15" / target.name) in allowed
+    assert str(include_root / "c++" / "16") not in allowed
+    assert str(include_root / target.name / "c++" / "16") not in allowed
+
+
+def test_gcc_installations_other_than_permitted_libstdcxx_are_masked(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/clang++-18"})
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    assert spack.installer.build.gcc_installation_dirs_to_mask(
+        spec, linux_header_policy(include_root)
+    ) == [str(target / "16")]
+
+
+def test_mask_preserves_gcc_installation_selected_for_fortran(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    gcc = SimpleNamespace(
+        name="gcc",
+        version="16",
+        extra_attributes={"compilers": {"fortran": "/usr/bin/gfortran-16"}},
+    )
+    spec = compiler_spec(
+        "llvm", "18", {"cxx": "/usr/bin/clang++-18"}, additional_compilers=(("fortran", gcc),)
+    )
+    monkeypatch.setattr(
+        spack.installer.build,
+        "_gcc_installation",
+        lambda compiler_path: target / ("16" if compiler_path.endswith("16") else "16"),
+    )
+
+    assert (
+        spack.installer.build.gcc_installation_dirs_to_mask(
+            spec, linux_header_policy(include_root)
+        )
+        == []
+    )
+
+
+def test_gcc_16_compiler_gets_gcc_16_libstdcxx(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    spec = compiler_spec("gcc", "16.1", {"cxx": "/usr/bin/g++-16"})
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    allowed = spack.installer.build.system_compiler_header_paths(spec, policy)
+
+    assert str(include_root / "c++" / "16") in allowed
+    assert str(include_root / "c++" / "15") not in allowed
+    assert spack.installer.build.gcc_installation_dirs_to_mask(spec, policy) == [
+        str(target / "15")
+    ]
+
+
+def test_newest_libstdcxx_used_when_no_older_headers_exist(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path, older_headers=False)
+    spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/clang++-18"})
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    allowed = spack.installer.build.system_compiler_header_paths(spec, policy)
+
+    assert str(include_root / "c++" / "16") in allowed
+    assert spack.installer.build.gcc_installation_dirs_to_mask(spec, policy) == []
+
+
+def test_system_header_policy_denies_unselected_libstdcxx(tmp_path, monkeypatch):
+    try:
+        sandbox = spack.sandbox.get_sandbox()
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    permitted_header = include_root / "c++" / "15" / "vector"
+    denied_header = include_root / "c++" / "16" / "vector"
+    permitted_header.touch()
+    denied_header.touch()
+    spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/sh"})
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    def setup():
+        for path in spack.installer.build.system_compiler_header_paths(spec, policy):
+            sandbox.allow_read(path)
+        sandbox.apply()
+
+    def worker(request):
+        permitted = permitted_header.read_text() == ""
+        try:
+            denied_header.read_text()
+        except OSError as error:
+            denied_errno = error.errno
+        else:
+            denied_errno = None
+        return {"denied_errno": denied_errno, "permitted": permitted}
+
+    result = run_json_worker({}, worker, setup=setup)
+
+    assert result == {"denied_errno": errno.EACCES, "permitted": True}
+
+
+def test_sandbox_df_command_has_fixed_output(tmp_path):
+    try:
+        sandbox = spack.sandbox.get_sandbox()
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    stage = tmp_path / "stage"
+    stage.mkdir()
+
+    def setup():
+        sandbox.allow_write(stage)
+        sandbox.allow_read("/bin/sh")
+        for path in spack.installer.build.HOST_RUNTIME_READ_PATHS:
+            sandbox.allow_read(path)
+        spack.installer.build.allow_sandbox_commands(sandbox, str(stage))
+        os.chdir(str(stage))
+        sandbox.apply()
+
+    def worker(request):
+        accepted = subprocess.run(
+            ["df", "-P", "-B1", "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        rejected = subprocess.run(
+            ["df", "-h", "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        return {
+            "accepted_returncode": accepted.returncode,
+            "accepted_stdout": accepted.stdout,
+            "command": spack.installer.build.shutil.which("df"),
+            "rejected_returncode": rejected.returncode,
+            "rejected_stderr": rejected.stderr,
+        }
+
+    result = run_json_worker({}, worker, setup=setup)
+
+    assert result["command"] == os.path.join(str(stage), "spack-sandbox-bin", "df")
+    assert result["command"] != os.path.join(spack.installer.build.SANDBOX_COMMAND_DIR, "df")
+    assert result == {
+        "accepted_returncode": 0,
+        "accepted_stdout": (
+            "Filesystem         1-blocks Used        Available Capacity Mounted on\n"
+            "spack-sandbox 1125899906842624    0 1125899906842624       0% /\n"
+        ),
+        "command": os.path.join(str(stage), "spack-sandbox-bin", "df"),
+        "rejected_returncode": 64,
+        "rejected_stderr": "spack sandbox df: unsupported arguments\n",
+    }
+
+
+def test_hide_directories_as_empty_mounts_empty_directory(tmp_path):
+    user_id, group_id = os.getuid(), os.getgid()
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "host-file").touch()
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            masked = spack.sandbox.hide_directories_as_empty([str(target)], str(stage))
+            identity_preserved = os.getuid() == user_id and os.getgid() == group_id
+            result = (
+                b"1" if masked and identity_preserved and list(target.iterdir()) == [] else b"0"
+            )
+        except OSError as error:
+            result = "E{0}".format(error.errno).encode("ascii")
+        os.write(write_fd, result)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        result = os.read(read_fd, 16)
+        _, status = os.waitpid(pid, 0)
+    finally:
+        os.close(read_fd)
+    assert os.WIFEXITED(status)
+    if result == b"0":
+        pytest.skip("unprivileged user and mount namespaces are unavailable")
+    assert not result.startswith(b"E")
+    assert result == b"1"
+
+
+def test_hide_directories_as_empty_uses_prepared_namespace(monkeypatch, tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    prepared = []
+    monkeypatch.setattr(
+        spack.sandbox,
+        "prepare_empty_directory_masking",
+        lambda paths, libc=None: prepared.append(list(paths)) or pytest.fail("must not prepare"),
+    )
+    libc = SimpleNamespace(mount=lambda *args: 0)
+
+    assert spack.sandbox.hide_directories_as_empty(
+        [str(target)], str(stage), namespace_ready=True, libc=libc
+    )
+    assert prepared == []
+
+
+def test_exec_notification_reports_path_and_continues():
+    parent, child = socket.socketpair()
+    executable = sys.executable
+    pid = os.fork()
+    if pid == 0:
+        parent.close()
+        listener_fd = spack.sandbox.SeccompSandbox().exec_listener()
+        descriptors = array.array("i", [listener_fd])
+        child.sendmsg([b"1"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptors)])
+        child.close()
+        os.execv(executable, [executable, "-c", "pass"])
+        os._exit(1)
+
+    child.close()
+    listener_fd = -1
+    try:
+        _, ancillary, _, _ = parent.recvmsg(1, socket.CMSG_SPACE(array.array("i").itemsize))
+        for level, kind, data in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                descriptors = array.array("i")
+                descriptors.frombytes(data[: descriptors.itemsize])
+                listener_fd = descriptors[0]
+                break
+        assert listener_fd >= 0
+
+        seccomp = spack.sandbox.SeccompSandbox()
+        notification = seccomp.receive_notification(listener_fd)
+        assert os.fsdecode(seccomp.executable_path(notification)) == executable
+        seccomp.continue_notification(listener_fd, notification.id)
+        _, status = os.waitpid(pid, 0)
+        assert os.WIFEXITED(status)
+        assert os.WEXITSTATUS(status) == 0
+    finally:
+        parent.close()
+        if listener_fd >= 0:
+            os.close(listener_fd)
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
 
 
 class SpyLandlockSandbox(spack.sandbox.LandlockSandbox):
@@ -164,6 +527,47 @@ def test_network_worker_sandbox_policy(monkeypatch):
     assert rlimits == [1024 * 1024 * 1024]
 
 
+def test_stage_worker_sandbox_policy(monkeypatch):
+    sandbox = MockSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    rlimits = []
+    monkeypatch.setattr(spack.sandbox, "set_stage_worker_rlimits", lambda: rlimits.append(True))
+
+    spack.sandbox.restrict_stage_worker(["/tmp", "/bin/tar"], ["/var"])
+
+    assert sandbox.read_calls == [
+        (pathlib.Path("/tmp").absolute(), pathlib.Path("/tmp").resolve()),
+        (pathlib.Path("/bin/tar").absolute(), pathlib.Path("/bin/tar").resolve()),
+    ]
+    assert sandbox.write_calls == [
+        (pathlib.Path("/var").absolute(), pathlib.Path("/var").resolve())
+    ]
+    assert sandbox.apply_calls == [(False, False, True, False)]
+    assert rlimits == [True]
+
+
+def test_unlimited_worker_rlimits_only_disable_core_dumps(monkeypatch):
+    setrlimit_calls = []
+    monkeypatch.setattr(
+        spack.sandbox.resource,
+        "setrlimit",
+        lambda kind, limits: setrlimit_calls.append((kind, limits)),
+    )
+    monkeypatch.setattr(
+        spack.sandbox.resource,
+        "getrlimit",
+        lambda kind: pytest.fail("unlimited workers must not inspect memory rlimits"),
+    )
+
+    spack.sandbox.set_stage_worker_rlimits()
+    spack.sandbox.set_build_worker_rlimits()
+
+    assert setrlimit_calls == [
+        (spack.sandbox.resource.RLIMIT_CORE, (0, 0)),
+        (spack.sandbox.resource.RLIMIT_CORE, (0, 0)),
+    ]
+
+
 def test_recipe_import_sandbox_availability_honors_fallback(monkeypatch):
     monkeypatch.setattr(
         spack.sandbox,
@@ -292,12 +696,31 @@ class FailingSeccompSandbox(MockSeccompSandbox):
         raise OSError("seccomp_load failed")
 
 
+@pytest.mark.parametrize(
+    "allow_network,expected_block_network", [(None, True), (False, True), (True, False)]
+)
 def test_enable_sandbox_paths(
-    config, mock_packages, monkeypatch, temporary_store: spack.store.Store, tmp_path: pathlib.Path
+    config,
+    mock_packages,
+    monkeypatch,
+    temporary_store: spack.store.Store,
+    tmp_path: pathlib.Path,
+    allow_network,
+    expected_block_network,
 ):
     """Test that _enable_sandbox in the installer calls allow_read/allow_write correctly."""
     mock_sandbox = MockSandbox()
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+    build_rlimits = []
+    monkeypatch.setattr(
+        spack.sandbox, "set_build_worker_rlimits", lambda: build_rlimits.append(True)
+    )
+    compiler_specs = []
+    monkeypatch.setattr(
+        spack.installer.build,
+        "allow_compiler_paths",
+        lambda sandbox, spec: compiler_specs.append(spec),
+    )
 
     spec = spack.concretize.concretize_one("dependent-install")
 
@@ -326,8 +749,10 @@ def test_enable_sandbox_paths(
         "enable": True,
         "allow_read": [str(custom_read_link)],
         "allow_write": [str(custom_write)],
-        "allow_network": True,
+        "whitelists": {"tools": {"allow": ["true"], "specs": ["dependent-install"]}},
     }
+    if allow_network is not None:
+        config["allow_network"] = allow_network
 
     _enable_sandbox(config, spec, str(stage_path))
 
@@ -341,6 +766,11 @@ def test_enable_sandbox_paths(
 
     # Verify sbang read
     assert sbang_file.resolve() in allow_read_resolved
+    assert pathlib.Path(which_string("true")).resolve() in allow_read_resolved
+    for path in spack.installer.build.HOST_RUNTIME_READ_PATHS:
+        assert pathlib.Path(path).resolve() in allow_read_resolved
+    assert pathlib.Path("/bin/sh").resolve() in allow_read_resolved
+    assert compiler_specs == [spec]
 
     allow_write_resolved = [c[1] for c in mock_sandbox.write_calls]
     assert stage_path.resolve() in allow_write_resolved
@@ -348,7 +778,190 @@ def test_enable_sandbox_paths(
     assert custom_write.resolve() in allow_write_resolved
     assert pathlib.Path(tempfile.gettempdir()).resolve() in allow_write_resolved
 
+    assert mock_sandbox.apply_calls == [(expected_block_network, False, False, False)]
+    assert build_rlimits == [True]
+
+
+def test_enable_sandbox_proxy_uses_network_listener(
+    mock_packages, monkeypatch, temporary_store, tmp_path
+):
+    mock_sandbox = MockSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+    monkeypatch.setattr(spack.sandbox, "set_build_worker_rlimits", lambda: None)
+    monkeypatch.setattr(spack.installer.build, "allow_compiler_paths", lambda sandbox, spec: None)
+
+    class NetworkSeccomp:
+        denied_bypass = False
+        included_exec = None
+
+        def network_listener(self, include_exec=False):
+            self.included_exec = include_exec
+            return 42
+
+        def deny_network_bypass(self):
+            self.denied_bypass = True
+
+    seccomp = NetworkSeccomp()
+    monkeypatch.setattr(spack.sandbox, "SeccompSandbox", lambda: seccomp)
+    for name in ("http_proxy", "https_proxy", "ftp_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.setenv(name, "inherited")
+        monkeypatch.setenv(name.upper(), "inherited")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "inherited")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
+    spec = spack.concretize.concretize_one("trivial-install-test-package")
+    pathlib.Path(spec.prefix).mkdir(parents=True, exist_ok=True)
+    stage_path = tmp_path / "stage"
+    stage_path.mkdir()
+    temporary_store.install_sbang()
+
+    listeners = _enable_sandbox(
+        {"enable": True, "learning": {"enabled": True}},
+        spec,
+        str(stage_path),
+        "http://spack:secret@127.0.0.1:1234",
+    )
+
+    assert listeners.exec_fd is None
+    assert listeners.network_fd == 42
+    assert seccomp.denied_bypass
+    assert seccomp.included_exec is True
     assert mock_sandbox.apply_calls == [(False, False, False, False)]
+    assert os.environ["https_proxy"] == "http://spack:secret@127.0.0.1:1234"
+    assert os.environ["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert os.environ["GIT_CONFIG_NOSYSTEM"] == "1"
+
+
+def test_compiler_support_paths_queries_all_build_tools(monkeypatch):
+    queries = []
+
+    class CompletedProcess:
+        returncode = 0
+
+        def __init__(self, stdout):
+            self.stdout = stdout
+
+    def run(command, **kwargs):
+        queries.append(command[1])
+        return CompletedProcess(command[1].split("=", 1)[1])
+
+    monkeypatch.setattr(spack.installer.build.subprocess, "run", run)
+    monkeypatch.setattr(
+        spack.installer.build.shutil,
+        "which",
+        lambda program, path=None: (
+            "/wrapper/{0}".format(program) if path is None else "/host/{0}".format(program)
+        ),
+    )
+
+    paths = spack.installer.build.compiler_support_paths("/usr/bin/cc")
+
+    assert queries == [
+        "-print-prog-name={0}".format(program) for program in spack.installer.build.BUILD_PROGRAMS
+    ] + [
+        "-print-file-name={0}".format(filename)
+        for filename in spack.installer.build.COMPILER_FILES
+    ]
+    assert set(paths) == {
+        prefix + program
+        for program in spack.installer.build.BUILD_PROGRAMS
+        for prefix in ("/wrapper/", "/host/")
+    }
+
+
+def test_allow_git_support_paths_uses_configured_exec_path(monkeypatch):
+    sandbox = MockSandbox()
+    monkeypatch.setattr(spack.installer.build.shutil, "which", lambda program: "/usr/bin/git")
+    completed = SimpleNamespace(returncode=0, stdout="/usr/lib/git-core\n")
+    monkeypatch.setattr(
+        spack.installer.build.subprocess, "run", lambda command, **kwargs: completed
+    )
+
+    spack.installer.build.allow_git_support_paths(sandbox)
+
+    assert pathlib.Path("/usr/lib/git-core").resolve() in [
+        resolved for _original, resolved in sandbox.read_calls
+    ]
+
+
+def _system_compiler_spec(name, version, compiler_path):
+    compiler = SimpleNamespace(
+        name=name, version=version, extra_attributes={"compilers": {"cxx": compiler_path}}
+    )
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(edges_to_dependencies=lambda: [edge])
+    return SimpleNamespace(traverse=lambda: [root])
+
+
+def _linux_header_policy(include_root):
+    return {
+        "version": 1,
+        "system_include_root": str(include_root),
+        "glibc": {
+            "files": ["stdio.h"],
+            "directories": ["arpa"],
+            "target_files": ["fpu_control.h"],
+            "target_directories": ["bits", "sys"],
+        },
+        "linux": {"directories": ["linux"], "target_directories": ["asm"]},
+        "libstdcxx": {"maximum_major_for_non_gcc": 15},
+    }
+
+
+def test_shipped_linux_header_policy_is_valid():
+    policy = spack.installer.build._load_linux_header_policy()
+
+    assert policy["version"] == 1
+    assert policy["system_include_root"] == "/usr/include"
+
+
+def test_system_compiler_headers_allow_only_safe_libstdcxx(tmp_path, monkeypatch):
+    target = tmp_path / "lib" / "gcc" / "test-linux-gnu"
+    (target / "15").mkdir(parents=True)
+    (target / "16").mkdir()
+    include_root = tmp_path / "include"
+    (include_root / "c++" / "15").mkdir(parents=True)
+    (include_root / "c++" / "16").mkdir()
+    spec = _system_compiler_spec("llvm", "18", "/usr/bin/clang++-18")
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    allowed = spack.installer.build.system_compiler_header_paths(
+        spec, _linux_header_policy(include_root)
+    )
+
+    assert str(include_root) not in allowed
+    assert str(include_root / "stdio.h") in allowed
+    assert str(include_root / "linux") in allowed
+    assert str(include_root / target.name / "bits") in allowed
+    assert str(include_root / "c++" / "15") in allowed
+    assert str(include_root / "c++" / "16") not in allowed
+
+
+def test_allow_selected_compiler_paths(tmp_path: pathlib.Path, monkeypatch):
+    compiler_dir = tmp_path / "compiler" / "bin"
+    compiler_dir.mkdir(parents=True)
+    compiler_paths = {
+        language: str(compiler_dir / executable)
+        for language, executable in (("c", "cc"), ("cxx", "c++"), ("fortran", "fc"))
+    }
+    for path in compiler_paths.values():
+        pathlib.Path(path).touch()
+
+    compiler_spec = SimpleNamespace(extra_attributes={"compilers": compiler_paths})
+    selected_edge = SimpleNamespace(spec=compiler_spec, virtuals=("c", "cxx"))
+    node = SimpleNamespace(edges_to_dependencies=lambda: [selected_edge, selected_edge])
+    spec = SimpleNamespace(traverse=lambda: [node])
+    sandbox = MockSandbox()
+    monkeypatch.setattr(spack.installer.build, "compiler_support_paths", lambda path: [])
+
+    spack.installer.build.allow_compiler_paths(sandbox, cast(spack.spec.Spec, spec))
+
+    allowed = [resolved for _, resolved in sandbox.read_calls]
+    assert pathlib.Path(compiler_paths["c"]).resolve() in allowed
+    assert pathlib.Path(compiler_paths["cxx"]).resolve() in allowed
+    assert pathlib.Path(compiler_paths["fortran"]).resolve() not in allowed
+    assert len(allowed) == 2
 
 
 def test_sandbox_tcp_network_fallback_requires_abi_v4(monkeypatch):

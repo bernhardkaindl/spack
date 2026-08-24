@@ -26,7 +26,7 @@ import sys
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Iterable, Union
+from typing import Dict, Iterable, Optional, Union
 
 # os.O_PATH is only defined on linux. Appease mypy with our own O_PATH.
 if sys.platform == "linux":
@@ -52,9 +52,11 @@ SECCOMP_RET_ALLOW = 0x7FFF0000
 SECCOMP_RET_ERRNO = 0x00050000
 SECCOMP_RET_USER_NOTIF = 0x7FC00000
 SECCOMP_ADDFD_FLAG_SEND = 1 << 1
+SECCOMP_USER_NOTIF_FLAG_CONTINUE = 1
 SYS_PIDFD_OPEN = 434
 SYS_PIDFD_GETFD = 438
 SECCOMP_IOCTL_NOTIF_ADDFD = 0x40182103
+MAX_EXECUTABLE_PATH_BYTES = 4096
 
 _SOCKET_SYSCALLS = (
     "accept",
@@ -225,6 +227,39 @@ class SeccompNotificationAddfd(ctypes.Structure):
         ("newfd", ctypes.c_uint32),
         ("newfd_flags", ctypes.c_uint32),
     ]
+
+
+class IOVec(ctypes.Structure):
+    """Native scatter/gather buffer used by ``process_vm_readv``."""
+
+    _fields_ = [("base", ctypes.c_void_p), ("length", ctypes.c_size_t)]
+
+
+def read_process_string(
+    pid: int, address: int, limit: int = MAX_EXECUTABLE_PATH_BYTES, libc=None
+) -> bytes:
+    """Read one bounded NUL-terminated byte string from another process."""
+    if address <= 0 or limit <= 0:
+        raise OSError(errno.EINVAL, "invalid remote string address or limit")
+    libc = libc if libc is not None else ctypes.CDLL(None, use_errno=True)
+    libc.process_vm_readv.restype = ctypes.c_ssize_t
+    buffer = ctypes.create_string_buffer(limit)
+    local = IOVec(ctypes.addressof(buffer), limit)
+    remote = IOVec(address, limit)
+    result = libc.process_vm_readv(
+        ctypes.c_int(pid),
+        ctypes.byref(local),
+        ctypes.c_ulong(1),
+        ctypes.byref(remote),
+        ctypes.c_ulong(1),
+        ctypes.c_ulong(0),
+    )
+    size = _check_syscall(result, "process_vm_readv")
+    value = buffer.raw[:size]
+    terminator = value.find(b"\0")
+    if terminator < 0:
+        raise OSError(errno.ENAMETOOLONG, "remote string exceeds the byte limit")
+    return value[:terminator]
 
 
 class Sandbox(ABC):
@@ -539,9 +574,42 @@ class SeccompSandbox:
         """Install a filter notifying on ``connect`` and return its listener descriptor."""
         return self._notification_listener(("connect",))
 
-    def network_listener(self) -> int:
-        """Install a filter notifying on TCP socket creation and connection."""
-        return self._notification_listener(("socket", "connect"))
+    def network_listener(self, include_exec: bool = False) -> int:
+        """Install a filter notifying on TCP operations and optionally executable replacement."""
+        syscalls = (
+            ("socket", "connect", "execve", "execveat") if include_exec else ("socket", "connect")
+        )
+        return self._notification_listener(syscalls)
+
+    def exec_listener(self) -> int:
+        """Install a filter notifying on executable image replacement."""
+        return self._notification_listener(("execve", "execveat"))
+
+    def executable_path(self, notification: SeccompNotification) -> bytes:
+        """Read the executable pathname argument from a blocked exec notification."""
+        if notification.data.nr == self._get_syscall_number("execve"):
+            address = notification.data.args[0]
+        elif notification.data.nr == self._get_syscall_number("execveat"):
+            address = notification.data.args[1]
+        else:
+            raise OSError(errno.EINVAL, "notification is not an exec syscall")
+        return read_process_string(notification.pid, address, libc=self.libc)
+
+    def resolved_executable_path(self, notification: SeccompNotification) -> str:
+        """Resolve the executable pathname while its task is blocked."""
+        path = os.fsdecode(self.executable_path(notification))
+        if os.path.isabs(path):
+            return os.path.realpath(path)
+        if notification.data.nr == self._get_syscall_number("execveat"):
+            directory_fd = ctypes.c_int64(notification.data.args[0]).value
+            base = (
+                "/proc/{0}/cwd".format(notification.pid)
+                if directory_fd == -100
+                else "/proc/{0}/fd/{1}".format(notification.pid, directory_fd)
+            )
+        else:
+            base = "/proc/{0}/cwd".format(notification.pid)
+        return os.path.realpath(os.path.join(os.readlink(base), path))
 
     def deny_network_bypass(self) -> None:
         """Deny socket operations that could bypass the supervised TCP path."""
@@ -585,15 +653,26 @@ class SeccompSandbox:
         raise OSError(-result, f"seccomp_notify_id_valid: {os.strerror(-result)}")
 
     def respond_to_notification(
-        self, listener_fd: int, notification_id: int, value: int = 0, error: int = 0
+        self,
+        listener_fd: int,
+        notification_id: int,
+        value: int = 0,
+        error: int = 0,
+        flags: int = 0,
     ) -> None:
-        """Return a spoofed result without continuing the target syscall."""
+        """Return a result or continue the target syscall."""
         response = SeccompNotificationResponse(
-            id=notification_id, val=value, error=-abs(error), flags=0
+            id=notification_id, val=value, error=-abs(error), flags=flags
         )
         result = self.libseccomp.seccomp_notify_respond(listener_fd, ctypes.byref(response))
         if result < 0:
             raise OSError(-result, f"seccomp_notify_respond: {os.strerror(-result)}")
+
+    def continue_notification(self, listener_fd: int, notification_id: int) -> None:
+        """Continue a syscall blocked on a seccomp user notification."""
+        self.respond_to_notification(
+            listener_fd, notification_id, flags=SECCOMP_USER_NOTIF_FLAG_CONTINUE
+        )
 
     def addfd_to_notification(
         self,
@@ -740,7 +819,17 @@ def set_network_worker_rlimits(memory_limit_bytes: int = 1024 * 1024 * 1024) -> 
     _set_worker_rlimits(memory_limit_bytes, limit_file_size=False)
 
 
-def _set_worker_rlimits(memory_limit_bytes: int, limit_file_size: bool) -> None:
+def set_stage_worker_rlimits() -> None:
+    """Disable core dumps without imposing an installer memory ceiling on staging."""
+    _set_worker_rlimits(None, limit_file_size=False)
+
+
+def set_build_worker_rlimits() -> None:
+    """Disable core dumps without imposing an installer memory ceiling on builds."""
+    _set_worker_rlimits(None, limit_file_size=False)
+
+
+def _set_worker_rlimits(memory_limit_bytes: Optional[int], limit_file_size: bool) -> None:
     """Apply shared worker rlimits, optionally forbidding all file output."""
 
     # See man setrlimit(2) for details on the resource limits being set here.
@@ -749,6 +838,9 @@ def _set_worker_rlimits(memory_limit_bytes: int, limit_file_size: bool) -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     if limit_file_size and hasattr(resource, "RLIMIT_FSIZE"):
         resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+    if memory_limit_bytes is None:
+        return
 
     # Set the soft and hard memory ceilings to fail if too much memory is used.
     if hasattr(resource, "RLIMIT_AS"):
@@ -793,6 +885,21 @@ def restrict_network_worker(
     for root in write_roots:
         sandbox.allow_write(root)
     sandbox.apply(block_network=False, block_process=True, block_ipc=True)
+
+
+def restrict_stage_worker(
+    read_roots: Iterable[Union[str, Path]], write_roots: Iterable[Union[str, Path]]
+) -> None:
+    """Confine network-supervised staging while permitting selected expansion tools."""
+    set_stage_worker_rlimits()
+    sandbox = get_sandbox()
+    for root in read_roots:
+        sandbox.allow_read(root)
+    for root in write_roots:
+        sandbox.allow_write(root)
+    # Normal archive expansion invokes tools such as tar. Landlock limits which
+    # executables are visible, and the inherited seccomp listener supervises descendants.
+    sandbox.apply(block_network=False, block_process=False, block_ipc=True)
 
 
 class SandboxError(spack.error.SpackError):
