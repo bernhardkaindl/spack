@@ -4,10 +4,64 @@
 """Tests for the installer.build module (PrefixPivoter and prefix management)."""
 
 import pathlib
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from spack.installer.build import OVERWRITE_GARBAGE_SUFFIX, BinaryCacheMiss, PrefixPivoter
+import spack.install_worker
+from spack.installer.build import (
+    OVERWRITE_GARBAGE_SUFFIX,
+    BinaryCacheMiss,
+    PrefixPivoter,
+    _stage_source,
+)
+
+
+class StagePackage:
+    def __init__(self):
+        self.calls = []
+
+    def do_patch(self):
+        self.calls.append("patch")
+
+    def do_stage(self):
+        self.calls.append("stage")
+
+
+@pytest.mark.parametrize("skip_patch,expected_patch", [(False, True), (True, False)])
+def test_stage_source_uses_worker(monkeypatch, skip_patch, expected_patch):
+    package: Any = StagePackage()
+    worker_calls = []
+    monkeypatch.setattr(
+        spack.install_worker,
+        "select_execution",
+        lambda: SimpleNamespace(mode=spack.install_worker.WORKER),
+    )
+    monkeypatch.setattr(
+        spack.install_worker,
+        "stage_package",
+        lambda pkg, **kwargs: worker_calls.append((pkg, kwargs)),
+    )
+
+    _stage_source(package, skip_patch)
+
+    assert worker_calls == [(package, {"patch": expected_patch, "acquire_lock": False})]
+    assert package.calls == []
+
+
+@pytest.mark.parametrize("skip_patch,expected", [(False, ["patch"]), (True, ["stage"])])
+def test_stage_source_uses_configured_fallback(monkeypatch, skip_patch, expected):
+    package: Any = StagePackage()
+    monkeypatch.setattr(
+        spack.install_worker,
+        "select_execution",
+        lambda: SimpleNamespace(mode=spack.install_worker.FALLBACK),
+    )
+
+    _stage_source(package, skip_patch)
+
+    assert package.calls == expected
 
 
 @pytest.fixture

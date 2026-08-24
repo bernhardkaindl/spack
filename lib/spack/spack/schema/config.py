@@ -251,6 +251,27 @@ properties: Dict[str, Any] = {
                         "description": "Allow sandboxed commands to use their trusted direct "
                         "path when worker confinement is unavailable.",
                     },
+                    "learning": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "enabled": {"type": "boolean"},
+                            "config_file": {"type": ["string", "null"]},
+                        },
+                    },
+                    "whitelists": {
+                        "type": "object",
+                        "additionalProperties": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["specs"],
+                            "properties": {
+                                "allow": {"type": "array", "items": {"type": "string"}},
+                                "network": {"type": "array", "items": {"type": "string"}},
+                                "specs": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    },
                     "allow_read": {
                         "type": "array",
                         "items": {"type": "string"},

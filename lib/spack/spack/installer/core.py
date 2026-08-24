@@ -13,14 +13,17 @@ import selectors
 import signal
 import sys
 import tempfile
+import threading
 import time
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Union
 
 import spack.binary_distribution
 import spack.config
 import spack.error
+import spack.install_worker.learning
 import spack.mirrors.mirror
 import spack.report
+import spack.sandbox
 import spack.spec
 import spack.stage
 import spack.store
@@ -28,6 +31,7 @@ import spack.traverse
 import spack.url_buildcache
 import spack.util.filesystem as fs
 import spack.util.lock
+import spack.util.proxy
 import spack.util.tty
 from spack.installer.base import (
     JOBSERVER_EVENT,
@@ -64,6 +68,16 @@ if TYPE_CHECKING:
 
 #: How often to flush completed builds to the database
 DATABASE_WRITE_INTERVAL = 5.0
+
+
+def _build_process_group_id(pid: int, notification_is_valid: Callable[[], bool]) -> Optional[int]:
+    """Return the process group for a valid build-network notification."""
+    if not notification_is_valid():
+        return None
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
 
 
 class ReportData:
@@ -264,6 +278,7 @@ class PackageInstaller:
         self.verbose = verbose
         self.running_builds: Dict[str, ChildInfo] = {}
         self.log_paths: Dict[str, str] = {}
+        self.learned_executables: Dict[str, Set[str]] = {}
         self.ui = ui or TerminalUI(
             total=0, verbose=verbose, filter_padding=self.store.has_padding()
         )
@@ -391,6 +406,8 @@ class PackageInstaller:
                             self._handle_child_logs(child_info, selector)
                         elif data.name == "state":
                             self._handle_child_state(child_info, selector)
+                        elif data.name == "exec":
+                            self._handle_exec_notification(child_info, selector)
                         elif data.name == "sentinel":
                             finished_builds.append(data.build_id)
                     elif data == STDIN_EVENT:
@@ -559,6 +576,29 @@ class PackageInstaller:
         exitcode = build.close(selector)
         self.report_data.finish_record(build.spec, exitcode, build.log_path)
 
+        if build.network_supervisor_errors:
+            spack.util.tty.warn(
+                "Build network supervisor failed for {0}: {1}".format(
+                    build.spec.name, build.network_supervisor_errors[0]
+                )
+            )
+        if build.network_attempts and spack.install_worker.learning.enabled():
+            destinations = list(dict.fromkeys(build.network_attempts))
+            spack.util.tty.warn(
+                "Sandbox learning observed build network destinations for {0}: {1}".format(
+                    build.spec.name, ", ".join(destinations)
+                )
+            )
+            for destination in destinations:
+                try:
+                    spack.install_worker.learning.learn_network_destination(
+                        build.spec, destination
+                    )
+                except spack.install_worker.learning.LearningError as error:
+                    spack.util.tty.warn(
+                        "Sandbox learning could not update network policy: {0}".format(error)
+                    )
+
         if exitcode == ExitCode.SUCCESS:
             # Schedule successful builds for batched database insertion. Ownership of the prefix
             # write lock moves from the finished child to the pending DB insert; it is downgraded
@@ -577,6 +617,39 @@ class PackageInstaller:
 
         is_root = dag_hash in self.build_graph.roots
         user_policy = self.root_policy if is_root else self.dependencies_policy
+
+        if spack.install_worker.learning.enabled():
+            executable = spack.install_worker.learning.denied_executable(
+                build.log_path, build.exec_candidates
+            )
+            learned = self.learned_executables.setdefault(dag_hash, set())
+            if executable is not None and executable not in learned:
+                try:
+                    canonical = spack.install_worker.learning.learn_executable(
+                        build.spec, executable
+                    )
+                except spack.install_worker.learning.LearningError as error:
+                    spack.util.tty.warn(
+                        "Sandbox learning could not update policy: {0}".format(error)
+                    )
+                else:
+                    learned.add(canonical)
+                    spack.util.tty.warn(
+                        "Sandbox learning granted {0} to {1}; retrying".format(
+                            canonical, build.spec.name
+                        )
+                    )
+                    self.ui.on_build_removed(dag_hash)
+                    self.pending_builds.append(dag_hash)
+                    return
+            elif executable is not None:
+                spack.util.tty.warn(
+                    "Sandbox learning stopped after repeated denial of {0}".format(executable)
+                )
+            elif spack.install_worker.learning.has_permission_denied_hint(build.log_path):
+                spack.util.tty.warn(
+                    "Build log contains a Permission denied hint without matching exec evidence"
+                )
 
         if exitcode == ExitCode.STOPPED_AT_PHASE:
             return  # the user requested early stopping; don't treat as failure
@@ -769,6 +842,8 @@ class PackageInstaller:
             log_path=self.log_paths[dag_hash],
             stop_before=self.stop_before if is_root else None,
             stop_at=self.stop_at if is_root else None,
+            network_proxy_url=None,
+            network_proxy_address=None,
         )
         child_info = self.launcher(request, jobserver)
         child_info.prefix_lock = prefix_lock
@@ -895,5 +970,92 @@ class PackageInstaller:
                 self.ui.on_progress(dag_hash, message["progress"], message["total"])
             elif "installed_from_binary_cache" in message:
                 child_info.spec.package.installed_from_binary_cache = True
+            elif set(message) == {"exec_listener"} and type(message["exec_listener"]) is int:
+                if child_info.exec_listener_fd >= 0 or message["exec_listener"] < 0:
+                    continue
+                pid = child_info.proc.pid
+                if pid is None:
+                    continue
+                pidfd = spack.sandbox.pidfd_open(pid)
+                try:
+                    listener_fd = spack.sandbox.pidfd_getfd(pidfd, message["exec_listener"])
+                finally:
+                    os.close(pidfd)
+                child_info.exec_listener_fd = listener_fd
+                selector.register(listener_fd, selectors.EVENT_READ, FdInfo(dag_hash, "exec"))
+            elif set(message) == {"network_listener"} and type(message["network_listener"]) is int:
+                if (
+                    child_info.network_listener_fd >= 0
+                    or message["network_listener"] < 0
+                    or child_info.network_proxy_address is None
+                ):
+                    continue
+                pid = child_info.proc.pid
+                if pid is None:
+                    continue
+                pidfd = spack.sandbox.pidfd_open(pid)
+                try:
+                    listener_fd = spack.sandbox.pidfd_getfd(pidfd, message["network_listener"])
+                except BaseException:
+                    os.close(pidfd)
+                    raise
+                child_info.network_pidfd = pidfd
+                child_info.network_listener_fd = listener_fd
+
+                def record_executable(path: str) -> None:
+                    if os.path.isfile(path) and os.access(path, os.X_OK):
+                        if path not in child_info.exec_candidates:
+                            child_info.exec_candidates.append(path)
+
+                supervisor = spack.util.proxy.ConnectSupervisor(
+                    listener_fd,
+                    pid,
+                    pidfd,
+                    child_info.network_proxy_address,
+                    thread_group_id=_build_process_group_id,
+                    executable_logger=(
+                        record_executable if spack.install_worker.learning.enabled() else None
+                    ),
+                )
+
+                def supervise() -> None:
+                    try:
+                        supervisor.serve(child_info.network_supervisor_stop)
+                    except BaseException as error:
+                        child_info.network_supervisor_errors.append(error)
+                        child_info.proc.terminate()
+
+                thread = threading.Thread(target=supervise)
+                thread.daemon = True
+                child_info.network_supervisor_thread = thread
+                thread.start()
 
         return True
+
+    def _handle_exec_notification(
+        self, child_info: ChildInfo, selector: selectors.BaseSelector
+    ) -> None:
+        """Record one bounded exec attempt and let Landlock enforce it."""
+        listener_fd = child_info.exec_listener_fd
+        seccomp = spack.sandbox.SeccompSandbox()
+        try:
+            notification = seccomp.receive_notification(listener_fd)
+        except OSError:
+            try:
+                selector.unregister(listener_fd)
+            except (KeyError, ValueError, OSError):
+                pass
+            return
+        try:
+            path = seccomp.resolved_executable_path(notification)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                if path not in child_info.exec_candidates:
+                    child_info.exec_candidates.append(path)
+        except (OSError, UnicodeError):
+            pass
+        finally:
+            try:
+                if seccomp.notification_is_valid(listener_fd, notification.id):
+                    seccomp.continue_notification(listener_fd, notification.id)
+            except OSError:
+                pass

@@ -9,10 +9,16 @@ import sys
 import pytest
 
 import spack.error
+import spack.install_worker.learning
 import spack.spec
 from spack.config import Configuration
 from spack.installer.base import ExitCode
-from spack.installer.core import PackageInstaller, read_connection, write_connection
+from spack.installer.core import (
+    PackageInstaller,
+    _build_process_group_id,
+    read_connection,
+    write_connection,
+)
 from spack.installer.ui import ChangeJobs, SetEcho
 from spack.store import Store
 from spack.test.installer.conftest import (
@@ -75,6 +81,13 @@ class TestPackageInstallerConstructor:
         assert installer.dependencies_policy == "cache_only"
 
 
+def test_build_process_group_identity(monkeypatch):
+    monkeypatch.setattr(os, "getpgid", lambda pid: 1234)
+
+    assert _build_process_group_id(5678, lambda: True) == 1234
+    assert _build_process_group_id(5678, lambda: False) is None
+
+
 @pytest.mark.disable_clean_stage_check  # failed builds keep their log file in the stage root
 def test_build_failure_reported_through_event_loop(temporary_store, mock_packages):
     """A build exiting with an error yields exactly one failed event, an InstallError naming the
@@ -116,6 +129,76 @@ def test_cache_miss_falls_back_to_source_build(
     assert ("state_changed", dag_hash, "finished") in ui.events
     record = _record(temporary_store, spec)
     assert record is not None and record.explicit
+
+
+def test_learning_grants_and_retries_build(
+    temporary_store, mock_packages, mutable_config, monkeypatch
+):
+    mutable_config.set("config:sandbox:learning:enabled", True)
+    spec = _make_concrete("trivial-install-test-package")
+    executable = "/usr/bin/true"
+    denial = (executable + ": Permission denied\n").encode()
+    launcher = ScriptedLauncher(
+        {
+            spec.name: [
+                Script(
+                    exitcode=ExitCode.BUILD_ERROR, output=denial, exec_candidates=(executable,)
+                ),
+                Script(),
+            ]
+        }
+    )
+    learned = []
+    monkeypatch.setattr(
+        spack.install_worker.learning,
+        "learn_executable",
+        lambda learned_spec, path: learned.append((learned_spec, path)) or path,
+    )
+
+    ui = _install(launcher, spec)
+
+    assert learned == [(spec, executable)]
+    assert len(launcher.requests) == 2
+    assert ("build_removed", spec.dag_hash()) in ui.events
+
+
+def test_learning_persists_unique_network_destinations(
+    temporary_store, mock_packages, mutable_config, monkeypatch
+):
+    mutable_config.set("config:sandbox:learning:enabled", True)
+    spec = _make_concrete("trivial-install-test-package")
+    destination = "https://github.com:443"
+    launcher = ScriptedLauncher({spec.name: Script(network_attempts=(destination, destination))})
+    learned = []
+    monkeypatch.setattr(
+        spack.install_worker.learning,
+        "learn_network_destination",
+        lambda learned_spec, url: learned.append((learned_spec, url)),
+    )
+
+    _install(launcher, spec)
+
+    assert learned == [(spec, destination)]
+
+
+@pytest.mark.disable_clean_stage_check
+def test_learning_stops_on_repeated_denial(
+    temporary_store, mock_packages, mutable_config, monkeypatch
+):
+    mutable_config.set("config:sandbox:learning:enabled", True)
+    spec = _make_concrete("trivial-install-test-package")
+    executable = "/usr/bin/true"
+    denial = (executable + ": Permission denied\n").encode()
+    failure = Script(exitcode=ExitCode.BUILD_ERROR, output=denial, exec_candidates=(executable,))
+    launcher = ScriptedLauncher({spec.name: [failure, failure]})
+    monkeypatch.setattr(
+        spack.install_worker.learning, "learn_executable", lambda learned_spec, path: path
+    )
+
+    with pytest.raises(spack.error.InstallError):
+        _install(launcher, spec)
+
+    assert len(launcher.requests) == 2
 
 
 def test_build_output_streams_to_frontend(temporary_store, mock_packages):

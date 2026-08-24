@@ -97,6 +97,8 @@ class Script(NamedTuple):
     raw_state: bytes = b""
     #: Keep the build running until the test calls finish() or the event loop terminates it.
     hang: bool = False
+    exec_candidates: Tuple[str, ...] = ()
+    network_attempts: Tuple[str, ...] = ()
 
 
 class FakeBuild(ProcessExitNotifier):
@@ -170,6 +172,8 @@ class ScriptedLauncher:
             write_connection(channels.state_w, script.raw_state)
         if script.output:
             write_connection(channels.output_w, script.output)
+            with open(request.log_path, "ab") as stream:
+                stream.write(script.output)
         build = FakeBuild(script.exitcode, channels)
         self.builds.append(build)
         if script.hang:
@@ -178,7 +182,7 @@ class ScriptedLauncher:
         else:
             # Finishing EOFs the channels and the exit notifier, like a child that exited.
             build.finish()
-        return ChildInfo(
+        child_info = ChildInfo(
             build,
             request.spec,
             channels.output_r,
@@ -187,6 +191,9 @@ class ScriptedLauncher:
             build,
             request.log_path,
         )
+        child_info.exec_candidates.extend(script.exec_candidates)
+        child_info.network_attempts.extend(script.network_attempts)
+        return child_info
 
 
 def _make_concrete(

@@ -671,6 +671,11 @@ def execute_install_time_tests(builder: Builder):
     if not builder.pkg.run_tests or not builder.install_time_test_callbacks:
         return
 
+    import spack.build_environment
+
+    spack.build_environment.setup_package(
+        builder.pkg, dirty=True, context=spack.build_environment.Context.TEST
+    )
     builder.pkg.tester.phase_tests(builder, "install", builder.install_time_test_callbacks)
 
 

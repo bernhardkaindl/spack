@@ -6,6 +6,7 @@ import pathlib
 
 import pytest
 
+import spack.build_environment
 import spack.builder
 import spack.concretize
 import spack.paths
@@ -170,6 +171,27 @@ def test_install_time_test_callback(
     with open(s.package.tester.test_log_file, "r", encoding="utf-8") as f:
         results = f.read().replace("\n", " ")
         assert "PyTestCallback test" in results
+
+
+def test_install_time_tests_use_test_environment(monkeypatch):
+    contexts = []
+    package = type("Package", (), {})()
+    package.run_tests = True
+    package.tester = type(
+        "Tester", (), {"phase_tests": lambda self, builder, phase, callbacks: None}
+    )()
+    builder = type(
+        "Builder", (), {"pkg": package, "install_time_test_callbacks": ["test_imports"]}
+    )()
+    monkeypatch.setattr(
+        spack.build_environment,
+        "setup_package",
+        lambda pkg, dirty, context: contexts.append((pkg, dirty, context)),
+    )
+
+    spack.builder.execute_install_time_tests(builder)
+
+    assert contexts == [(package, True, spack.build_environment.Context.TEST)]
 
 
 @pytest.mark.regression("43097")

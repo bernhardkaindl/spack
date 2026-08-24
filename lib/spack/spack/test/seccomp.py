@@ -83,6 +83,16 @@ def test_seccomp_network_listener():
     ]
 
 
+def test_seccomp_network_listener_can_include_exec():
+    spy = SpySeccompSandbox()
+
+    assert spy.network_listener(include_exec=True) == spy.listener_fd
+    assert spy.rules_added == [
+        (spy._get_syscall_number(name), spack.sandbox.SECCOMP_RET_USER_NOTIF)
+        for name in ("socket", "connect", "execve", "execveat")
+    ]
+
+
 def test_seccomp_denies_network_bypass_after_listener_transfer():
     spy = SpySeccompSandbox()
 
