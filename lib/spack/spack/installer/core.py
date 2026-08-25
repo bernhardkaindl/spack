@@ -495,6 +495,16 @@ class PackageInstaller:
                         child.proc.join()
                 except Exception:
                     pass
+                try:
+                    exit_code = child.proc.exitcode
+                    if exit_code == ExitCode.SUCCESS:
+                        child.commit_prefix()
+                    else:
+                        child.rollback_prefix(
+                            ExitCode.BUILD_ERROR if exit_code is None else exit_code
+                        )
+                except Exception:
+                    pass
 
             # Release all held locks best-effort, so that one failure does not prevent the others
             # from being released.

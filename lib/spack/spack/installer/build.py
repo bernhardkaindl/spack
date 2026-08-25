@@ -151,6 +151,7 @@ class ChildInfo:
         "notifier",
         "log_path",
         "prefix_lock",
+        "prefix_pivoter",
         "state_buffer",
         "exec_listener_fd",
         "exec_candidates",
@@ -176,6 +177,7 @@ class ChildInfo:
         network_proxy: Optional[spack.util.proxy.LocalHTTPProxy] = None,
         network_proxy_address: Optional[Tuple[str, int]] = None,
         network_attempts: Optional[List[str]] = None,
+        prefix_pivoter: Optional["PrefixPivoter"] = None,
     ) -> None:
         self.proc = proc
         self.spec = spec
@@ -185,6 +187,7 @@ class ChildInfo:
         self.notifier = notifier
         self.log_path = log_path
         self.prefix_lock: Optional[spack.util.lock.Lock] = None
+        self.prefix_pivoter = prefix_pivoter
         # Buffer for partially received state data from this child. Kept as raw bytes and split on
         # b"\n": the newline byte cannot occur inside a multi-byte UTF-8 sequence, so framing is
         # safe without decoding partial reads.
@@ -207,6 +210,23 @@ class ChildInfo:
             except Exception:
                 pass
         self.prefix_lock = None
+
+    def commit_prefix(self) -> None:
+        """Commit a successful build by discarding its saved original prefix."""
+        if self.prefix_pivoter is None:
+            return
+
+        prefix_pivoter, self.prefix_pivoter = self.prefix_pivoter, None
+        prefix_pivoter.commit()
+
+    def rollback_prefix(self, exit_code: int) -> None:
+        """Roll back a failed build and release ownership of its prefix pivot."""
+        if self.prefix_pivoter is None:
+            return
+
+        prefix_pivoter, self.prefix_pivoter = self.prefix_pivoter, None
+        error_type = BinaryCacheMiss if exit_code == ExitCode.BUILD_CACHE_MISS else RuntimeError
+        prefix_pivoter.rollback(error_type)
 
     def register_with_selector(self, selector: selectors.BaseSelector, build_id: str) -> None:
         """Register output, state, and sentinel channels with the selector."""
@@ -258,6 +278,10 @@ class ChildInfo:
         self.proc.join()
         exit_code = self.proc.exitcode
         assert exit_code is not None, "Finished build should have exit code set"
+        if exit_code == ExitCode.SUCCESS:
+            self.commit_prefix()
+        else:
+            self.rollback_prefix(exit_code)
         if hasattr(self.proc, "close"):  # No known equivalent in Python 3.6
             self.proc.close()
         return exit_code
@@ -336,7 +360,7 @@ def install_from_buildcache(
 
 
 class PrefixPivoter:
-    """Manages the installation prefix of a build."""
+    """Save an existing install prefix and either commit or roll back its replacement."""
 
     def __init__(self, prefix: str, keep_prefix: bool = False) -> None:
         """Initialize the prefix pivoter.
@@ -368,17 +392,25 @@ class PrefixPivoter:
     ) -> None:
         """Exit the context: cleanup on success, restore on failure."""
         if exc_type is None:
-            # Success: remove the backup
-            if self.tmp_prefix is not None:
-                self._rmtree_ignore_errors(self.tmp_prefix)
+            self.commit()
             return
 
-        # Failure handling:
-        if self.keep_prefix and not issubclass(exc_type, BinaryCacheMiss):
+        self.rollback(exc_type)
+
+    def commit(self) -> None:
+        """Keep the replacement prefix and discard the saved original prefix."""
+        if self.tmp_prefix is not None:
+            self._rmtree_ignore_errors(self.tmp_prefix)
+            self.tmp_prefix = None
+
+    def rollback(self, error_type: type) -> None:
+        """Apply failed-install policy and restore the saved prefix when required."""
+        if self.keep_prefix and not issubclass(error_type, BinaryCacheMiss):
             # Leave the failed prefix in place, discard the backup. Except for binary cache misses,
             # which is a scheduling failure and not a build failure.
             if self.tmp_prefix is not None:
                 self._rmtree_ignore_errors(self.tmp_prefix)
+                self.tmp_prefix = None
         elif self.tmp_prefix is not None:
             # There was a pre-existing prefix: pivot back to it and discard the failed build
             garbage = self._mkdtemp(dir=self.parent, prefix=".", suffix=OVERWRITE_GARBAGE_SUFFIX)
@@ -388,6 +420,7 @@ class PrefixPivoter:
             except FileNotFoundError:  # build never created the prefix dir
                 has_failed_prefix = False
             self._rename(self.tmp_prefix, self.prefix)
+            self.tmp_prefix = None
             if has_failed_prefix:
                 self._rmtree_ignore_errors(garbage)
         elif self._lexists(self.prefix):
@@ -519,8 +552,7 @@ def worker_function(
     exit_code = ExitCode.SUCCESS
 
     try:
-        with PrefixPivoter(spec.prefix, request.keep_prefix):
-            _install(request, state_stream, spack.store.STORE)
+        _install(request, state_stream, spack.store.STORE)
     except spack.error.StopPhase:
         exit_code = ExitCode.STOPPED_AT_PHASE
     except ProcessError as e:
@@ -950,7 +982,7 @@ def _stage_source(pkg: "spack.package_base.PackageBase", skip_patch: bool) -> No
 
 
 def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
-    """Start a new build in a child process."""
+    """Pivot the install prefix and start its build in a child process."""
     spec = request.spec
     channels = create_build_channels()
 
@@ -998,21 +1030,27 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
 
     # As a performance optimization, we do not serialize the environment which
     # is slow to serialize and not needed in the build job
-    proc = Process(
-        target=worker_function,
-        args=(
-            request,
-            channels.state_w,
-            channels.output_w,
-            channels.control_r,
-            channels.tee_control_w,
-            makeflags,
-            GlobalStateMarshaler(serialize_env=False),
-        ),
-    )
+    prefix_pivoter = PrefixPivoter(spec.prefix, request.keep_prefix)
+    prefix_pivoted = False
     try:
+        prefix_pivoter.__enter__()
+        prefix_pivoted = True
+        proc = Process(
+            target=worker_function,
+            args=(
+                request,
+                channels.state_w,
+                channels.output_w,
+                channels.control_r,
+                channels.tee_control_w,
+                makeflags,
+                GlobalStateMarshaler(serialize_env=False),
+            ),
+        )
         proc.start()
     except BaseException:
+        if prefix_pivoted:
+            prefix_pivoter.__exit__(*sys.exc_info())
         if network_proxy is not None:
             network_proxy.stop()
         raise
@@ -1031,6 +1069,7 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
         network_proxy,
         request.network_proxy_address,
         network_attempts,
+        prefix_pivoter,
     )
 
 
