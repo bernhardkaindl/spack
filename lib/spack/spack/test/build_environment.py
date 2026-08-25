@@ -551,6 +551,25 @@ def test_module_globals_available_at_setup_dependent_time(
     assert externaltool.package.test_attr
 
 
+@pytest.mark.not_on_windows("Windows doesn't use the compiler-wrapper")
+def test_compiler_globals_set_on_dependency_without_language_provider(
+    mutable_config, mock_packages, working_env
+):
+    """Dependencies without an effective language-provider edge still get compiler globals.
+
+    Build dependencies of non-root specs are omitted from the setup context, so their declared
+    language edges cannot populate globals such as ``spack_cxx``.
+    """
+    root = spack.concretize.concretize_one("mpileaks")
+    dependency = root["callpath"]
+    assert dependency.has_virtual_dependency("cxx")
+    dependency.package.module.__dict__.pop("spack_cxx", None)
+
+    spack.build_environment.setup_package(root.package, dirty=False)
+
+    assert dependency.package.module.spack_cxx == root.package.module.spack_cxx
+
+
 def test_build_jobs_sequential_is_sequential():
     assert (
         spack.config.determine_number_of_jobs(
