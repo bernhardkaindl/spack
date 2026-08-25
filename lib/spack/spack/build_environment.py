@@ -131,6 +131,13 @@ SPACK_DEBUG_LOG_DIR = "SPACK_DEBUG_LOG_DIR"
 SPACK_CCACHE_BINARY = "SPACK_CCACHE_BINARY"
 SPACK_SYSTEM_DIRS = "SPACK_SYSTEM_DIRS"
 
+#: Package API globals that language providers define, per language virtual.
+COMPILER_GLOBALS = {
+    "c": ("spack_cc",),
+    "cxx": ("spack_cxx",),
+    "fortran": ("spack_fc", "spack_f77"),
+}
+
 # Platform-specific library suffix (deprecated)
 if sys.platform == "darwin":
     dso_suffix = "dylib"
@@ -1041,6 +1048,39 @@ class SetupContext:
                 dependent_module = ModuleChangePropagator(spec.package)
                 pkg.setup_dependent_package(dependent_module, spec)
                 dependent_module.propagate_changes_to_mro()
+
+        self._set_inherited_compiler_globals()
+
+    def _set_inherited_compiler_globals(self) -> None:
+        """Define missing compiler globals of the package API on dependencies.
+
+        Language providers set ``spack_cc`` and friends through ``setup_dependent_package``, which
+        can only reach dependents whose language-provider edges are in this setup context. Build
+        dependencies of non-root specs are omitted, so those specs may declare a language without
+        receiving its globals. A build uses a single compiler wrapper, so the root's values are the
+        ones that apply.
+        """
+        if self.context != Context.BUILD:
+            return
+
+        root_module = self.specs[0].package.module
+        for dspec, flag in chain(self.external, self.nonexternal):
+            if UseMode.ROOT & flag or not self.should_set_package_py_globals & flag:
+                continue
+
+            inherited = {
+                name: getattr(root_module, name)
+                for names in COMPILER_GLOBALS.values()
+                for name in names
+                if hasattr(root_module, name) and not hasattr(dspec.package.module, name)
+            }
+            if not inherited:
+                continue
+
+            module = ModuleChangePropagator(dspec.package)
+            for name, value in inherited.items():
+                setattr(module, name, value)
+            module.propagate_changes_to_mro()
 
     def get_env_modifications(self) -> EnvironmentModifications:
         """Returns the environment variable modifications for the given input specs and context.
