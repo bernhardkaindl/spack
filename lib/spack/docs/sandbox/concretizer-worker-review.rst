@@ -12,6 +12,7 @@ It explains how normal commands reach the solver, where recipes run, why the who
 This is supporting review material, not a second plan or an implementation status page.
 The plan owns architecture approval, milestones, and acceptance criteria.
 The guide should be updated when implementation changes the call paths or resolves a proof point.
+See :ref:`concretizer-internals` for the current solver integration independent of this worker proposal.
 
 Correction to the Initial Exploration
 -------------------------------------
