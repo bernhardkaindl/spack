@@ -20,6 +20,7 @@ Documentation map
 * :doc:`checksum-command`: the ``spack checksum`` worker contract.
 * :doc:`network-supervisor`: proxy and download-worker network contract.
 * :doc:`install-worker`: staged design for the existing installer worker option.
+* :doc:`concretizer-worker`: staged design for confined recipe evaluation during solving.
 * :doc:`memory-pressure-scheduling`: planned Linux build admission and adaptive parallelism.
 
 .. toctree::
@@ -34,4 +35,5 @@ Documentation map
    checksum-command
    network-supervisor
    install-worker
+   concretizer-worker
    memory-pressure-scheduling
