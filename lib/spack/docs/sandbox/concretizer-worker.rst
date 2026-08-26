@@ -8,6 +8,7 @@ Concretizer Worker Plan
 
 This page plans confinement of recipe evaluation performed during concretization.
 It extends the existing concretizer instead of adding a command, solver, or package-data model.
+See :doc:`concretizer-worker-review` for the code paths, analysis of the initial exploration, and implementation review checklist.
 
 The target covers all normal paths through ``spack.concretize`` and the Clingo-based solver, including:
 
@@ -305,7 +306,7 @@ The confined worker owns:
 * post-concretization transformations; and
 * serialization of concrete specs and bounded solve metadata.
 
-The worker receives no direct network access and cannot execute another process.
+The worker receives no direct network access and no arbitrary process-execution capability.
 It reads all configured active repository roots, Spack and Python runtime files, Clingo modules and control files, and trusted configuration or database inputs proven necessary by focused tests.
 Inactive repositories and unrelated host paths remain inaccessible.
 The initial worker may write only its dedicated concretization-cache paths.
@@ -386,16 +387,20 @@ This includes ensuring Clingo is importable and determining whether repository i
 
 Parent preflight may prepare Clingo, indexes, configuration, and reuse inputs only where that work does not import ordinary package recipes.
 If Clingo bootstrap cannot avoid recipes, define the selected bootstrap recipes as a small trusted set with dedicated review and tests; do not turn bootstrap into a general parent-side recipe-import exception.
+Compiler-property detection may execute a selected compiler and write temporary and cache files on a cache miss.
+The initial implementation must prove that parent preflight can populate this data without ordinary recipe imports, or document and test a narrower supervised capability before granting it to the worker.
 
-Apply rlimits, Landlock, network denial, process denial, and IPC denial before request parsing can cause a recipe import.
+Apply rlimits, Landlock, network denial, denial of unapproved process execution, and IPC denial before request parsing can cause a recipe import.
 Add read paths only after a focused failure identifies a normal concretizer dependency.
 
 Acceptance checks:
 
 * [ ] the first selected and transitive recipe imports occur only after confinement is active;
-* [ ] recipe attempts to write files, open sockets, execute programs, or use blocked IPC fail;
+* [ ] recipe attempts to write files, open sockets, execute unapproved programs, or use blocked IPC fail;
 * [ ] inactive repositories and unrelated host paths are inaccessible;
 * [ ] normal Clingo import and control-file reads succeed;
+* [ ] compiler-property cache hits need no worker process execution or unrelated writes;
+* [ ] a cache miss fails clearly unless a separately approved narrow mechanism handles it;
 * [ ] only dedicated concretization-cache paths are writable;
 * [ ] cache path selection cannot be influenced by recipe data; and
 * [ ] direct kernel-boundary tests run on a supported Linux Landlock host.
