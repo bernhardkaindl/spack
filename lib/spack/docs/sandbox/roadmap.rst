@@ -76,7 +76,7 @@ The implemented checksum boundary needs additional compatibility coverage:
 Later command boundaries
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-* Harden ``spack spec`` and environment concretization.
+* Harden ``spack spec``, environment concretization, and implicit install concretization through the shared :doc:`concretizer-worker` plan.
 * Continue installation and staging hardening through :doc:`install-worker`.
 * See :doc:`planned-work` for namespace isolation and later assessments.
 
