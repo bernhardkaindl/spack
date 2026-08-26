@@ -30,9 +30,8 @@ Planning status:
 * [x] Prepare a recommended implementation direction and architecture comparison.
 * [x] Resolve fallback, initial scope, preflight, cache, and worker-lifetime decisions.
 * [x] Resolve the remaining decision gates at the end of this page.
-* [ ] Record final approval of the architecture decision package.
-* [ ] Measure normal and large solve request, response, memory, and runtime bounds.
-* [ ] Implement the bounded worker contract without changing solve semantics.
+* [x] Record final approval of the architecture decision package.
+* [ ] Implement the scalable worker contract without changing solve semantics.
 * [ ] Apply confinement before the first recipe import in the worker.
 * [ ] Integrate every shared concretization strategy.
 * [ ] Validate command, environment, install, fallback, and direct-API behavior.
@@ -137,9 +136,11 @@ Costs and risks:
 
 * The worker must be allowed to read Clingo modules and control files in addition to repositories and the Spack runtime.
 * Clingo bootstrap, repository indexes, compiler configuration, and other required writes must be completed by the parent or narrowly designed before confinement.
-* The request and response limits must accommodate environments and concrete DAGs larger than the current four-MiB command-worker limit.
-* A fixed one-GiB recipe-import memory limit may be too small for large solves and must be measured.
-* Solver progress, timers, statistics, warnings, and rich exception details need explicit bounded transport rather than raw worker standard output.
+* The current single-message four-MiB worker transport is not suitable for arbitrarily large valid environments and concrete DAGs.
+  The concretizer needs streaming, multiple bounded frames, or an equivalent scalable transport.
+* The generic 120-second worker timeout and fixed one-GiB recipe-import memory limit are not valid concretizer defaults.
+  Existing solver timeout semantics and limits inherited from the invoking process or service must be preserved unless an administrator explicitly configures a narrower resource policy.
+* Solver progress, timers, statistics, warnings, and rich exception details need explicit structured transport rather than raw worker standard output.
 * Fork-only launch means unsupported hosts need the existing in-process path.
 
 Estimated implementation size:
@@ -249,8 +250,8 @@ Consequences of approval
 Approval means:
 
 * the first implementation must not introduce a recipe-fact DTO, exported ASP protocol, remote solver, persistent solver service, or separate concretizer command;
-* worker output is untrusted until the parent validates the complete bounded response;
-* parent-side validation must verify protocol shape, limits, concrete native-spec structure, requested-root association, and all invariants that do not require importing recipes;
+* worker output is untrusted until the parent validates the complete structured response;
+* parent-side validation must verify protocol shape, transport safety limits, concrete native-spec structure, requested-root association, and all invariants that do not require importing recipes;
 * recipe-dependent semantic validation remains inside the confined worker;
 * cache writes are part of the initial confinement policy, not a reason to move solving back into the parent;
 * unsupported-host compatibility uses the existing in-process implementation only according to ``config:sandbox:allow_fallback``; and
@@ -291,8 +292,8 @@ The trusted parent owns:
 * command parsing and concretization policy selection;
 * active environment, repository, configuration, compiler, store, and reuse selection;
 * safe preflight work required before irreversible confinement;
-* worker launch, timeout, cancellation, cleanup, and fallback selection;
-* request and response size limits and structural validation;
+* worker launch, existing solver timeout semantics, cancellation, cleanup, and fallback selection;
+* transport resource policy and structural response validation;
 * environment and lockfile mutation;
 * continuation into the existing installer; and
 * terminal and machine-readable output.
@@ -304,7 +305,7 @@ The confined worker owns:
 * recipe directive and package metadata evaluation;
 * ASP setup, Clingo execution, and model reconstruction;
 * post-concretization transformations; and
-* serialization of concrete specs and bounded solve metadata.
+* serialization of concrete specs and structured solve metadata.
 
 The worker receives no direct network access and no arbitrary process-execution capability.
 It reads all configured active repository roots, Spack and Python runtime files, Clingo modules and control files, and trusted configuration or database inputs proven necessary by focused tests.
@@ -314,7 +315,9 @@ No other filesystem write access is granted.
 
 Recipe-controlled text is untrusted data.
 Raw worker standard output is never forwarded to the terminal or interpreted as a response.
-All returned fields are bounded and validated before the parent constructs native specs or takes an action.
+All returned fields are validated before the parent constructs native specs or takes an action.
+Recipe-controlled diagnostics and individual transport frames are bounded.
+The protocol must also prevent an untrusted worker from exhausting parent memory or storage with an unending response, but this safety policy must not encode an expected maximum environment or DAG size.
 
 Fallback Contract
 -----------------
@@ -335,13 +338,23 @@ Tests must force capability outcomes; they must not silently pass by falling bac
 Incremental Delivery Plan
 -------------------------
 
-1. Measure and freeze the contract
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Define and prove a scalable contract
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Start with the smallest one-shot ``concretize_one`` solve over test repositories.
-Measure serialized abstract inputs, concrete outputs, peak memory, solve time, and diagnostics for small, representative, and large solves before choosing limits.
-Use scalable checked-in test-repository DAGs for deterministic acceptance gates.
-Also record a representative real environment benchmark to cover realistic package metadata, serialization shape, peak memory, and runtime without making CI depend on an external repository.
+Use scalable checked-in test-repository DAGs to prove that the protocol does not assume the current four-MiB single-message limit or another expected maximum solve size.
+A representative real environment benchmark may record serialization overhead, peak memory, and runtime, but it does not define a supported maximum.
+
+Moving the solver into a worker must not add a default limit on valid request size, concrete-DAG size, solver memory, or solve duration.
+The implementation still needs transport safety because the worker response is untrusted:
+
+* reject an individual frame whose declared size exceeds the protocol's frame limit before allocating it;
+* bound recipe-controlled diagnostics;
+* process large native-spec data incrementally or through multiple bounded frames; and
+* apply an administrative total transport-resource ceiling only if needed to prevent unbounded parent memory or storage consumption.
+
+Any total ceiling must be configurable, documented as a security resource policy rather than a normal solve-size expectation, and produce a specific diagnostic.
+It must not silently select in-process fallback.
 
 The versioned request should contain only JSON-compatible values:
 
@@ -361,9 +374,12 @@ The response should contain:
 Acceptance checks:
 
 * [ ] native abstract and concrete specs round trip without importing a recipe in the parent;
-* [ ] duplicate keys, unknown fields, wrong types, stale versions, malformed specs, and oversized messages fail before parent-side mutation;
+* [ ] duplicate keys, unknown fields, wrong types, stale versions, malformed specs, and invalid or oversized frames fail before parent-side mutation;
 * [ ] a worker cannot use raw standard output as a response channel;
-* [ ] request, response, timeout, diagnostic, and memory limits come from measurements; and
+* [ ] large valid requests and concrete DAGs are not rejected because they exceed the shared command worker's single-message limit;
+* [ ] moving to a worker adds no default solve-duration or solver-memory limit;
+* [ ] existing ``concretizer:timeout`` and ``concretizer:error_on_timeout`` behavior is preserved;
+* [ ] transport and diagnostic safety limits are independent of expected solve complexity; and
 * [ ] Python 3.6-compatible syntax and existing native-spec formats are retained where feasible.
 
 2. Prove one-shot solve parity before confinement
@@ -448,7 +464,7 @@ Acceptance checks:
 * [ ] bootstrap, buildcache, mirror, developer, and other direct concretization callers preserve behavior through the shared policy;
 * [ ] a CI lane runs representative concretization suites with a real worker and no fallback;
 * [ ] unsupported-host tests prove the configured direct fallback without claiming confinement;
-* [ ] performance and peak memory regressions are recorded for small and large environments; and
+* [ ] performance and peak memory regressions are recorded for small and large environments without turning those observations into compatibility ceilings; and
 * [ ] status and roadmap documentation are updated as each milestone lands.
 
 Prior Branch Assessment
@@ -477,7 +493,8 @@ They become implementation decisions when the architecture approval record is co
 * [x] Together and multi-round solves use one new worker per operation.
   Separate solves may fork one worker per root, with concurrency capped by ``-j`` or configured jobs.
 * [x] The initial worker may read every configured active repository root, but not inactive repositories or unrelated host paths.
-* [x] Scalable checked-in fixtures provide deterministic limit and overhead gates, supplemented by a recorded representative real-environment benchmark.
+* [x] Scalable checked-in fixtures prove transport compatibility beyond ordinary command-worker message sizes.
+  A representative real-environment benchmark may track overhead but does not define a supported maximum.
 * [x] User-visible warning and error order is preserved.
   Timers and solver statistics require structured semantic equivalence rather than byte-for-byte presentation parity.
 

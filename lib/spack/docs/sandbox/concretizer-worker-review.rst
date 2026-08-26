@@ -300,8 +300,10 @@ Review the implementation in vertical increments:
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 * Confirm abstract requests and concrete responses are native-spec data, not pickle or recipe objects.
-* Require rejection of duplicate keys, unknown fields, stale protocol versions, malformed specs, oversized messages, and root mismatches.
-* Derive message, memory, timeout, and diagnostic limits from checked-in scalable fixtures and a recorded real environment.
+* Require rejection of duplicate keys, unknown fields, stale protocol versions, malformed specs, invalid or oversized frames, and root mismatches.
+* Require scalable transport for large valid requests and concrete DAGs rather than deriving a supported maximum from fixtures.
+* Preserve existing solver timeout behavior and inherited resource limits; do not add default solver memory or wall-clock ceilings merely because execution moved into a worker.
+* Keep frame, diagnostic, and total transport-resource safeguards independent of expected solve complexity and require a clear diagnostic rather than in-process retry when one is exceeded.
 
 2. Launcher-neutral parity
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
