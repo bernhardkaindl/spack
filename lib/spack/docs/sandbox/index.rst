@@ -21,6 +21,7 @@ Documentation map
 * :doc:`network-supervisor`: proxy and download-worker network contract.
 * :doc:`install-worker`: staged design for the existing installer worker option.
 * :doc:`concretizer-worker`: staged design for confined recipe evaluation during solving.
+* :doc:`concretizer-worker-review`: code-oriented reviewer guide for the concretizer worker.
 * :doc:`memory-pressure-scheduling`: planned Linux build admission and adaptive parallelism.
 
 .. toctree::
@@ -36,4 +37,5 @@ Documentation map
    network-supervisor
    install-worker
    concretizer-worker
+   concretizer-worker-review
    memory-pressure-scheduling
