@@ -766,6 +766,8 @@ To profile Spack, use Python's built-in `cProfile <https://docs.python.org/3/lib
 Debugging concretization
 ------------------------
 
+See :ref:`concretizer-internals` for the current command, environment, high-level API, solver, setup, Clingo, and result-construction architecture.
+
 When working on the ASP-based solver in ``lib/spack/spack/solver/``, it is often useful to inspect the raw facts and rules that clingo sees, and to run clingo directly outside of Spack.
 
 Generating ASP facts
