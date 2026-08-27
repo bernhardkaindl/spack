@@ -4,11 +4,16 @@
 
 import warnings
 
+import pytest
+
 import spack.concretize
 import spack.concretizer_worker as concretizer_worker
 import spack.config
+import spack.environment as ev
+import spack.installer_dispatch
 import spack.util.parallel
 import spack.util.sandbox
+from spack.main import SpackCommand
 from spack.spec import Spec
 
 
@@ -144,3 +149,68 @@ def test_separate_uses_configured_fallback(mock_packages, monkeypatch):
     result = spack.concretize.concretize_separately([(Spec("pkg-a"), None)])
 
     assert result[0][1].concrete
+
+
+@pytest.mark.disable_clean_stage_check
+def test_install_implicitly_concretizes_in_worker(mock_packages, monkeypatch):
+    worker_calls = []
+    installed_specs = []
+    real_solve = concretizer_worker.solve_in_worker
+
+    def solve_in_worker(specs, **kwargs):
+        worker_calls.append([str(spec) for spec in specs])
+        return real_solve(specs, **kwargs)
+
+    class RecordingInstaller:
+        reports = {}
+
+        def install(self):
+            pass
+
+    def create_installer(packages, **kwargs):
+        installed_specs.extend(package.spec for package in packages)
+        return RecordingInstaller()
+
+    monkeypatch.setattr(concretizer_worker, "solve_in_worker", solve_in_worker)
+    monkeypatch.setattr(spack.installer_dispatch, "create_installer", create_installer)
+
+    SpackCommand("install")("pkg-a")
+
+    assert worker_calls == [["pkg-a"]]
+    assert installed_specs and all(spec.concrete for spec in installed_specs)
+
+
+def test_environment_is_unchanged_after_invalid_worker_response(
+    tmp_path, mock_packages, monkeypatch
+):
+    environment = ev.create_in_dir(tmp_path)
+    environment.add("pkg-a")
+    real_runner = spack.util.sandbox.run_json_worker_streaming
+
+    def invalid_response(*args, **kwargs):
+        response = real_runner(*args, **kwargs)
+        response["results"][0]["duration"] = -1
+        return response
+
+    monkeypatch.setattr(spack.util.sandbox, "run_json_worker_streaming", invalid_response)
+
+    with pytest.raises(concretizer_worker.ConcretizerWorkerProtocolError):
+        environment.concretize()
+
+    assert not environment.concretized_roots
+    assert not environment.specs_by_hash
+
+
+def test_already_concretized_environment_does_not_launch_worker(
+    tmp_path, mock_packages, monkeypatch
+):
+    environment = ev.create_in_dir(tmp_path)
+    environment.add("pkg-a")
+    environment.concretize()
+    monkeypatch.setattr(
+        concretizer_worker,
+        "solve_in_worker",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("worker launched")),
+    )
+
+    assert environment.concretize() == []
