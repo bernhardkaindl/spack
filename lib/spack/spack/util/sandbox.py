@@ -13,6 +13,7 @@ import select
 import signal
 import socket
 import struct
+import tempfile
 import threading
 import time
 import traceback
@@ -22,6 +23,7 @@ MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 120
 _MESSAGE_PREFIX_BYTES = 8
 _MAX_FAILURE_DIAGNOSTIC_BYTES = 1024 * 1024
+_STREAM_FRAME_BYTES = 64 * 1024
 
 
 class JsonWorkerError(RuntimeError):
@@ -44,6 +46,12 @@ class _BoundedTextBuffer(io.StringIO):
             super().write(captured)
             self.size += len(captured.encode("utf-8"))
         return len(text)
+
+
+def _bounded_text(text: str, limit: int = _MAX_FAILURE_DIAGNOSTIC_BYTES) -> str:
+    """Return UTF-8 text truncated to at most ``limit`` encoded bytes."""
+    encoded = text.encode("utf-8", errors="replace")
+    return encoded[:limit].decode("utf-8", errors="ignore")
 
 
 def _reject_duplicate_keys(pairs):
@@ -126,6 +134,61 @@ def _read_message(fd: int, deadline: Optional[float] = None) -> Any:
         raise JsonWorkerError("sandbox worker message is not valid JSON") from error
 
 
+def _write_stream_message(fd: int, message: Any, deadline: Optional[float] = None) -> None:
+    """Write one JSON value as a sequence of bounded frames followed by an empty frame."""
+    encoder = json.JSONEncoder(allow_nan=False, separators=(",", ":"))
+    buffered = bytearray()
+    try:
+        for text in encoder.iterencode(message):
+            buffered.extend(text.encode("utf-8"))
+            while len(buffered) >= _STREAM_FRAME_BYTES:
+                frame = bytes(buffered[:_STREAM_FRAME_BYTES])
+                del buffered[:_STREAM_FRAME_BYTES]
+                _write_all(fd, struct.pack(">Q", len(frame)), deadline)
+                _write_all(fd, frame, deadline)
+    except (TypeError, ValueError) as error:
+        raise JsonWorkerError("sandbox worker message is not JSON compatible") from error
+
+    if buffered:
+        _write_all(fd, struct.pack(">Q", len(buffered)), deadline)
+        _write_all(fd, bytes(buffered), deadline)
+    _write_all(fd, struct.pack(">Q", 0), deadline)
+
+
+def _read_stream_message(
+    fd: int,
+    deadline: Optional[float] = None,
+    *,
+    spool_to_disk: bool = False,
+    max_total_bytes: Optional[int] = None,
+) -> Any:
+    """Read bounded JSON frames, optionally limiting total transport resources."""
+    stream = (
+        tempfile.SpooledTemporaryFile(max_size=MAX_MESSAGE_BYTES)
+        if spool_to_disk
+        else io.BytesIO()
+    )
+    total = 0
+    try:
+        while True:
+            size = struct.unpack(">Q", _read_exact(fd, _MESSAGE_PREFIX_BYTES, deadline))[0]
+            if size == 0:
+                break
+            if size > _STREAM_FRAME_BYTES:
+                raise JsonWorkerError("sandbox worker frame exceeds the byte limit")
+            total += size
+            if max_total_bytes is not None and total > max_total_bytes:
+                raise JsonWorkerError("sandbox worker response exceeds the resource limit")
+            stream.write(_read_exact(fd, size, deadline))
+
+        stream.seek(0)
+        return json.load(stream, object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise JsonWorkerError("sandbox worker message is not valid JSON") from error
+    finally:
+        stream.close()
+
+
 def _redirect_standard_streams() -> None:
     input_fd = os.open(os.devnull, os.O_RDONLY)
     output_fd = os.open(os.devnull, os.O_WRONLY)
@@ -198,10 +261,47 @@ def _run_child(
             _write_message(
                 response_fd,
                 {
-                    "error": f"{type(error).__name__}: {error}",
+                    "error": _bounded_text(f"{type(error).__name__}: {error}"),
                     "ok": False,
-                    "output": diagnostics.getvalue(),
-                    "traceback": traceback.format_exc(),
+                    "output": _bounded_text(diagnostics.getvalue()),
+                    "traceback": _bounded_text(traceback.format_exc()),
+                },
+            )
+        except BaseException:
+            pass
+        os._exit(1)
+    finally:
+        os.close(request_fd)
+        os.close(response_fd)
+    os._exit(0)
+
+
+def _run_stream_child(
+    request_fd: int,
+    response_fd: int,
+    worker: Callable[[Any], Any],
+    setup: Optional[Callable[[], None]],
+) -> None:
+    """Run a child using scalable framed JSON transport."""
+    diagnostics = _BoundedTextBuffer(_MAX_FAILURE_DIAGNOSTIC_BYTES)
+    try:
+        os.setsid()
+        _redirect_standard_streams()
+        _close_inherited_fds({0, 1, 2, request_fd, response_fd})
+        with contextlib.redirect_stdout(diagnostics), contextlib.redirect_stderr(diagnostics):
+            if setup:
+                setup()
+            result = worker(_read_stream_message(request_fd))
+        _write_stream_message(response_fd, {"ok": True, "result": result})
+    except BaseException as error:
+        try:
+            _write_stream_message(
+                response_fd,
+                {
+                    "error": _bounded_text(f"{type(error).__name__}: {error}"),
+                    "ok": False,
+                    "output": _bounded_text(diagnostics.getvalue()),
+                    "traceback": _bounded_text(traceback.format_exc()),
                 },
             )
         except BaseException:
@@ -248,6 +348,70 @@ def run_json_worker(
             os.close(request_fd)
 
         response = _read_message(response_fd, deadline)
+        completed = True
+    finally:
+        if not completed:
+            _terminate_worker(pid)
+        os.close(response_fd)
+        _, status = os.waitpid(pid, 0)
+
+    if not isinstance(response, dict):
+        raise JsonWorkerError("sandbox worker failed")
+    if set(response) == {"ok", "result"} and response["ok"] is True and status == 0:
+        return response["result"]
+    if set(response) == {"error", "ok", "output", "traceback"} and response["ok"] is False:
+        if all(isinstance(response[key], str) for key in ("error", "output", "traceback")):
+            message = "sandbox worker failed: {}\n{}{}".format(
+                response["error"], response["output"], response["traceback"]
+            )
+            raise JsonWorkerError(message)
+    raise JsonWorkerError("sandbox worker failed")
+
+
+def run_json_worker_streaming(
+    request: Any,
+    worker: Callable[[Any], Any],
+    setup: Optional[Callable[[], None]] = None,
+    timeout: Optional[float] = None,
+    max_response_bytes: Optional[int] = None,
+) -> Any:
+    """Run a POSIX child using scalable JSON split across bounded transport frames.
+
+    ``timeout`` and ``max_response_bytes`` are optional resource policies. Omitting them avoids
+    imposing generic solve-duration or response-size ceilings on callers such as concretization.
+    """
+    if not hasattr(os, "fork"):
+        raise JsonWorkerError("sandbox worker launcher is unsupported on this platform")
+    if timeout is not None and timeout <= 0:
+        raise ValueError("sandbox worker timeout must be positive")
+    if max_response_bytes is not None and max_response_bytes <= 0:
+        raise ValueError("sandbox worker response resource limit must be positive")
+
+    child_request_fd, request_fd = os.pipe()
+    response_fd, child_response_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(request_fd)
+        os.close(response_fd)
+        _run_stream_child(child_request_fd, child_response_fd, worker, setup)
+
+    os.close(child_request_fd)
+    os.close(child_response_fd)
+    response = None
+    status = None
+    completed = False
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    try:
+        _set_nonblocking(request_fd)
+        _set_nonblocking(response_fd)
+        try:
+            _write_stream_message(request_fd, request, deadline)
+        finally:
+            os.close(request_fd)
+
+        response = _read_stream_message(
+            response_fd, deadline, spool_to_disk=True, max_total_bytes=max_response_bytes
+        )
         completed = True
     finally:
         if not completed:
