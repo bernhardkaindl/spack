@@ -382,8 +382,8 @@ Acceptance checks:
 * [x] duplicate keys, unknown fields, wrong types, stale versions, malformed specs, and invalid or oversized frames fail before parent-side mutation;
 * [x] a worker cannot use raw standard output as a response channel;
 * [x] large valid requests and concrete DAGs are not rejected because they exceed the shared command worker's single-message limit;
-* [ ] moving to a worker adds no default solve-duration or solver-memory limit;
-* [ ] existing ``concretizer:timeout`` and ``concretizer:error_on_timeout`` behavior is preserved;
+* [x] moving to a worker adds no default solve-duration or solver-memory limit;
+* [x] existing ``concretizer:timeout`` and ``concretizer:error_on_timeout`` behavior is preserved;
 * [x] transport and diagnostic safety limits are independent of expected solve complexity;
 * [x] ordered root association is validated in the parent while virtual-provider and other recipe-dependent satisfaction checks remain worker-owned; and
 * [x] Python 3.6-compatible syntax and existing native-spec formats are retained where feasible.
@@ -392,14 +392,15 @@ Acceptance checks:
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Add a launcher-neutral worker function around the existing ``Solver.solve()``.
-Run it through ``run_json_worker`` with a no-op setup first, then restore its concrete result in the parent.
+Run it through the scalable JSON worker without confinement first, then restore its concrete result in the parent.
+The setup hook discards stale inherited lock handles and recreates the store and binary-cache index with fresh child-process state before request parsing.
 
 Acceptance checks:
 
-* [ ] direct and worker solves produce identical DAG hashes for representative versions, variants, virtuals, conflicts, externals, reuse, splicing, compiler, target, and test-dependency cases;
-* [ ] unsatisfiable, invalid-variant, unknown-package, timeout, and internal errors retain useful exception categories and bounded messages;
-* [ ] concretization-cache enabled and disabled behavior is explicitly tested; and
-* [ ] interrupts, worker timeout, truncated responses, crashes, and descriptor cleanup are tested.
+* [x] direct and worker solves produce identical DAG hashes for representative versions, variants, virtuals, externals, reuse, automatic splicing, compiler, platform, and test-dependency cases;
+* [x] unsatisfiable, invalid-variant, unknown-package, timeout configuration, and internal errors retain useful exception categories and bounded messages;
+* [x] concretization-cache enabled and disabled behavior is explicitly tested; and
+* [x] interrupts, worker timeout, truncated responses, crashes, and descriptor cleanup are tested.
 
 3. Apply recipe-import confinement
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

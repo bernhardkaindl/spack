@@ -171,6 +171,32 @@ def test_streaming_json_worker_honors_explicit_timeout():
     assert time.monotonic() - start < 0.5
 
 
+def test_streaming_json_worker_parent_interrupt_reaps_child(monkeypatch):
+    parent_pid = os.getpid()
+    real_read = spack.util.sandbox._read_stream_message
+    real_waitpid = os.waitpid
+    reaped = []
+
+    def interrupt_parent(fd, deadline=None, **kwargs):
+        if os.getpid() == parent_pid:
+            raise KeyboardInterrupt()
+        return real_read(fd, deadline, **kwargs)
+
+    def record_waitpid(pid, options):
+        result = real_waitpid(pid, options)
+        reaped.append(result)
+        return result
+
+    monkeypatch.setattr(spack.util.sandbox, "_read_stream_message", interrupt_parent)
+    monkeypatch.setattr(os, "waitpid", record_waitpid)
+
+    with pytest.raises(KeyboardInterrupt):
+        spack.util.sandbox.run_json_worker_streaming({}, _sleeping_worker)
+
+    assert len(reaped) == 1
+    assert os.WIFSIGNALED(reaped[0][1])
+
+
 def test_streaming_json_worker_enforces_optional_response_resource_limit():
     with pytest.raises(spack.util.sandbox.JsonWorkerError, match="resource limit"):
         spack.util.sandbox.run_json_worker_streaming(
@@ -208,6 +234,20 @@ def test_streaming_json_reader_rejects_duplicate_keys():
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+def test_streaming_json_reader_rejects_truncated_frame():
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, struct.pack(">Q", 10) + b"short")
+        os.close(write_fd)
+        write_fd = -1
+        with pytest.raises(spack.util.sandbox.JsonWorkerError, match="truncated"):
+            spack.util.sandbox._read_stream_message(read_fd)
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
 
 
 @pytest.mark.parametrize("payload", [b'{"field": 1, "field": 2}', None])
