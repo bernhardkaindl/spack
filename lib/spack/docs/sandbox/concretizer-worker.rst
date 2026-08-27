@@ -274,11 +274,11 @@ Approval record
 
 The final reviewer should change only the applicable approval boxes after reviewing this page:
 
-* [ ] Approve Alternative B as the initial concretizer-worker architecture.
-* [ ] Approve the parent and worker ownership described in :ref:`concretizer-worker-trust-boundary`.
-* [ ] Approve the agreed supporting decisions in :ref:`concretizer-worker-supporting-decisions`.
-* [ ] Accept the documented fork limitation for the initial implementation.
-* [ ] Reject Alternative A for the initial implementation without rejecting it for a future, separately justified solver-input protocol.
+* [x] Approve Alternative B as the initial concretizer-worker architecture.
+* [x] Approve the parent and worker ownership described in :ref:`concretizer-worker-trust-boundary`.
+* [x] Approve the agreed supporting decisions in :ref:`concretizer-worker-supporting-decisions`.
+* [x] Accept the documented fork limitation for the initial implementation.
+* [x] Reject Alternative A for the initial implementation without rejecting it for a future, separately justified solver-input protocol.
 
 If the primary architecture is not approved, record which scorecard criterion changes the decision and reopen the affected cost, protocol, and trust-boundary sections before implementation.
 
