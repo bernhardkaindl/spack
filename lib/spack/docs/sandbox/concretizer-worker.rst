@@ -413,7 +413,12 @@ If Clingo bootstrap cannot avoid recipes, define the selected bootstrap recipes 
 Compiler-property detection may execute a selected compiler and write temporary and cache files on a cache miss.
 The trusted parent imports only configured or installed compiler candidate recipes, executes their
 selected compiler tools, and populates compiler properties before confinement.
+It sends the detected host ``glibc`` or ``musl`` specs as an exact-external-spec request snapshot,
+so the worker does not execute compilers or infer libc compatibility after confinement.
 Those compiler recipes form a specially reviewed trusted set; this exception does not include ordinary requested or transitive recipes.
+
+Clingo bootstrap completes once in the trusted parent before worker launch.
+The worker does not select or install a different bootstrap DAG.
 
 When build-cache reuse is enabled, the trusted parent refreshes configured mirror indexes and sends the resulting concrete native specs as a frozen request snapshot.
 The worker applies the existing reuse filters to that snapshot and receives no network access.
@@ -438,6 +443,8 @@ Acceptance checks:
 * [x] normal Clingo import, threads, and control-file reads succeed;
 * [x] compiler-property cache hits need no worker process execution or unrelated writes;
 * [x] trusted compiler preflight handles cache misses before confinement;
+* [x] worker reuse consumes parent-detected host libc compatibility metadata;
+* [x] Clingo bootstrap completes in the parent before the worker is launched;
 * [x] only parent-selected misc-cache and concretization-cache paths are writable;
 * [x] cache path selection cannot be influenced by recipe data; and
 * [x] direct kernel-boundary tests run on a supported Linux Landlock host.
