@@ -33,6 +33,10 @@ An allowlisted error protocol preserves catchable Spack, configuration, spec, un
 
 Trusted parent preflight ensures Clingo is importable and imports only configured or installed
 compiler candidate recipes to populate compiler properties.
+Bootstrap completes once before worker launch, so worker selection does not select or install a
+different Clingo bootstrap DAG.
+Detected host ``glibc`` or ``musl`` specs cross the protocol as a validated frozen snapshot;
+libc reuse compatibility therefore does not depend on compiler execution inside the worker.
 Local-store specs and install metadata are frozen before every worker solve; build-cache candidates
 are refreshed and frozen only when enabled by reuse policy.
 The worker applies the existing reuse filters without store access or network refresh.
