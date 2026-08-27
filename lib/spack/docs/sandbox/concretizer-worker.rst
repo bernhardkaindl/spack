@@ -33,8 +33,8 @@ Planning status:
 * [x] Record final approval of the architecture decision package.
 * [x] Implement the scalable worker contract without changing solve semantics.
 * [x] Apply confinement before the first recipe import in the worker.
-* [ ] Integrate every shared concretization strategy.
-* [ ] Validate command, environment, install, fallback, and direct-API behavior.
+* [x] Integrate every approved high-level concretization strategy.
+* [x] Validate command, environment, install, fallback, and high-level direct-API behavior.
 
 Current Concretization Boundary
 -------------------------------
