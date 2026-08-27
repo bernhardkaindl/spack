@@ -524,6 +524,12 @@ def binary_index_location():
 BINARY_INDEX = cast(BinaryIndexCache, spack.util.lang.Singleton(BinaryIndexCache))
 
 
+def reinitialize_binary_index() -> None:
+    """Recreate the lazy binary index with fresh file-cache lock handles."""
+    global BINARY_INDEX
+    BINARY_INDEX = cast(BinaryIndexCache, spack.util.lang.Singleton(BinaryIndexCache))
+
+
 def compute_hash(data):
     if isinstance(data, str):
         data = data.encode("utf-8")

@@ -210,6 +210,50 @@ def test_response_rejects_reordered_results(mock_packages):
         concretizer_worker.validate_response(response, request)
 
 
+def test_response_allows_multiple_inputs_to_share_one_concrete_root(mock_packages):
+    abstract = [Spec("pkg-a"), Spec("pkg-a")]
+    concrete = spack.concretize.concretize_one("pkg-a")
+    request = concretizer_worker.create_request(abstract)
+
+    restored = concretizer_worker.validate_response(
+        concretizer_worker.create_response([concrete, concrete]), request
+    )
+
+    assert [spec.dag_hash() for spec in restored.specs] == [
+        concrete.dag_hash(),
+        concrete.dag_hash(),
+    ]
+
+
+def test_error_response_round_trip():
+    response = concretizer_worker.create_error_response("unsatisfiable", "cannot solve", "details")
+
+    error = concretizer_worker.validate_error_response(response)
+
+    assert error == concretizer_worker.ConcretizerWorkerErrorResponse(
+        "unsatisfiable", "cannot solve", "details"
+    )
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"error": {}, "protocol": concretizer_worker.PROTOCOL_VERSION},
+        {
+            "error": {"kind": "forged", "long_message": None, "message": "failure"},
+            "protocol": concretizer_worker.PROTOCOL_VERSION,
+        },
+        {
+            "error": {"kind": "spack", "long_message": None, "message": "x" * (2 * 1024 * 1024)},
+            "protocol": concretizer_worker.PROTOCOL_VERSION,
+        },
+    ],
+)
+def test_error_response_rejects_malformed_or_excessive_data(response):
+    with pytest.raises(concretizer_worker.ConcretizerWorkerProtocolError):
+        concretizer_worker.validate_error_response(response)
+
+
 @pytest.mark.parametrize(
     "mutate",
     [

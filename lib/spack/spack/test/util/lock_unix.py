@@ -53,6 +53,19 @@ if sys.platform != "win32":
 pytestmark = pytest.mark.not_on_windows("does not run on windows")
 
 
+def test_open_file_tracker_discards_externally_closed_handles_after_fork(tmp_path):
+    tracker = lk.OpenFileTracker()
+    tracked = tracker.create_and_track(str(tmp_path / "lock"))
+    os.close(tracked.fh.fileno())
+
+    tracker.discard_after_fork()
+
+    assert tracked.fh.closed
+    replacement = tracker.create_and_track(str(tmp_path / "lock"))
+    assert replacement.fh.fileno() >= 0
+    tracker.purge()
+
+
 #
 # This test can be run with MPI.  MPI is "enabled" if we can import
 # mpi4py and the number of total MPI processes is greater than 1.
