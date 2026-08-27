@@ -38,6 +38,7 @@ import spack.hooks
 import spack.install_worker
 import spack.install_worker.learning
 import spack.mirrors.mirror
+import spack.repo
 import spack.sandbox
 import spack.spec
 import spack.store
@@ -778,6 +779,9 @@ def _enable_sandbox(
     for dep in spec.traverse(root=False):
         if not dep.external:
             sandbox.allow_read(dep.prefix)
+
+    for repository in spack.repo.PATH.repos:
+        sandbox.allow_read(repository.root)
 
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)

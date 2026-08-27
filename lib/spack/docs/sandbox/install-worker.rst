@@ -251,8 +251,14 @@ The staging worker must import the selected package recipe after confinement is 
 It receives only the parent-selected concrete spec, repository state, and other minimal normal Spack state needed to invoke existing package methods.
 It must not depend on a new concretization or source-plan protocol.
 
+Build workers may also import dependency recipes lazily after confinement.
+This is required when a concrete spec was restored from the concretizer-worker protocol and does
+not carry inherited Python package objects.
+The build policy grants read-only access to every parent-selected active repository root; inactive
+repositories and unrelated host paths remain inaccessible.
+
 * [ ] Harden recipe evaluation used by ``spack spec`` and environment concretization as its own project.
-* [ ] Prove that a concrete spec produced directly or by a future concretizer worker enters the same installer worker path.
+* [x] Prove that a concrete spec produced directly or by the concretizer worker enters the same installer worker path.
 * [ ] Import the selected staging recipe only after worker confinement is active.
 
 Captured Prior-Branch Material

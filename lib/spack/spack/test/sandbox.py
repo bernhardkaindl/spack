@@ -21,6 +21,7 @@ from typing import List, Tuple, cast
 
 import spack.concretize
 import spack.installer.build
+import spack.repo
 import spack.sandbox
 import spack.spec
 import spack.store
@@ -504,6 +505,8 @@ def test_enable_sandbox_paths(
     allow_read_resolved = [c[1] for c in mock_sandbox.read_calls]
     for dep in spec.traverse(root=False):
         assert pathlib.Path(dep.prefix).resolve() in allow_read_resolved
+    for repository in spack.repo.PATH.repos:
+        assert pathlib.Path(repository.root).resolve() in allow_read_resolved
 
     # Verify symlink resolution in read_calls
     assert custom_read_target.resolve() in allow_read_resolved
@@ -530,6 +533,7 @@ def test_enable_sandbox_paths(
 def test_enable_sandbox_proxy_uses_network_listener(
     mock_packages, monkeypatch, temporary_store, tmp_path
 ):
+    spec = spack.concretize.concretize_one("trivial-install-test-package")
     mock_sandbox = MockSandbox()
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
     monkeypatch.setattr(spack.sandbox, "set_build_worker_rlimits", lambda: None)
@@ -553,7 +557,6 @@ def test_enable_sandbox_proxy_uses_network_listener(
         monkeypatch.setenv(name.upper(), "inherited")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "inherited")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
-    spec = spack.concretize.concretize_one("trivial-install-test-package")
     pathlib.Path(spec.prefix).mkdir(parents=True, exist_ok=True)
     stage_path = tmp_path / "stage"
     stage_path.mkdir()
