@@ -180,11 +180,12 @@ def test_install_implicitly_concretizes_in_worker(mock_packages, monkeypatch):
     assert installed_specs and all(spec.concrete for spec in installed_specs)
 
 
-def test_environment_is_unchanged_after_invalid_worker_response(
+def test_concretize_command_does_not_write_lockfile_after_invalid_worker_response(
     tmp_path, mock_packages, monkeypatch
 ):
     environment = ev.create_in_dir(tmp_path)
     environment.add("pkg-a")
+    environment.write()
     real_runner = spack.util.sandbox.run_json_worker_streaming
 
     def invalid_response(*args, **kwargs):
@@ -194,11 +195,13 @@ def test_environment_is_unchanged_after_invalid_worker_response(
 
     monkeypatch.setattr(spack.util.sandbox, "run_json_worker_streaming", invalid_response)
 
-    with pytest.raises(concretizer_worker.ConcretizerWorkerProtocolError):
-        environment.concretize()
+    with environment:
+        with pytest.raises(concretizer_worker.ConcretizerWorkerProtocolError):
+            SpackCommand("concretize")()
 
     assert not environment.concretized_roots
     assert not environment.specs_by_hash
+    assert not (tmp_path / ev.lockfile_name).exists()
 
 
 def test_already_concretized_environment_does_not_launch_worker(
