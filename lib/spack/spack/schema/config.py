@@ -251,6 +251,18 @@ properties: Dict[str, Any] = {
                         "description": "Allow sandboxed commands to use their trusted direct "
                         "path when worker confinement is unavailable.",
                     },
+                    "concretizer": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "max_response_bytes": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Maximum total bytes accepted from one "
+                                "concretizer worker response.",
+                            }
+                        },
+                    },
                     "learning": {
                         "type": "object",
                         "additionalProperties": False,

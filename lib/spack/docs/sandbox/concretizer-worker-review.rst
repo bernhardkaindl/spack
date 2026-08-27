@@ -304,6 +304,7 @@ Review the implementation in vertical increments:
 * Require scalable transport for large valid requests and concrete DAGs rather than deriving a supported maximum from fixtures.
 * Preserve existing solver timeout behavior and inherited resource limits; do not add default solver memory or wall-clock ceilings merely because execution moved into a worker.
 * Keep frame, diagnostic, and total transport-resource safeguards independent of expected solve complexity and require a clear diagnostic rather than in-process retry when one is exceeded.
+* Verify the launcher passes ``config:sandbox:concretizer:max_response_bytes`` to the transport; the one-GiB default is a security resource ceiling, not an expected maximum solve size.
 * Validate ordered input/result association and native-spec integrity in the parent.
   Keep virtual-provider and other recipe-dependent satisfaction checks in the worker; rebuilding provider metadata in the parent would execute the recipe code being confined.
 

@@ -178,6 +178,15 @@ def test_streaming_json_worker_enforces_optional_response_resource_limit():
         )
 
 
+def test_streaming_json_worker_has_finite_default_response_limit():
+    assert spack.util.sandbox.DEFAULT_STREAM_RESPONSE_BYTES == 1024 * 1024 * 1024
+
+
+def test_streaming_json_worker_rejects_invalid_response_resource_limit():
+    with pytest.raises(ValueError, match="resource limit must be positive"):
+        spack.util.sandbox.run_json_worker_streaming({}, _echo_worker, max_response_bytes=0)
+
+
 def test_streaming_json_reader_rejects_oversized_frame_before_payload():
     read_fd, write_fd = os.pipe()
     try:
