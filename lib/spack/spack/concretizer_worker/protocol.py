@@ -4,11 +4,12 @@
 
 """Versioned structured messages for confined concretizer workers."""
 
+import math
 from typing import Any, Dict, Iterable, List, NamedTuple, Sequence, Union
 
 import spack.spec
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 TOGETHER = "together"
 WHEN_POSSIBLE = "when_possible"
 SEPARATELY = "separately"
@@ -26,7 +27,7 @@ _REQUEST_KEYS = {
     "tests",
 }
 _RESPONSE_KEYS = {"protocol", "results", "warnings"}
-_RESULT_KEYS = {"dag_hash", "input", "spec"}
+_RESULT_KEYS = {"dag_hash", "duration", "input", "spec"}
 _ERROR_RESPONSE_KEYS = {"error", "protocol"}
 _ERROR_KEYS = {"kind", "long_message", "message"}
 ERROR_KINDS = (
@@ -68,6 +69,7 @@ class ConcretizerWorkerResponse(NamedTuple):
 
     specs: List[spack.spec.Spec]
     warnings: List[str]
+    durations: List[float]
 
 
 class ConcretizerWorkerErrorResponse(NamedTuple):
@@ -292,7 +294,9 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
 
 
 def create_response(
-    specs: Sequence[spack.spec.Spec], warnings: Iterable[str] = ()
+    specs: Sequence[spack.spec.Spec],
+    warnings: Iterable[str] = (),
+    durations: Union[Sequence[float], None] = None,
 ) -> Dict[str, Any]:
     """Create a JSON-compatible response without imposing a concrete-DAG size ceiling."""
     if not isinstance(specs, Sequence) or isinstance(specs, (str, bytes)) or not specs:
@@ -308,11 +312,28 @@ def create_response(
             "concretizer-worker response has invalid warnings"
         ) from error
     _validate_warnings(warning_list)
+    if durations is None:
+        durations = [0.0] * len(specs)
+    if (
+        not isinstance(durations, Sequence)
+        or isinstance(durations, (str, bytes))
+        or len(durations) != len(specs)
+        or not all(
+            type(duration) in (int, float) and math.isfinite(duration) and duration >= 0
+            for duration in durations
+        )
+    ):
+        raise ConcretizerWorkerProtocolError("concretizer-worker response has invalid durations")
 
     return {
         "protocol": PROTOCOL_VERSION,
         "results": [
-            {"dag_hash": spec.dag_hash(), "input": index, "spec": spec.to_dict()}
+            {
+                "dag_hash": spec.dag_hash(),
+                "duration": float(durations[index]),
+                "input": index,
+                "spec": spec.to_dict(),
+            }
             for index, spec in enumerate(specs)
         ],
         "warnings": warning_list,
@@ -373,6 +394,7 @@ def validate_response(response: Any, request: Any) -> ConcretizerWorkerResponse:
         )
 
     specs = []
+    durations = []
     for expected_index, result in enumerate(response["results"]):
         if not isinstance(result, dict) or set(result) != _RESULT_KEYS:
             raise ConcretizerWorkerProtocolError(
@@ -381,6 +403,14 @@ def validate_response(response: Any, request: Any) -> ConcretizerWorkerResponse:
         if type(result["input"]) is not int or result["input"] != expected_index:
             raise ConcretizerWorkerProtocolError(
                 "concretizer-worker response has invalid input ordering"
+            )
+        if (
+            type(result["duration"]) not in (int, float)
+            or not math.isfinite(result["duration"])
+            or result["duration"] < 0
+        ):
+            raise ConcretizerWorkerProtocolError(
+                "concretizer-worker response has an invalid duration"
             )
         if not isinstance(result["dag_hash"], str) or not result["dag_hash"]:
             raise ConcretizerWorkerProtocolError(
@@ -405,5 +435,6 @@ def validate_response(response: Any, request: Any) -> ConcretizerWorkerResponse:
                 "concretizer-worker response DAG hash does not match its spec"
             )
         specs.append(spec)
+        durations.append(float(result["duration"]))
 
-    return ConcretizerWorkerResponse(specs, list(warnings))
+    return ConcretizerWorkerResponse(specs, list(warnings), durations)

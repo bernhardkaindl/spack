@@ -8,8 +8,9 @@ import functools
 import os
 import pathlib
 import sysconfig
+import time
 import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import spack.binary_distribution
 import spack.caches
@@ -26,7 +27,9 @@ import spack.store
 import spack.util.sandbox
 from spack.concretizer_worker.protocol import (
     ERROR_KINDS,
+    SEPARATELY,
     TOGETHER,
+    WHEN_POSSIBLE,
     ConcretizerWorkerProtocolError,
     ConcretizerWorkerResponse,
     TestsType,
@@ -150,12 +153,10 @@ def _preflight_compiler_properties(
 def solve_request(
     request: Dict[str, Any], specs_factory: Optional["SpecFiltersFactory"] = None
 ) -> Dict[str, Any]:
-    """Run one validated together solve and return structured concrete roots."""
+    """Run one validated solve operation and return structured concrete roots."""
     validated = validate_request(request)
-    if validated.strategy != TOGETHER:
-        raise ConcretizerWorkerProtocolError(
-            "concretizer-worker solve supports only the together strategy"
-        )
+    if validated.strategy not in (TOGETHER, WHEN_POSSIBLE, SEPARATELY):
+        raise ConcretizerWorkerProtocolError("unsupported concretizer-worker solve strategy")
 
     # Importing the solver here keeps recipe evaluation on the worker side of a future setup hook.
     from spack.solver.asp import Solver
@@ -168,16 +169,39 @@ def solve_request(
             validated.local_deprecated_for,
         ):
             with warnings.catch_warnings(record=True) as caught:
-                result = Solver(specs_factory=specs_factory).solve(
-                    validated.specs,
-                    tests=validated.tests,
-                    allow_deprecated=validated.allow_deprecated,
-                )
+                solver = Solver(specs_factory=specs_factory)
+                if validated.strategy != WHEN_POSSIBLE:
+                    start = time.monotonic()
+                    result = solver.solve(
+                        validated.specs,
+                        tests=validated.tests,
+                        allow_deprecated=validated.allow_deprecated,
+                    )
+                    specs = result.specs
+                    durations = [time.monotonic() - start] * len(specs)
+                else:
+                    specs_by_input = {}
+                    durations_by_input = {}
+                    start = time.monotonic()
+                    for result in solver.solve_in_rounds(
+                        validated.specs,
+                        tests=validated.tests,
+                        allow_deprecated=validated.allow_deprecated,
+                    ):
+                        duration = time.monotonic() - start
+                        for abstract, concrete in result.specs_by_input.items():
+                            specs_by_input[abstract] = concrete
+                            durations_by_input[abstract] = duration
+                        start = time.monotonic()
+                    specs = [specs_by_input[abstract] for abstract in validated.specs]
+                    durations = [durations_by_input[abstract] for abstract in validated.specs]
     except spack.error.SpackError as error:
         return _error_response(error)
     except AssertionError as error:
         return create_error_response("assertion", str(error))
-    return create_response(result.specs, warnings=[str(item.message) for item in caught])
+    return create_response(
+        specs, warnings=[str(item.message) for item in caught], durations=durations
+    )
 
 
 def _raise_worker_error(response: Any) -> None:
@@ -208,8 +232,9 @@ def solve_in_worker(
     tests: TestsType = False,
     allow_deprecated: bool = False,
     factory: Optional["SpecFiltersFactory"] = None,
+    strategy: str = TOGETHER,
 ) -> ConcretizerWorkerResponse:
-    """Run an unchanged one-shot solve in an unconstrained forked worker.
+    """Run an unchanged solve operation in a confined forked worker.
 
     The worker inherits ``concretizer:timeout`` settings. The transport adds no competing
     deadline, so solver timeout and partial-answer behavior remain authoritative.
@@ -233,7 +258,7 @@ def solve_in_worker(
         specs,
         tests=tests,
         allow_deprecated=allow_deprecated,
-        strategy=TOGETHER,
+        strategy=strategy,
         buildcache_specs=buildcache_specs,
         local_store_specs=local_store_specs,
         local_external_origin_hashes=sorted(local_external_origin_hashes),
@@ -251,3 +276,59 @@ def solve_in_worker(
     )
     _raise_worker_error(response)
     return validate_response(response, request)
+
+
+def solve_separately_in_workers(
+    specs: Sequence[spack.spec.Spec],
+    *,
+    processes: int,
+    tests: TestsType = False,
+    allow_deprecated: bool = False,
+    factory: Optional["SpecFiltersFactory"] = None,
+) -> Iterator[Tuple[int, ConcretizerWorkerResponse]]:
+    """Concretize roots in separate confined workers with bounded parent scheduling."""
+    from spack.bootstrap import ensure_clingo_importable_or_raise
+    from spack.solver.reuse import buildcache_reuse_enabled, local_store_snapshot
+
+    ensure_clingo_importable_or_raise()
+    configured_compilers = spack.compilers.config.all_compilers()
+    local_store_specs, local_external_origin_hashes, local_deprecated_for = local_store_snapshot(
+        spack.config.CONFIG
+    )
+    _preflight_compiler_properties(configured_compilers, local_store_specs)
+    buildcache_specs = (
+        spack.binary_distribution.update_cache_and_get_specs()
+        if buildcache_reuse_enabled(spack.config.CONFIG)
+        else []
+    )
+    read_roots, write_roots = _worker_paths()
+    requests = [
+        create_request(
+            [spec],
+            tests=tests,
+            allow_deprecated=allow_deprecated,
+            strategy=SEPARATELY,
+            buildcache_specs=buildcache_specs,
+            local_store_specs=local_store_specs,
+            local_external_origin_hashes=sorted(local_external_origin_hashes),
+            local_deprecated_for=local_deprecated_for,
+        )
+        for spec in specs
+    ]
+    max_response_bytes = spack.config.CONFIG.get(
+        "config:sandbox:concretizer:max_response_bytes",
+        spack.util.sandbox.DEFAULT_STREAM_RESPONSE_BYTES,
+    )
+    responses = spack.util.sandbox.map_json_workers_streaming(
+        requests,
+        functools.partial(solve_request, specs_factory=factory),
+        processes=processes,
+        setup=functools.partial(_worker_setup, read_roots, write_roots),
+        max_response_bytes=max_response_bytes,
+    )
+    try:
+        for index, response in responses:
+            _raise_worker_error(response)
+            yield index, validate_response(response, requests[index])
+    finally:
+        responses.close()

@@ -452,9 +452,9 @@ Do not put worker policy in ``cmd/spec.py``, ``cmd/concretize.py``, ``cmd/instal
 Support in order:
 
 * [x] ``concretize_one`` and one-shot together solves;
-* [ ] together solves with reuse factories;
-* [ ] ``solve_in_rounds()`` for ``unify: when_possible``;
-* [ ] separate solves without nesting the existing unconstrained process pool around sandbox workers; and
+* [x] together solves with reuse factories;
+* [x] ``solve_in_rounds()`` for ``unify: when_possible``;
+* [x] separate solves without nesting the existing unconstrained process pool around sandbox workers; and
 * [ ] direct shared-API output modes required by ``spack solve`` and tests.
 
 A together or multi-round operation initially uses one newly forked worker for the operation.

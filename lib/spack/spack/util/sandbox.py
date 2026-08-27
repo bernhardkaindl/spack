@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 import traceback
-from typing import Any, Callable, Optional, Set
+from typing import Any, Callable, Dict, Generator, Iterable, Optional, Set, Tuple
 
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 120
@@ -314,6 +314,96 @@ def _run_stream_child(
     os._exit(0)
 
 
+class _StreamingJsonWorker:
+    """Parent-owned handle for one scalable JSON worker."""
+
+    def __init__(
+        self,
+        pid: int,
+        response_fd: int,
+        deadline: Optional[float],
+        max_response_bytes: Optional[int],
+    ) -> None:
+        self.pid = pid
+        self.response_fd = response_fd
+        self.deadline = deadline
+        self.max_response_bytes = max_response_bytes
+        self.reaped = False
+
+    def terminate(self) -> None:
+        """Terminate and reap this worker unless it was already collected."""
+        if self.reaped:
+            return
+        _terminate_worker(self.pid)
+        os.close(self.response_fd)
+        os.waitpid(self.pid, 0)
+        self.reaped = True
+
+    def collect(self) -> Any:
+        """Read, validate, and reap this worker's response."""
+        response = None
+        status = None
+        completed = False
+        try:
+            response = _read_stream_message(
+                self.response_fd,
+                self.deadline,
+                spool_to_disk=True,
+                max_total_bytes=self.max_response_bytes,
+            )
+            completed = True
+        finally:
+            if not completed:
+                _terminate_worker(self.pid)
+            os.close(self.response_fd)
+            _, status = os.waitpid(self.pid, 0)
+            self.reaped = True
+
+        if not isinstance(response, dict):
+            raise JsonWorkerError("sandbox worker failed")
+        if set(response) == {"ok", "result"} and response["ok"] is True and status == 0:
+            return response["result"]
+        if set(response) == {"error", "ok", "output", "traceback"} and response["ok"] is False:
+            if all(isinstance(response[key], str) for key in ("error", "output", "traceback")):
+                message = "sandbox worker failed: {}\n{}{}".format(
+                    response["error"], response["output"], response["traceback"]
+                )
+                raise JsonWorkerError(message)
+        raise JsonWorkerError("sandbox worker failed")
+
+
+def _launch_json_worker_streaming(
+    request: Any,
+    worker: Callable[[Any], Any],
+    setup: Optional[Callable[[], None]],
+    timeout: Optional[float],
+    max_response_bytes: Optional[int],
+) -> _StreamingJsonWorker:
+    """Launch one scalable JSON worker and return its parent-owned handle."""
+    child_request_fd, request_fd = os.pipe()
+    response_fd, child_response_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(request_fd)
+        os.close(response_fd)
+        _run_stream_child(child_request_fd, child_response_fd, worker, setup)
+
+    os.close(child_request_fd)
+    os.close(child_response_fd)
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    handle = _StreamingJsonWorker(pid, response_fd, deadline, max_response_bytes)
+    try:
+        _set_nonblocking(request_fd)
+        try:
+            _write_stream_message(request_fd, request, deadline)
+        finally:
+            os.close(request_fd)
+    except BaseException:
+        handle.terminate()
+        raise
+    return handle
+
+
 def run_json_worker(
     request: Any,
     worker: Callable[[Any], Any],
@@ -389,49 +479,61 @@ def run_json_worker_streaming(
     if max_response_bytes is not None and max_response_bytes <= 0:
         raise ValueError("sandbox worker response resource limit must be positive")
 
-    child_request_fd, request_fd = os.pipe()
-    response_fd, child_response_fd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        os.close(request_fd)
-        os.close(response_fd)
-        _run_stream_child(child_request_fd, child_response_fd, worker, setup)
+    return _launch_json_worker_streaming(
+        request, worker, setup, timeout, max_response_bytes
+    ).collect()
 
-    os.close(child_request_fd)
-    os.close(child_response_fd)
-    response = None
-    status = None
-    completed = False
-    deadline = time.monotonic() + timeout if timeout is not None else None
-    try:
-        _set_nonblocking(request_fd)
-        _set_nonblocking(response_fd)
+
+def map_json_workers_streaming(
+    requests: Iterable[Any],
+    worker: Callable[[Any], Any],
+    *,
+    processes: int,
+    setup: Optional[Callable[[], None]] = None,
+    timeout: Optional[float] = None,
+    max_response_bytes: Optional[int] = DEFAULT_STREAM_RESPONSE_BYTES,
+) -> Generator[Tuple[int, Any], None, None]:
+    """Run bounded scalable JSON workers and yield responses as workers finish."""
+    if not hasattr(os, "fork"):
+        raise JsonWorkerError("sandbox worker launcher is unsupported on this platform")
+    if processes <= 0:
+        raise ValueError("sandbox worker process count must be positive")
+    if timeout is not None and timeout <= 0:
+        raise ValueError("sandbox worker timeout must be positive")
+    if max_response_bytes is not None and max_response_bytes <= 0:
+        raise ValueError("sandbox worker response resource limit must be positive")
+
+    indexed_requests = iter(enumerate(requests))
+    active: Dict[int, Tuple[int, _StreamingJsonWorker]] = {}
+
+    def launch_next() -> bool:
         try:
-            _write_stream_message(request_fd, request, deadline)
-        finally:
-            os.close(request_fd)
+            index, request = next(indexed_requests)
+        except StopIteration:
+            return False
+        handle = _launch_json_worker_streaming(request, worker, setup, timeout, max_response_bytes)
+        active[handle.response_fd] = (index, handle)
+        return True
 
-        response = _read_stream_message(
-            response_fd, deadline, spool_to_disk=True, max_total_bytes=max_response_bytes
-        )
-        completed = True
+    try:
+        for _ in range(processes):
+            if not launch_next():
+                break
+
+        while active:
+            deadlines = [handle.deadline for _, handle in active.values() if handle.deadline]
+            wait = _remaining_time(min(deadlines)) if deadlines else None
+            ready, _, _ = select.select(list(active), [], [], wait)
+            if not ready:
+                raise JsonWorkerError("sandbox worker timed out")
+            for response_fd in ready:
+                index, handle = active.pop(response_fd)
+                response = handle.collect()
+                launch_next()
+                yield index, response
     finally:
-        if not completed:
-            _terminate_worker(pid)
-        os.close(response_fd)
-        _, status = os.waitpid(pid, 0)
-
-    if not isinstance(response, dict):
-        raise JsonWorkerError("sandbox worker failed")
-    if set(response) == {"ok", "result"} and response["ok"] is True and status == 0:
-        return response["result"]
-    if set(response) == {"error", "ok", "output", "traceback"} and response["ok"] is False:
-        if all(isinstance(response[key], str) for key in ("error", "output", "traceback")):
-            message = "sandbox worker failed: {}\n{}{}".format(
-                response["error"], response["output"], response["traceback"]
-            )
-            raise JsonWorkerError(message)
-    raise JsonWorkerError("sandbox worker failed")
+        for _, handle in active.values():
+            handle.terminate()
 
 
 def _send_listener_fd_number(control: socket.socket, fd: int) -> None:

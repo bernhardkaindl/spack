@@ -257,15 +257,17 @@ def test_worker_matches_direct_automatic_splice(mutable_config, install_mockery)
     assert worker.build_spec.dag_hash() == direct.build_spec.dag_hash()
 
 
-def test_solve_request_rejects_unimplemented_strategy():
+def test_solve_request_supports_separate_strategy(mock_packages):
     request = concretizer_worker.create_request(
-        [Spec("pkg-a")], strategy=concretizer_worker.WHEN_POSSIBLE
+        [Spec("pkg-a")], strategy=concretizer_worker.SEPARATELY
     )
 
-    with pytest.raises(
-        concretizer_worker.ConcretizerWorkerProtocolError, match="only the together strategy"
-    ):
-        concretizer_worker.solve_request(request)
+    response = concretizer_worker.validate_response(
+        concretizer_worker.solve_request(request), request
+    )
+
+    assert len(response.specs) == 1
+    assert response.specs[0].concrete
 
 
 def test_worker_preserves_unknown_input_error(mock_packages):

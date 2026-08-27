@@ -36,6 +36,7 @@ from .solve import (
     ConcretizerWorkerUnsatisfiableSpecError,
     solve_in_worker,
     solve_request,
+    solve_separately_in_workers,
 )
 
 __all__ = [
@@ -61,6 +62,7 @@ __all__ = [
     "create_request",
     "create_response",
     "solve_in_worker",
+    "solve_separately_in_workers",
     "solve_request",
     "select_execution",
     "validate_error_response",

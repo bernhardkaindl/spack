@@ -116,8 +116,6 @@ def concretize_together_when_possible(
         factory: optional factory to produce a list of specs to be reused
         ui: frontend to report progress to. Defaults to a headless frontend.
     """
-    from spack.solver.asp import Solver
-
     ui = ui or HeadlessUI()
 
     to_concretize = [concrete if concrete else abstract for abstract, concrete in spec_list]
@@ -132,6 +130,29 @@ def concretize_together_when_possible(
         kind=SolveKind.WHEN_POSSIBLE, total=len(to_concretize), processes=1
     )
     start = time.monotonic()
+    selection = spack.concretizer_worker.select_execution()
+    if selection.mode == spack.concretizer_worker.WORKER:
+        response = spack.concretizer_worker.solve_in_worker(
+            to_concretize,
+            tests=tests,
+            allow_deprecated=allow_deprecated,
+            factory=factory,
+            strategy=spack.concretizer_worker.WHEN_POSSIBLE,
+        )
+        for message in response.warnings:
+            warnings.warn(message)
+        for j, (abstract, concrete, duration) in enumerate(
+            zip(to_concretize, response.specs, response.durations), start=1
+        ):
+            ui.on_spec_concretized(abstract, concrete=concrete, count=j, duration=duration)
+            result_by_user_spec[abstract] = concrete
+        return [
+            (old_concrete_to_abstract.get(abstract, abstract), concrete)
+            for abstract, concrete in sorted(result_by_user_spec.items())
+        ]
+
+    from spack.solver.asp import Solver
+
     for result in Solver(specs_factory=factory).solve_in_rounds(
         to_concretize, tests=tests, allow_deprecated=allow_deprecated
     ):
@@ -219,17 +240,35 @@ def concretize_separately(
             (abstract, concrete) for abstract, concrete in spec_list if concrete
         ]
 
-    for j, (i, concrete, duration) in enumerate(
-        spack.util.parallel.imap_unordered(
-            _concretize_task,
-            args,
-            processes=num_procs,
-            debug=tty.is_debug(),
-            maxtaskperchild=1,
-            serialize_env=True,
-        ),
-        start=1,
-    ):
+    selection = spack.concretizer_worker.select_execution()
+    if selection.mode == spack.concretizer_worker.WORKER:
+        allow_deprecated = spack.config.CONFIG.get("config:deprecated", False)
+        worker_results = (
+            (args[worker_index][0], response.specs[0], response.durations[0], response.warnings)
+            for worker_index, response in spack.concretizer_worker.solve_separately_in_workers(
+                [to_concretize[i] for i, _, _, _ in args],
+                processes=num_procs,
+                tests=tests,
+                allow_deprecated=allow_deprecated,
+                factory=factory,
+            )
+        )
+    else:
+        worker_results = (
+            (i, concrete, duration, [])
+            for i, concrete, duration in spack.util.parallel.imap_unordered(
+                _concretize_task,
+                args,
+                processes=num_procs,
+                debug=tty.is_debug(),
+                maxtaskperchild=1,
+                serialize_env=True,
+            )
+        )
+
+    for j, (i, concrete, duration, worker_warnings) in enumerate(worker_results, start=1):
+        for message in worker_warnings:
+            warnings.warn(message)
         ret.append((i, concrete))
         ui.on_spec_concretized(to_concretize[i], concrete=concrete, count=j, duration=duration)
 
