@@ -887,6 +887,9 @@ def _enable_sandbox(
         if not dep.external:
             sandbox.allow_read(dep.prefix)
 
+    for repository in spack.repo.PATH.repos:
+        sandbox.allow_read(repository.root)
+
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
 

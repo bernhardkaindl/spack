@@ -98,6 +98,8 @@ It can execute only individually selected archive-expansion tools.
 
 The existing installer reuses this worker at its source-staging boundary.
 It retains scheduling, jobserver limits, state and log channels, terminal UI, hooks, builder phases, database actions, and binary-cache behavior.
+Build workers can lazily import recipes from parent-selected active repositories through read-only
+Landlock access, including dependency recipes referenced by concretizer-worker-restored specs.
 The installer child owns the stage context and lock, so its worker applies the requested patch behavior without reacquiring the lock.
 Installer stage and build workers currently impose no Spack memory ceiling, while retaining core-dump
 suppression and any limits inherited from the invoking process or service.
