@@ -40,12 +40,14 @@ Landlock allows reads from active repositories, Spack and Python runtime paths, 
 configuration.
 Writes are limited to parent-selected persistent misc-cache and concretization-cache roots.
 Current cache readers parse structured data; cache content remains untrusted and subject to parser and native-spec validation.
-Seccomp denies sockets, executable replacement, and blocked IPC while allowing the threads required by Clingo's asynchronous solve.
+Seccomp denies sockets, ``fork``, ``vfork``, executable replacement, and blocked IPC.
+Legacy ``clone`` is allowed only with ``CLONE_THREAD``; ``clone3`` returns ``ENOSYS`` so libc uses the inspectable legacy form for Clingo threads.
 No solver-specific memory ceiling is imposed.
 
 Focused parity covers versions, variants, dependency DAGs, virtual roots, externals, installed-spec reuse, automatic splicing, compilers, platforms, test dependencies, ordered warnings, cache-enabled and cache-disabled operation, invalid inputs, and inherited solver timeout configuration.
 Transport lifecycle coverage includes explicit worker deadlines, parent interruption, truncated frames, child crashes, inherited-descriptor cleanup, and child reaping.
 Real kernel-boundary tests prove that selected recipe evaluation begins after confinement and cannot read or write unrelated paths, create TCP or Unix sockets, or execute a program.
+They also prove that child-process creation is denied while a normal asynchronous Clingo solve succeeds.
 No normal command or shared ``spack.concretize`` function selects this worker yet.
 
 Implemented ``spack info`` boundaries
