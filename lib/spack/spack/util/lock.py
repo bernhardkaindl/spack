@@ -143,6 +143,15 @@ class OpenFileTracker:
             open_file.fh.close()
         self._descriptors.clear()
 
+    def discard_after_fork(self):
+        """Forget handles already closed by child-process descriptor cleanup."""
+        for open_file in self._descriptors.values():
+            try:
+                open_file.fh.close()
+            except OSError:
+                pass
+        self._descriptors.clear()
+
 
 #: Open file descriptors for locks in this process. Used to prevent one process
 #: from opening the sam file many times for different byte range locks
