@@ -61,9 +61,11 @@ def test_request_accepts_each_strategy(strategy):
 
 def test_request_round_trips_reuse_snapshots(mock_packages):
     concrete = spack.concretize.concretize_one("pkg-a")
+    libc = Spec("glibc@=2.39", external_path="/usr")
     request = concretizer_worker.create_request(
         [Spec("pkg-a")],
         buildcache_specs=[concrete],
+        host_libcs=[libc],
         local_store_specs=[concrete],
         local_external_origin_hashes=[concrete.dag_hash()],
         local_deprecated_for={concrete.dag_hash(): "replacement-hash"},
@@ -72,6 +74,8 @@ def test_request_round_trips_reuse_snapshots(mock_packages):
     restored = concretizer_worker.validate_request(request)
 
     assert restored.buildcache_specs[0].dag_hash() == concrete.dag_hash()
+    assert str(restored.host_libcs[0]) == "glibc@=2.39"
+    assert restored.host_libcs[0].external_path == "/usr"
     assert restored.local_store_specs[0].dag_hash() == concrete.dag_hash()
     assert restored.local_external_origin_hashes == [concrete.dag_hash()]
     assert restored.local_deprecated_for == {concrete.dag_hash(): "replacement-hash"}
@@ -81,6 +85,9 @@ def test_request_round_trips_reuse_snapshots(mock_packages):
     "kwargs",
     [
         {"buildcache_specs": [Spec("pkg-a")]},
+        {"host_libcs": [Spec("glibc@2.39:", external_path="/usr")]},
+        {"host_libcs": [Spec("glibc@=2.39")]},
+        {"host_libcs": [Spec("zlib@=1.3", external_path="/usr")]},
         {"local_store_specs": [Spec("pkg-a")]},
         {"local_external_origin_hashes": [""]},
         {"local_deprecated_for": {"hash": ""}},

@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, List, NamedTuple, Sequence, Union
 
 import spack.spec
 
-PROTOCOL_VERSION = 5
+PROTOCOL_VERSION = 6
 TOGETHER = "together"
 WHEN_POSSIBLE = "when_possible"
 SEPARATELY = "separately"
@@ -17,6 +17,7 @@ STRATEGIES = (TOGETHER, WHEN_POSSIBLE, SEPARATELY)
 _REQUEST_KEYS = {
     "allow_deprecated",
     "buildcache_specs",
+    "host_libcs",
     "local_external_origin_hashes",
     "local_deprecated_for",
     "local_store_specs",
@@ -59,6 +60,7 @@ class ConcretizerWorkerRequest(NamedTuple):
     allow_deprecated: bool
     strategy: str
     buildcache_specs: List[spack.spec.Spec]
+    host_libcs: List[spack.spec.Spec]
     local_store_specs: List[spack.spec.Spec]
     local_external_origin_hashes: List[str]
     local_deprecated_for: Dict[str, str]
@@ -124,6 +126,15 @@ def _validate_error_text(value: Any, field: str, optional: bool = False) -> Unio
     return value
 
 
+def _valid_host_libc(spec: Any) -> bool:
+    return (
+        isinstance(spec, spack.spec.Spec)
+        and spec.name in ("glibc", "musl")
+        and spec.external
+        and spec.versions.concrete is not None
+    )
+
+
 def create_request(
     specs: Sequence[spack.spec.Spec],
     *,
@@ -131,6 +142,7 @@ def create_request(
     allow_deprecated: bool = False,
     strategy: str = TOGETHER,
     buildcache_specs: Sequence[spack.spec.Spec] = (),
+    host_libcs: Sequence[spack.spec.Spec] = (),
     local_store_specs: Sequence[spack.spec.Spec] = (),
     local_external_origin_hashes: Sequence[str] = (),
     local_deprecated_for: Union[Dict[str, str], None] = None,
@@ -147,6 +159,12 @@ def create_request(
     if not all(isinstance(spec, spack.spec.Spec) and spec.concrete for spec in buildcache_specs):
         raise ConcretizerWorkerProtocolError(
             "concretizer-worker request requires concrete build-cache specs"
+        )
+    if not isinstance(host_libcs, Sequence) or isinstance(host_libcs, (str, bytes)):
+        raise ConcretizerWorkerProtocolError("concretizer-worker request has invalid host libcs")
+    if not all(_valid_host_libc(spec) for spec in host_libcs):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request requires exact external host libcs"
         )
     if not isinstance(local_store_specs, Sequence) or isinstance(local_store_specs, (str, bytes)):
         raise ConcretizerWorkerProtocolError(
@@ -180,6 +198,7 @@ def create_request(
     request = {
         "allow_deprecated": allow_deprecated,
         "buildcache_specs": [spec.to_dict() for spec in buildcache_specs],
+        "host_libcs": [spec.to_dict() for spec in host_libcs],
         "local_external_origin_hashes": list(local_external_origin_hashes),
         "local_deprecated_for": dict(local_deprecated_for),
         "local_store_specs": [spec.to_dict() for spec in local_store_specs],
@@ -226,6 +245,12 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
         raise ConcretizerWorkerProtocolError(
             "concretizer-worker request has invalid build-cache spec data"
         )
+    if not isinstance(request["host_libcs"], list) or not all(
+        isinstance(spec, dict) for spec in request["host_libcs"]
+    ):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid host libc data"
+        )
     if not isinstance(request["local_store_specs"], list) or not all(
         isinstance(spec, dict) for spec in request["local_store_specs"]
     ):
@@ -253,6 +278,7 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
         buildcache_specs = [
             spack.spec.Spec.from_dict(spec) for spec in request["buildcache_specs"]
         ]
+        host_libcs = [spack.spec.Spec.from_dict(spec) for spec in request["host_libcs"]]
         local_store_specs = [
             spack.spec.Spec.from_dict(spec) for spec in request["local_store_specs"]
         ]
@@ -267,6 +293,10 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
     if not all(spec.concrete for spec in buildcache_specs):
         raise ConcretizerWorkerProtocolError(
             "concretizer-worker request requires concrete build-cache specs"
+        )
+    if not all(_valid_host_libc(spec) for spec in host_libcs):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request requires exact external host libcs"
         )
     if not all(spec.concrete for spec in local_store_specs):
         raise ConcretizerWorkerProtocolError(
@@ -287,6 +317,7 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
         request["allow_deprecated"],
         request["strategy"],
         buildcache_specs,
+        host_libcs,
         local_store_specs,
         list(request["local_external_origin_hashes"]),
         dict(request["local_deprecated_for"]),

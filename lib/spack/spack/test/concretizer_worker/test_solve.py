@@ -18,6 +18,7 @@ import spack.config as spack_config
 import spack.error as spack_error
 import spack.platforms as spack_platforms
 import spack.repo as spack_repo
+import spack.util.libc
 import spack.util.sandbox
 from spack.old_installer import PackageInstaller
 from spack.spec import Spec
@@ -84,6 +85,30 @@ def test_worker_uses_configured_response_limit(mock_packages, mutable_config, mo
     assert observed == [(None, configured_limit)]
 
 
+def test_worker_bootstraps_clingo_once_in_parent_before_launch(mock_packages, monkeypatch):
+    import spack.bootstrap
+
+    parent_pid = os.getpid()
+    events = []
+    real_bootstrap = spack.bootstrap.ensure_clingo_importable_or_raise
+    real_runner = spack.util.sandbox.run_json_worker_streaming
+
+    def bootstrap():
+        events.append(("bootstrap", os.getpid()))
+        real_bootstrap()
+
+    def run_worker(*args, **kwargs):
+        events.append(("launch", os.getpid()))
+        return real_runner(*args, **kwargs)
+
+    monkeypatch.setattr(spack.bootstrap, "ensure_clingo_importable_or_raise", bootstrap)
+    monkeypatch.setattr(spack.util.sandbox, "run_json_worker_streaming", run_worker)
+
+    concretizer_worker.solve_in_worker([Spec("pkg-a")])
+
+    assert events == [("bootstrap", parent_pid), ("launch", parent_pid)]
+
+
 def test_compiler_preflight_includes_configured_and_installed(mock_packages, monkeypatch):
     import spack.concretizer_worker.solve as worker_solve
 
@@ -99,6 +124,9 @@ def test_compiler_preflight_includes_configured_and_installed(mock_packages, mon
         def compiler_verbose_output(self):
             warmed.append(self.compiler.dag_hash())
 
+        def default_libc(self):
+            return None
+
     monkeypatch.setattr(compiler_config, "supported_compilers", lambda: ["gcc", "llvm"])
     monkeypatch.setattr(compiler_libraries, "CompilerPropertyDetector", Detector)
     monkeypatch.setattr(spack_platforms, "using_libc_compatibility", lambda: True)
@@ -108,6 +136,28 @@ def test_compiler_preflight_includes_configured_and_installed(mock_packages, mon
     )
 
     assert warmed == [configured.dag_hash(), installed.dag_hash()]
+
+
+def test_worker_uses_parent_detected_libc(mock_packages, monkeypatch):
+    parent_pid = os.getpid()
+    libc = Spec("glibc@=2.39", external_path="/usr")
+    libc._mark_concrete()
+
+    def parent_only_libc(self):
+        return libc if os.getpid() == parent_pid else None
+
+    monkeypatch.setattr(
+        compiler_libraries.CompilerPropertyDetector, "compiler_verbose_output", lambda self: "ok"
+    )
+    monkeypatch.setattr(
+        compiler_libraries.CompilerPropertyDetector, "default_libc", parent_only_libc
+    )
+    monkeypatch.setattr(spack_platforms, "using_libc_compatibility", lambda: True)
+    monkeypatch.setattr(spack.util.libc, "libc_from_current_python_process", lambda: None)
+
+    response = concretizer_worker.solve_in_worker([Spec("pkg-a")])
+
+    assert response.specs[0].concrete
 
 
 def test_worker_inherits_existing_solver_timeout_config(
