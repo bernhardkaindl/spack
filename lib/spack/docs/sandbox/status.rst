@@ -8,6 +8,23 @@ Current Status
 
 ``spack info`` is the first hardened normal command.
 
+Implemented concretizer-worker contract foundation
+---------------------------------------------------
+
+The concretizer worker is not integrated into a solve path and does not yet apply confinement.
+Its versioned launcher-neutral contract and scalable process transport are implemented.
+
+The request carries abstract native specs, test-dependency selection, deprecated-version policy, and solve strategy.
+The response carries ordered final concrete native specs, DAG hashes, and bounded warnings.
+Request creation, response restoration, and structural validation do not import package recipes.
+Virtual-provider and other recipe-dependent satisfaction checks remain worker-owned.
+
+The scalable transport splits JSON into bounded frames and rejects oversized frame declarations before reading their payloads.
+It supports requests and responses larger than the existing command worker's four-MiB message limit, bounds every failure-diagnostic field, hides raw worker output, closes inherited descriptors, and reaps failed workers.
+It adds no default timeout or total response-size policy; callers may supply explicit resource limits.
+
+Focused tests cover malformed and stale requests and responses, ordered root association, DAG-hash validation, abstract, concrete, and spliced native-spec round trips, duplicate JSON keys, large payloads, optional timeout and response-resource policies, setup ordering, diagnostics, and legacy worker compatibility.
+
 Implemented ``spack info`` boundaries
 -------------------------------------
 
