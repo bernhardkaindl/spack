@@ -315,3 +315,27 @@ def test_worker_preserves_config_error_category(mock_packages, monkeypatch):
 
     with pytest.raises(spack_error.ConfigError, match="invalid solver configuration"):
         concretizer_worker.solve_in_worker([Spec("pkg-a")])
+
+
+def test_worker_preserves_package_error_category(mock_packages, monkeypatch):
+    import spack.solver.asp
+
+    def fail_solve(self, specs, **kwargs):
+        raise spack_error.PackageError("invalid package metadata")
+
+    monkeypatch.setattr(spack.solver.asp.Solver, "solve", fail_solve)
+
+    with pytest.raises(spack_error.PackageError, match="invalid package metadata"):
+        concretizer_worker.solve_in_worker([Spec("pkg-a")])
+
+
+def test_worker_preserves_assertion_error_category(mock_packages, monkeypatch):
+    import spack.solver.asp
+
+    def fail_solve(self, specs, **kwargs):
+        raise AssertionError("invalid solver invariant")
+
+    monkeypatch.setattr(spack.solver.asp.Solver, "solve", fail_solve)
+
+    with pytest.raises(AssertionError, match="invalid solver invariant"):
+        concretizer_worker.solve_in_worker([Spec("pkg-a")])

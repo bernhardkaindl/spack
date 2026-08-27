@@ -48,7 +48,10 @@ Focused parity covers versions, variants, dependency DAGs, virtual roots, extern
 Transport lifecycle coverage includes explicit worker deadlines, parent interruption, truncated frames, child crashes, inherited-descriptor cleanup, and child reaping.
 Real kernel-boundary tests prove that selected recipe evaluation begins after confinement and cannot read or write unrelated paths, create TCP or Unix sockets, or execute a program.
 They also prove that child-process creation is denied while a normal asynchronous Clingo solve succeeds.
-No normal command or shared ``spack.concretize`` function selects this worker yet.
+``spack.concretize.concretize_one()`` and unified together solves now select the confined worker automatically when supported.
+They use the existing direct solver only when confinement is unavailable and the shared ``config:sandbox:allow_fallback`` policy permits fallback.
+This covers explicit ``spack spec`` inputs and normal callers that use those shared operations.
+When-possible, separate, and broad environment/install integration remain incomplete.
 
 Implemented ``spack info`` boundaries
 -------------------------------------

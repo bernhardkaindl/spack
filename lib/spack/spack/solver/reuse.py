@@ -218,6 +218,14 @@ def specs_from_store_for_package(pkg_name: str) -> List[spack.spec.Spec]:
     return spack.store.STORE.db.query(pkg_name)
 
 
+def is_installed(spec: spack.spec.Spec) -> bool:
+    """Return installed status from a worker snapshot or the current store."""
+    if _LOCAL_STORE_SNAPSHOT is not None:
+        dag_hash = spec.dag_hash()
+        return any(candidate.dag_hash() == dag_hash for candidate in _LOCAL_STORE_SNAPSHOT)
+    return spack.store.STORE.db.installed(spec)
+
+
 def deprecated_for(spec: spack.spec.Spec) -> Optional[str]:
     """Return a deprecation target from a worker snapshot, or signal direct lookup."""
     if _LOCAL_DEPRECATED_FOR is None:
