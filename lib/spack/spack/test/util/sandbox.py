@@ -213,6 +213,42 @@ def test_streaming_json_worker_rejects_invalid_response_resource_limit():
         spack.util.sandbox.run_json_worker_streaming({}, _echo_worker, max_response_bytes=0)
 
 
+def test_streaming_json_worker_map_runs_bounded_workers_and_yields_completion_order():
+    requests = [{"value": value} for value in (0.15, 0.0, 0.0)]
+
+    def worker(request):
+        time.sleep(request["value"])
+        return {"pid": os.getpid(), "value": request["value"]}
+
+    results = list(
+        spack.util.sandbox.map_json_workers_streaming(requests, worker, processes=2, timeout=10)
+    )
+
+    assert [index for index, _ in results] == [1, 2, 0]
+    assert len({response["pid"] for _, response in results}) == 3
+
+
+def test_streaming_json_worker_map_reaps_outstanding_workers_on_error(monkeypatch):
+    real_waitpid = os.waitpid
+    reaped = []
+
+    def record_waitpid(pid, options):
+        result = real_waitpid(pid, options)
+        reaped.append(result)
+        return result
+
+    monkeypatch.setattr(os, "waitpid", record_waitpid)
+
+    with pytest.raises(spack.util.sandbox.JsonWorkerError, match="untrusted failure"):
+        list(
+            spack.util.sandbox.map_json_workers_streaming(
+                [{"fail": True}, {"value": 0.15}], _failing_worker, processes=2, timeout=10
+            )
+        )
+
+    assert len(reaped) == 2
+
+
 def test_streaming_json_reader_rejects_oversized_frame_before_payload():
     read_fd, write_fd = os.pipe()
     try:
