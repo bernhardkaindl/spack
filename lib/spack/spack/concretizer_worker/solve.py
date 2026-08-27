@@ -4,13 +4,23 @@
 
 """Launcher-neutral execution of the existing concretizer in a worker."""
 
+import functools
+import os
+import pathlib
+import sysconfig
 import warnings
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import spack.binary_distribution
+import spack.caches
+import spack.compilers.config
+import spack.compilers.libraries
 import spack.config
 import spack.error
+import spack.paths
+import spack.platforms
 import spack.repo
+import spack.sandbox
 import spack.spec
 import spack.store
 import spack.util.sandbox
@@ -70,11 +80,58 @@ def _error_response(error: spack.error.SpackError) -> Dict[str, Any]:
     return create_error_response(kind, error.message, error.long_message)
 
 
-def _worker_setup() -> None:
+def _worker_setup(read_roots: List[str], write_roots: List[str]) -> None:
     """Recreate singleton state whose inherited descriptors were closed by the launcher."""
     FILE_TRACKER.discard_after_fork()
     spack.store.reinitialize()
     spack.binary_distribution.reinitialize_binary_index()
+    spack.sandbox.restrict_concretizer_worker(read_roots, write_roots)
+
+
+def _worker_paths() -> Tuple[List[str], List[str]]:
+    """Derive worker filesystem capabilities from trusted active Spack state."""
+    from spack.solver.asp import ConcretizationCache
+
+    misc_cache = pathlib.Path(spack.caches.misc_cache_location())
+    concretization_cache = ConcretizationCache().root
+    misc_cache.mkdir(parents=True, exist_ok=True)
+    concretization_cache.mkdir(parents=True, exist_ok=True)
+
+    read_roots = [spack.paths.lib_path]
+    python_paths = list(sysconfig.get_paths().values())
+    read_roots.extend(path for path in python_paths if path and os.path.exists(path))
+    for repository in spack.repo.PATH.repos:
+        read_roots.append(repository.root)
+        if repository.python_path:
+            read_roots.append(repository.python_path)
+    for scope in spack.config.CONFIG.active_scopes:
+        path = getattr(scope, "path", None)
+        if path:
+            read_roots.append(str(path))
+
+    for root in ("/lib", "/lib64", "/usr/lib", "/usr/lib64", "/etc/ld.so.cache"):
+        if os.path.exists(root):
+            read_roots.append(root)
+
+    write_roots = [str(misc_cache), str(concretization_cache)]
+    return list(dict.fromkeys(read_roots)), list(dict.fromkeys(write_roots))
+
+
+def _preflight_compiler_properties(
+    configured_compilers: List[spack.spec.Spec], local_store_specs: List[spack.spec.Spec]
+) -> None:
+    """Populate properties for configured and installed compiler candidates."""
+    if not spack.platforms.using_libc_compatibility():
+        return
+    compiler_names = set(spack.compilers.config.supported_compilers())
+    installed_compilers = [spec for spec in local_store_specs if spec.name in compiler_names]
+    seen_compilers = set()
+    for compiler in configured_compilers + installed_compilers:
+        dag_hash = compiler.dag_hash()
+        if dag_hash in seen_compilers:
+            continue
+        seen_compilers.add(dag_hash)
+        spack.compilers.libraries.CompilerPropertyDetector(compiler).compiler_verbose_output()
 
 
 def solve_request(request: Dict[str, Any]) -> Dict[str, Any]:
@@ -87,12 +144,20 @@ def solve_request(request: Dict[str, Any]) -> Dict[str, Any]:
 
     # Importing the solver here keeps recipe evaluation on the worker side of a future setup hook.
     from spack.solver.asp import Solver
+    from spack.solver.reuse import use_buildcache_snapshot, use_local_store_snapshot
 
     try:
-        with warnings.catch_warnings(record=True) as caught:
-            result = Solver().solve(
-                validated.specs, tests=validated.tests, allow_deprecated=validated.allow_deprecated
-            )
+        with use_buildcache_snapshot(validated.buildcache_specs), use_local_store_snapshot(
+            validated.local_store_specs,
+            set(validated.local_external_origin_hashes),
+            validated.local_deprecated_for,
+        ):
+            with warnings.catch_warnings(record=True) as caught:
+                result = Solver().solve(
+                    validated.specs,
+                    tests=validated.tests,
+                    allow_deprecated=validated.allow_deprecated,
+                )
     except spack.error.SpackError as error:
         return _error_response(error)
     return create_response(result.specs, warnings=[str(item.message) for item in caught])
@@ -121,15 +186,40 @@ def solve_in_worker(
     The worker inherits ``concretizer:timeout`` settings. The transport adds no competing
     deadline, so solver timeout and partial-answer behavior remain authoritative.
     """
+    from spack.bootstrap import ensure_clingo_importable_or_raise
+    from spack.solver.reuse import buildcache_reuse_enabled, local_store_snapshot
+
+    ensure_clingo_importable_or_raise()
+    configured_compilers = spack.compilers.config.all_compilers()
+    local_store_specs, local_external_origin_hashes, local_deprecated_for = local_store_snapshot(
+        spack.config.CONFIG
+    )
+    _preflight_compiler_properties(configured_compilers, local_store_specs)
+    buildcache_specs = (
+        spack.binary_distribution.update_cache_and_get_specs()
+        if buildcache_reuse_enabled(spack.config.CONFIG)
+        else []
+    )
+    read_roots, write_roots = _worker_paths()
     request = create_request(
-        specs, tests=tests, allow_deprecated=allow_deprecated, strategy=TOGETHER
+        specs,
+        tests=tests,
+        allow_deprecated=allow_deprecated,
+        strategy=TOGETHER,
+        buildcache_specs=buildcache_specs,
+        local_store_specs=local_store_specs,
+        local_external_origin_hashes=sorted(local_external_origin_hashes),
+        local_deprecated_for=local_deprecated_for,
     )
     max_response_bytes = spack.config.CONFIG.get(
         "config:sandbox:concretizer:max_response_bytes",
         spack.util.sandbox.DEFAULT_STREAM_RESPONSE_BYTES,
     )
     response = spack.util.sandbox.run_json_worker_streaming(
-        request, solve_request, setup=_worker_setup, max_response_bytes=max_response_bytes
+        request,
+        solve_request,
+        setup=functools.partial(_worker_setup, read_roots, write_roots),
+        max_response_bytes=max_response_bytes,
     )
     _raise_worker_error(response)
     return validate_response(response, request)

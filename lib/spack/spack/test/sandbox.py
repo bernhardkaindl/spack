@@ -21,6 +21,7 @@ from typing import List, Tuple, cast
 import spack.concretize
 import spack.installer.build
 import spack.sandbox
+import spack.spec
 import spack.store
 from spack.installer.build import _enable_sandbox
 from spack.util.executable import which_string
@@ -369,18 +370,46 @@ class MockSeccompSandbox:
         self.block_sockets = None
         self.block_process = None
         self.block_ipc = None
+        self.block_exec = None
 
-    def apply(self, block_sockets=True, block_process=False, block_ipc=False):
+    def apply(self, block_sockets=True, block_process=False, block_ipc=False, block_exec=False):
         self.apply_calls += 1
         self.block_sockets = block_sockets
         self.block_process = block_process
         self.block_ipc = block_ipc
+        self.block_exec = block_exec
 
 
 class FailingSeccompSandbox(MockSeccompSandbox):
-    def apply(self, block_sockets=True, block_process=False, block_ipc=False):
-        super().apply(block_sockets, block_process, block_ipc)
+    def apply(self, block_sockets=True, block_process=False, block_ipc=False, block_exec=False):
+        super().apply(block_sockets, block_process, block_ipc, block_exec)
         raise OSError("seccomp_load failed")
+
+
+def test_restrict_concretizer_worker_policy(monkeypatch, tmp_path):
+    read_root = tmp_path / "read"
+    write_root = tmp_path / "write"
+    read_root.mkdir()
+    write_root.mkdir()
+    sandbox = MockSandbox()
+    seccomp = MockSeccompSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_recipe_import_sandbox", lambda: sandbox)
+    monkeypatch.setattr(spack.sandbox, "SeccompSandbox", lambda: seccomp)
+    limits = []
+    monkeypatch.setattr(
+        spack.sandbox,
+        "_set_worker_rlimits",
+        lambda memory_limit, limit_file_size: limits.append((memory_limit, limit_file_size)),
+    )
+
+    spack.sandbox.restrict_concretizer_worker([read_root], [write_root])
+
+    assert sandbox.read_calls == [(read_root, read_root)]
+    assert sandbox.write_calls == [(write_root, write_root)]
+    assert sandbox.apply_calls == [(True, False, True, False)]
+    assert limits == [(None, False)]
+    assert seccomp.block_sockets is False
+    assert seccomp.block_exec is True
 
 
 @pytest.mark.parametrize(

@@ -200,7 +200,8 @@ The initial implementation must choose and test one narrow solution:
 * the worker receives narrowly selected compiler execution and temporary/cache write capabilities; or
 * solver setup is changed to consume a parent-prepared, validated compiler-property input.
 
-The first option best matches the approved preflight direction, but code and tests must prove it is complete.
+The approved initial implementation uses trusted parent preflight.
+Configured compiler recipes form a specially reviewed trusted set and may be imported only to populate compiler properties before confinement.
 Missing preflight must fail clearly; it must not cause unrestricted fallback or broad worker grants.
 
 Repository and provider indexes
@@ -210,7 +211,9 @@ Possible-dependency analysis queries package classes and merged provider indexes
 The existing separate-concretization path prepares the provider index before starting parallel children to avoid lock and write races.
 
 Reviewers should require an inventory of index operations that may write.
-Indexes should be prepared by the trusted parent only when preparation does not import selected recipes, or exposed to the worker through separately documented narrow cache paths.
+The confined worker may update the persistent parent-selected misc-cache root because provider-index generation necessarily imports ordinary recipes.
+Current readers parse structured cache data rather than executing code selected by that data.
+Reviewers must still treat cache files as untrusted and check malformed-data handling, native-spec validation, and path selection.
 
 Concretization cache
 ~~~~~~~~~~~~~~~~~~~~
@@ -321,6 +324,7 @@ Review the implementation in vertical increments:
 * Instrument recipe imports and prove setup runs before the first selected recipe import.
 * Test denied writes, sockets, arbitrary execution, IPC, inactive repositories, and unrelated host paths at the kernel boundary.
 * Resolve compiler probing, index preparation, bootstrap, and cache writes with individual policy tests rather than broad directory grants.
+* Audit malformed or poisoned misc-cache entries as follow-up hardening; if a reader is found to execute cache-selected code, move that cache family to invocation scratch before enabling the worker by default.
 
 4. Shared strategy integration
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

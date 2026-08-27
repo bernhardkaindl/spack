@@ -26,7 +26,7 @@ import sys
 import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Union
+from typing import Dict, Iterable, List, Optional, Union
 
 # os.O_PATH is only defined on linux. Appease mypy with our own O_PATH.
 if sys.platform == "linux":
@@ -92,6 +92,7 @@ _NETWORK_WORKER_DENY_SYSCALLS = (
 )
 
 _PROCESS_EXEC_SYSCALLS = ("clone", "clone3", "fork", "vfork", "execve", "execveat")
+_EXEC_SYSCALLS = ("execve", "execveat")
 
 _IPC_SYSCALLS = (
     "ipc",
@@ -697,18 +698,24 @@ class SeccompSandbox:
         )
 
     def apply(
-        self, block_sockets: bool = True, block_process: bool = False, block_ipc: bool = False
+        self,
+        block_sockets: bool = True,
+        block_process: bool = False,
+        block_ipc: bool = False,
+        block_exec: bool = False,
     ) -> None:
         """Install an irreversible seccomp filter denying specified syscall groups."""
         self._prctl_no_new_privs()
 
-        syscall_groups = []
+        syscall_groups: List[Iterable[str]] = []
         if block_sockets:
             syscall_groups.append(_SOCKET_SYSCALLS)
         if block_process:
             syscall_groups.append(_PROCESS_EXEC_SYSCALLS)
         if block_ipc:
             syscall_groups.append(_IPC_SYSCALLS)
+        if block_exec:
+            syscall_groups.append(_EXEC_SYSCALLS)
 
         context = self.libseccomp.seccomp_init(ctypes.c_uint32(SECCOMP_RET_ALLOW))
         if not context:
@@ -872,6 +879,23 @@ def restrict_recipe_import(repository_roots: Iterable[Union[str, Path]]) -> None
     sandbox.apply(
         block_network=True, block_process=True, block_ipc=True, allow_tcp_network_fallback=False
     )
+
+
+def restrict_concretizer_worker(
+    read_roots: Iterable[Union[str, Path]], write_roots: Iterable[Union[str, Path]]
+) -> None:
+    """Confine solver recipe evaluation while allowing parent-selected cache writes."""
+    _set_worker_rlimits(None, limit_file_size=False)
+    sandbox = get_recipe_import_sandbox()
+    for root in read_roots:
+        sandbox.allow_read(root)
+    for root in write_roots:
+        sandbox.allow_write(root)
+    sandbox.apply(
+        block_network=True, block_process=False, block_ipc=True, allow_tcp_network_fallback=False
+    )
+    # Clingo's asynchronous solve requires threads, so deny executable replacement separately.
+    SeccompSandbox().apply(block_sockets=False, block_exec=True)
 
 
 def restrict_network_worker(

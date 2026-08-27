@@ -53,6 +53,7 @@ import spack.package_base
 import spack.package_prefs
 import spack.platforms
 import spack.repo
+import spack.solver.reuse
 import spack.solver.splicing
 import spack.spec
 import spack.store
@@ -3495,7 +3496,7 @@ def possible_compilers(*, configuration) -> Tuple[Set["spack.spec.Spec"], Set["s
     # Compilers from the local store
     supported_compilers = spack.compilers.config.supported_compilers()
     for pkg_name in supported_compilers:
-        result.update(spack.store.STORE.db.query(pkg_name))
+        result.update(spack.solver.reuse.specs_from_store_for_package(pkg_name))
 
     return result, rejected
 
@@ -3966,17 +3967,23 @@ def _ensure_no_deprecated(root: spack.spec.Spec, store: spack.store.Store) -> No
         spack.spec.SpecDeprecatedError: if any deprecated spec is found
     """
     deprecated = []
-    db = store.db
-    with db.read_transaction():
-        for x in root.traverse():
-            _, rec = db.query_by_spec_hash(x.dag_hash())
-            if rec and rec.deprecated_for:
-                deprecated.append(rec)
+    if spack.solver.reuse.using_local_store_snapshot():
+        for spec in root.traverse():
+            replacement = spack.solver.reuse.deprecated_for(spec)
+            if replacement:
+                deprecated.append((spec, replacement))
+    else:
+        db = store.db
+        with db.read_transaction():
+            for spec in root.traverse():
+                _, record = db.query_by_spec_hash(spec.dag_hash())
+                if record and record.deprecated_for:
+                    deprecated.append((record.spec, record.deprecated_for))
     if deprecated:
         msg = "\n    The following specs have been deprecated"
         msg += " in favor of specs with the hashes shown:\n"
-        for rec in deprecated:
-            msg += "        %s  --> %s\n" % (rec.spec, rec.deprecated_for)
+        for spec, replacement in deprecated:
+            msg += "        %s  --> %s\n" % (spec, replacement)
         msg += "\n"
         msg += "    For each package listed, choose another spec\n"
         raise spack.spec.SpecDeprecatedError(msg)
