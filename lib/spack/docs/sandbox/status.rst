@@ -61,8 +61,8 @@ cancellation.
 Focused command and environment coverage includes ``spack spec`` output modes, all three
 environment strategies, implicit ``spack install`` concretization, configured fallback, invalid
 response rejection before environment mutation, and already-concretized environment no-op behavior.
-Timer/statistics parity, lockfile transaction coverage, and broader direct-API regression coverage
-remain incomplete.
+Low-level ``spack solve`` timer/statistics transport and broader direct-API regression coverage
+remain deferred.
 
 Implemented ``spack info`` boundaries
 -------------------------------------

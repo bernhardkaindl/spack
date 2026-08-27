@@ -77,6 +77,8 @@ Later command boundaries
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 * Harden ``spack spec``, environment concretization, and implicit install concretization through the shared :doc:`concretizer-worker` plan.
+* Extend the concretizer-worker protocol for low-level ``spack solve`` setup output, timers, and
+  Clingo statistics after the high-level command boundary is complete.
 * Continue installation and staging hardening through :doc:`install-worker`.
 * See :doc:`planned-work` for namespace isolation and later assessments.
 
