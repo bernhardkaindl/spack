@@ -120,7 +120,7 @@ def _worker_paths(context: spack.context.SpackContext) -> Tuple[List[str], List[
     misc_cache.mkdir(parents=True, exist_ok=True)
     concretization_cache.mkdir(parents=True, exist_ok=True)
 
-    read_roots = [spack.paths.lib_path]
+    read_roots = [spack.paths.lib_path, context.store.root]
     python_paths = list(sysconfig.get_paths().values())
     read_roots.extend(path for path in python_paths if path and os.path.exists(path))
     for repository in context.repo.repos:
@@ -144,10 +144,12 @@ def _preflight_compiler_properties(
     context: spack.context.SpackContext,
     configured_compilers: List[spack.spec.Spec],
     local_store_specs: List[spack.spec.Spec],
-) -> None:
+) -> List[spack.spec.Spec]:
     """Populate properties for configured and installed compiler candidates."""
     if not spack.platforms.using_libc_compatibility():
-        return
+        return []
+    from spack.solver.runtimes import all_libcs
+
     compiler_names = set(spack.compilers.config.supported_compilers(repo=context.repo))
     installed_compilers = [spec for spec in local_store_specs if spec.name in compiler_names]
     compiler_cache = spack.compilers.libraries.FileCompilerCache(context.misc_cache)
@@ -160,6 +162,7 @@ def _preflight_compiler_properties(
         spack.compilers.libraries.CompilerPropertyDetector(
             compiler, repo=context.repo, cache=compiler_cache
         ).compiler_verbose_output()
+    return sorted(all_libcs(context))
 
 
 def solve_request(
@@ -173,9 +176,12 @@ def solve_request(
     # Importing the solver here keeps recipe evaluation on the worker side of a future setup hook.
     from spack.solver.asp import Solver
     from spack.solver.reuse import use_buildcache_snapshot, use_local_store_snapshot
+    from spack.solver.runtimes import use_host_libc_snapshot
 
     try:
-        with use_buildcache_snapshot(validated.buildcache_specs), use_local_store_snapshot(
+        with use_buildcache_snapshot(validated.buildcache_specs), use_host_libc_snapshot(
+            validated.host_libcs
+        ), use_local_store_snapshot(
             validated.local_store_specs,
             set(validated.local_external_origin_hashes),
             validated.local_deprecated_for,
@@ -264,6 +270,7 @@ def solve_in_worker(
         context.store
     )
     _preflight_compiler_properties(context, configured_compilers, local_store_specs)
+    host_libcs = _preflight_compiler_properties(context, configured_compilers, local_store_specs)
     buildcache_specs = (
         spack.binary_distribution.update_cache_and_get_specs(
             context.binary_index, config=context.config
@@ -278,6 +285,7 @@ def solve_in_worker(
         allow_deprecated=allow_deprecated,
         strategy=strategy,
         buildcache_specs=buildcache_specs,
+        host_libcs=host_libcs,
         local_store_specs=local_store_specs,
         local_external_origin_hashes=sorted(local_external_origin_hashes),
         local_deprecated_for=local_deprecated_for,
@@ -314,11 +322,10 @@ def solve_separately_in_workers(
     local_store_specs, local_external_origin_hashes, local_deprecated_for = local_store_snapshot(
         context.store
     )
-    _preflight_compiler_properties(
-        context, configured_compilers, local_store_specs
-    )
+    _preflight_compiler_properties(context, configured_compilers, local_store_specs)
+    host_libcs = _preflight_compiler_properties(context, configured_compilers, local_store_specs)
     buildcache_specs = (
-            spack.binary_distribution.update_cache_and_get_specs(config=spack.config.CONFIG)
+        spack.binary_distribution.update_cache_and_get_specs(config=spack.config.CONFIG)
         if buildcache_reuse_enabled(spack.config.CONFIG)
         else []
     )
@@ -330,6 +337,7 @@ def solve_separately_in_workers(
             allow_deprecated=allow_deprecated,
             strategy=SEPARATELY,
             buildcache_specs=buildcache_specs,
+            host_libcs=host_libcs,
             local_store_specs=local_store_specs,
             local_external_origin_hashes=sorted(local_external_origin_hashes),
             local_deprecated_for=local_deprecated_for,

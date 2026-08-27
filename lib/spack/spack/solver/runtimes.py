@@ -1,7 +1,9 @@
 # Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
-from typing import TYPE_CHECKING, Set, Tuple
+import contextlib
+from typing import Iterator, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING
 
 import spack.compilers.config
 import spack.compilers.libraries
@@ -18,6 +20,18 @@ if TYPE_CHECKING:
 
 #: Language virtuals wrapped by the compiler wrapper (same ones for which a flag exists)
 COMPILER_WRAPPER_LANGUAGES = ("c", "cxx", "fortran")
+_HOST_LIBC_SNAPSHOT: Optional[Set[spack.spec.Spec]] = None
+
+
+@contextlib.contextmanager
+def use_host_libc_snapshot(libcs: List[spack.spec.Spec]) -> Iterator[None]:
+    """Use parent-detected host libc specs during a confined solve."""
+    global _HOST_LIBC_SNAPSHOT
+    previous, _HOST_LIBC_SNAPSHOT = _HOST_LIBC_SNAPSHOT, set(libcs)
+    try:
+        yield
+    finally:
+        _HOST_LIBC_SNAPSHOT = previous
 
 
 class RuntimePropertyRecorder:
@@ -275,6 +289,9 @@ class RuntimePropertyRecorder:
 def all_libcs(context: "spack.context.SpackContext") -> Set[spack.spec.Spec]:
     """Return a set of all libc specs targeted by any configured compiler. If none, fall back to
     libc determined from the current Python process if dynamically linked."""
+    cache = spack.compilers.libraries.FileCompilerCache(context.misc_cache)
+    if _HOST_LIBC_SNAPSHOT is not None:
+        return set(_HOST_LIBC_SNAPSHOT)
     cache = spack.compilers.libraries.FileCompilerCache(context.misc_cache)
     libcs = set()
     for c in spack.compilers.config.all_compilers_from(context.config, repo=context.repo):

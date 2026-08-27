@@ -31,8 +31,14 @@ The launcher-neutral one-shot path now runs the existing ``Solver.solve()`` in a
 After inherited descriptors are closed, its setup hook discards stale lock bookkeeping and recreates the store and binary-cache index with fresh lock objects.
 An allowlisted error protocol preserves catchable Spack, configuration, spec, unknown-package, and unsatisfiable-spec categories; unexpected internal failures retain the transport failure path.
 
-Trusted parent preflight ensures Clingo is importable and imports only configured or installed compiler candidate recipes to populate compiler properties.
-Local-store specs and install metadata are frozen before every worker solve; build-cache candidates are refreshed and frozen only when enabled by reuse policy.
+Trusted parent preflight ensures Clingo is importable and imports only configured or installed
+compiler candidate recipes to populate compiler properties.
+Bootstrap completes once before worker launch, so worker selection does not select or install a
+different Clingo bootstrap DAG.
+Detected host ``glibc`` or ``musl`` specs cross the protocol as a validated frozen snapshot;
+libc reuse compatibility therefore does not depend on compiler execution inside the worker.
+Local-store specs and install metadata are frozen before every worker solve; build-cache candidates
+are refreshed and frozen only when enabled by reuse policy.
 The worker applies the existing reuse filters without store access or network refresh.
 
 Landlock allows reads from active repositories, Spack and Python runtime paths, and loaded configuration.
