@@ -465,14 +465,14 @@ Scheduling, cancellation, and UI progress remain parent-owned.
 
 Acceptance checks:
 
-* [ ] ``spack spec`` matches direct output in text, YAML, JSON, and format modes;
-* [ ] ``spack concretize`` preserves together, when-possible, and separate environment behavior;
-* [ ] ``spack install`` implicitly concretizes through the same worker and passes the returned concrete spec to the existing installer;
-* [ ] warnings and errors preserve user-visible order and machine-readable output remains clean;
+* [x] ``spack spec`` matches direct output in text, YAML, JSON, and format modes;
+* [x] ``spack concretize`` preserves together, when-possible, and separate environment behavior;
+* [x] ``spack install`` implicitly concretizes through the same worker and passes the returned concrete spec to the existing installer;
+* [x] warnings and errors preserve user-visible order and machine-readable output remains clean;
 * [ ] timers and solver statistics retain semantic fields without requiring byte-for-byte presentation parity;
-* [ ] already-concretized environments do not launch a solver worker unnecessarily;
+* [x] already-concretized environments do not launch a solver worker unnecessarily;
 * [ ] lockfile updates occur only after the complete response is validated; and
-* [ ] worker and permitted fallback modes have focused command and environment coverage.
+* [x] worker and permitted fallback modes have focused command and environment coverage.
 
 5. Broaden API and regression coverage
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

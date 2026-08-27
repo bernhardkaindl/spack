@@ -58,7 +58,11 @@ Separate solves use one confined worker per unresolved root.
 The trusted parent caps concurrent workers at Spack's configured parallel job limit, validates only
 framed JSON responses, owns progress reporting, and reaps outstanding workers after failure or
 cancellation.
-Broad environment/install integration remains incomplete.
+Focused command and environment coverage includes ``spack spec`` output modes, all three
+environment strategies, implicit ``spack install`` concretization, configured fallback, invalid
+response rejection before environment mutation, and already-concretized environment no-op behavior.
+Timer/statistics parity, lockfile transaction coverage, and broader direct-API regression coverage
+remain incomplete.
 
 Implemented ``spack info`` boundaries
 -------------------------------------
