@@ -23,6 +23,7 @@ class SpySeccompSandbox(spack.sandbox.SeccompSandbox):
 
     def __init__(self):
         self.rules_added = []
+        self.masked_rules_added = []
         self.loaded = False
         self.listener_fd = 42
         self.prctl_called = False
@@ -36,6 +37,11 @@ class SpySeccompSandbox(spack.sandbox.SeccompSandbox):
 
     def _rule_add(self, context, syscall: int, action=spack.sandbox.SECCOMP_RET_ERRNO | 1) -> None:
         self.rules_added.append((syscall, action))
+
+    def _rule_add_masked_eq(
+        self, context, syscall: int, argument: int, mask: int, value: int, action: int
+    ) -> None:
+        self.masked_rules_added.append((syscall, argument, mask, value, action))
 
     def _load(self, context) -> None:
         self.loaded = True
@@ -61,6 +67,29 @@ def test_seccomp_sandbox_groups():
         + len(spack.sandbox._IPC_SYSCALLS)
     )
     assert len(spy.rules_added) == total_expected
+
+
+def test_seccomp_allows_only_thread_clone():
+    spy = SpySeccompSandbox()
+
+    spy.deny_process_creation_except_threads()
+
+    assert spy.masked_rules_added == [
+        (
+            spy._get_syscall_number("clone"),
+            0,
+            spack.sandbox.CLONE_THREAD,
+            0,
+            spack.sandbox.SECCOMP_RET_ERRNO | errno.EPERM,
+        )
+    ]
+    assert spy.rules_added == [
+        (spy._get_syscall_number("clone3"), spack.sandbox.SECCOMP_RET_ERRNO | errno.ENOSYS),
+        *[
+            (spy._get_syscall_number(name), spack.sandbox.SECCOMP_RET_ERRNO | errno.EPERM)
+            for name in ("fork", "vfork", "execve", "execveat")
+        ],
+    ]
 
 
 def test_seccomp_connect_listener():

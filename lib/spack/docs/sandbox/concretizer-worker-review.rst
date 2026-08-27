@@ -323,6 +323,7 @@ Review the implementation in vertical increments:
 
 * Instrument recipe imports and prove setup runs before the first selected recipe import.
 * Test denied writes, sockets, arbitrary execution, IPC, inactive repositories, and unrelated host paths at the kernel boundary.
+* Require ``clone(CLONE_THREAD)`` for Clingo threads while denying ``fork``, ``vfork``, ``clone3`` process creation, and executable replacement.
 * Resolve compiler probing, index preparation, bootstrap, and cache writes with individual policy tests rather than broad directory grants.
 * Audit malformed or poisoned misc-cache entries as follow-up hardening; if a reader is found to execute cache-selected code, move that cache family to invocation scratch before enabling the worker by default.
 
