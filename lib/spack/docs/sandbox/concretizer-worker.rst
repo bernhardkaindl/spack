@@ -425,10 +425,15 @@ Treat all cache content as untrusted input and retain parser and native-spec val
 Apply rlimits, Landlock, network denial, denial of unapproved process execution, and IPC denial before request parsing can cause a recipe import.
 Add read paths only after a focused failure identifies a normal concretizer dependency.
 
+The Linux seccomp policy permits legacy ``clone`` only when ``CLONE_THREAD`` is set.
+It denies ``fork``, ``vfork``, and executable replacement.
+It returns ``ENOSYS`` for ``clone3`` so libc retries with legacy ``clone``, whose flags seccomp can inspect without a supervisor.
+
 Acceptance checks:
 
 * [x] the first selected and transitive recipe imports occur only after confinement is active;
 * [x] recipe attempts to write files, open TCP or Unix sockets, execute unapproved programs, or use blocked IPC fail;
+* [x] recipe attempts to fork a child process fail while Clingo threads remain available;
 * [x] inactive repositories and unrelated host paths are inaccessible;
 * [x] normal Clingo import, threads, and control-file reads succeed;
 * [x] compiler-property cache hits need no worker process execution or unrelated writes;
@@ -532,3 +537,4 @@ Each would need a separate threat model and protocol; none is required to protec
 
 * [ ] Audit every persistent misc-cache reader for malformed and poisoned structured input.
   If any reader executes cache-selected code, move that cache family to invocation scratch before enabling the worker by default.
+* [ ] Revisit the ``clone3`` denial if a supported libc stops falling back to legacy thread-form ``clone``; keep process creation denied rather than broadly allowing ``clone3``.

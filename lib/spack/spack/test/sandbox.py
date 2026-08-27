@@ -11,6 +11,7 @@ import pytest
 if sys.platform != "linux":
     pytest.skip("Landlock sandboxing is Linux only", allow_module_level=True)
 
+import errno
 import os
 import pathlib
 import socket
@@ -371,6 +372,7 @@ class MockSeccompSandbox:
         self.block_process = None
         self.block_ipc = None
         self.block_exec = None
+        self.thread_only = False
 
     def apply(self, block_sockets=True, block_process=False, block_ipc=False, block_exec=False):
         self.apply_calls += 1
@@ -378,6 +380,9 @@ class MockSeccompSandbox:
         self.block_process = block_process
         self.block_ipc = block_ipc
         self.block_exec = block_exec
+
+    def deny_process_creation_except_threads(self):
+        self.thread_only = True
 
 
 class FailingSeccompSandbox(MockSeccompSandbox):
@@ -408,8 +413,32 @@ def test_restrict_concretizer_worker_policy(monkeypatch, tmp_path):
     assert sandbox.write_calls == [(write_root, write_root)]
     assert sandbox.apply_calls == [(True, False, True, False)]
     assert limits == [(None, False)]
-    assert seccomp.block_sockets is False
-    assert seccomp.block_exec is True
+    assert seccomp.thread_only
+
+
+def test_concretizer_worker_denies_fork(tmp_path):
+    try:
+        sandbox = spack.sandbox.get_recipe_import_sandbox()
+        if not sandbox.network_isolation_available():
+            pytest.skip("concretizer network isolation is unavailable")
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    def worker(request):
+        try:
+            pid = os.fork()
+        except OSError as error:
+            return error.errno
+        if pid == 0:
+            os._exit(0)
+        os.waitpid(pid, 0)
+        return None
+
+    result = run_json_worker(
+        {}, worker, setup=lambda: spack.sandbox.restrict_concretizer_worker([tmp_path], [])
+    )
+
+    assert result in (errno.EPERM, errno.EACCES)
 
 
 @pytest.mark.parametrize(
