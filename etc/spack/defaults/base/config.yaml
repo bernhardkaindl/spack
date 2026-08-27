@@ -181,6 +181,10 @@ config:
     # Allow sandboxed commands to use their trusted direct implementation when
     # worker confinement is unavailable.
     allow_fallback: false
+    concretizer:
+      # Limit total response bytes from an untrusted concretizer worker. Increase
+      # this for unusually large concrete environments.
+      max_response_bytes: 1073741824
     # Allow TCP network access during the build phase.
     allow_network: false
     # Experimental executable-policy learning. When enabled, only an already
