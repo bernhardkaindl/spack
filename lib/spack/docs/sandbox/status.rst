@@ -26,6 +26,14 @@ The total response ceiling defaults to one GiB and can be raised with ``config:s
 
 Focused tests cover malformed and stale requests and responses, ordered root association, DAG-hash validation, abstract, concrete, and spliced native-spec round trips, duplicate JSON keys, large payloads, optional timeout and response-resource policies, setup ordering, diagnostics, and legacy worker compatibility.
 
+The launcher-neutral one-shot path now runs the existing ``Solver.solve()`` in an unconstrained forked worker and restores final native specs in the parent.
+After inherited descriptors are closed, its setup hook discards stale lock bookkeeping and recreates the store and binary-cache index with fresh lock objects.
+An allowlisted error protocol preserves catchable Spack, configuration, spec, unknown-package, and unsatisfiable-spec categories; unexpected internal failures retain the transport failure path.
+
+Focused parity covers versions, variants, dependency DAGs, virtual roots, externals, installed-spec reuse, automatic splicing, compilers, platforms, test dependencies, ordered warnings, cache-enabled and cache-disabled operation, invalid inputs, and inherited solver timeout configuration.
+Transport lifecycle coverage includes explicit worker deadlines, parent interruption, truncated frames, child crashes, inherited-descriptor cleanup, and child reaping.
+No normal command or shared ``spack.concretize`` function selects this worker yet.
+
 Implemented ``spack info`` boundaries
 -------------------------------------
 

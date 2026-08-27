@@ -16,8 +16,12 @@ STRATEGIES = (TOGETHER, WHEN_POSSIBLE, SEPARATELY)
 _REQUEST_KEYS = {"allow_deprecated", "protocol", "specs", "strategy", "tests"}
 _RESPONSE_KEYS = {"protocol", "results", "warnings"}
 _RESULT_KEYS = {"dag_hash", "input", "spec"}
+_ERROR_RESPONSE_KEYS = {"error", "protocol"}
+_ERROR_KEYS = {"kind", "long_message", "message"}
+ERROR_KINDS = ("config", "spack", "spec", "unknown_package", "unsatisfiable")
 _MAX_WARNINGS = 1024
 _MAX_WARNING_BYTES = 64 * 1024
+_MAX_ERROR_BYTES = 1024 * 1024
 
 TestsType = Union[bool, Iterable[str]]
 
@@ -40,6 +44,14 @@ class ConcretizerWorkerResponse(NamedTuple):
 
     specs: List[spack.spec.Spec]
     warnings: List[str]
+
+
+class ConcretizerWorkerErrorResponse(NamedTuple):
+    """Validated allowlisted solver failure returned by a worker."""
+
+    kind: str
+    message: str
+    long_message: Union[str, None]
 
 
 def _tests_to_json(tests: TestsType) -> Union[bool, List[str]]:
@@ -70,6 +82,20 @@ def _validate_warnings(warnings: Any) -> List[str]:
             "concretizer-worker response warnings exceed the diagnostic limit"
         )
     return warnings
+
+
+def _validate_error_text(value: Any, field: str, optional: bool = False) -> Union[str, None]:
+    if optional and value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker error has invalid {0}".format(field)
+        )
+    if len(value.encode("utf-8")) > _MAX_ERROR_BYTES:
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker error {0} exceeds the diagnostic limit".format(field)
+        )
+    return value
 
 
 def create_request(
@@ -150,6 +176,42 @@ def create_response(
         ],
         "warnings": warning_list,
     }
+
+
+def create_error_response(
+    kind: str, message: str, long_message: Union[str, None] = None
+) -> Dict[str, Any]:
+    """Create a bounded allowlisted solver-error response."""
+    if kind not in ERROR_KINDS:
+        raise ConcretizerWorkerProtocolError("concretizer-worker error has an invalid kind")
+    error = {
+        "kind": kind,
+        "long_message": _validate_error_text(long_message, "long message", optional=True),
+        "message": _validate_error_text(message, "message"),
+    }
+    return {"error": error, "protocol": PROTOCOL_VERSION}
+
+
+def validate_error_response(response: Any) -> Union[ConcretizerWorkerErrorResponse, None]:
+    """Return a validated solver error, or ``None`` for a non-error response."""
+    if not isinstance(response, dict) or set(response) != _ERROR_RESPONSE_KEYS:
+        return None
+    if type(response["protocol"]) is not int or response["protocol"] != PROTOCOL_VERSION:
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker error has an unsupported protocol"
+        )
+    error = response["error"]
+    if not isinstance(error, dict) or set(error) != _ERROR_KEYS:
+        raise ConcretizerWorkerProtocolError("concretizer-worker error has invalid fields")
+    if error["kind"] not in ERROR_KINDS:
+        raise ConcretizerWorkerProtocolError("concretizer-worker error has an invalid kind")
+    message = _validate_error_text(error["message"], "message")
+    assert isinstance(message, str)
+    return ConcretizerWorkerErrorResponse(
+        error["kind"],
+        message,
+        _validate_error_text(error["long_message"], "long message", optional=True),
+    )
 
 
 def validate_response(response: Any, request: Any) -> ConcretizerWorkerResponse:
