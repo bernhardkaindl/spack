@@ -31,7 +31,7 @@ Planning status:
 * [x] Resolve fallback, initial scope, preflight, cache, and worker-lifetime decisions.
 * [x] Resolve the remaining decision gates at the end of this page.
 * [x] Record final approval of the architecture decision package.
-* [ ] Implement the scalable worker contract without changing solve semantics.
+* [x] Implement the scalable worker contract without changing solve semantics.
 * [ ] Apply confinement before the first recipe import in the worker.
 * [ ] Integrate every shared concretization strategy.
 * [ ] Validate command, environment, install, fallback, and direct-API behavior.
@@ -251,7 +251,7 @@ Approval means:
 
 * the first implementation must not introduce a recipe-fact DTO, exported ASP protocol, remote solver, persistent solver service, or separate concretizer command;
 * worker output is untrusted until the parent validates the complete structured response;
-* parent-side validation must verify protocol shape, transport safety limits, concrete native-spec structure, requested-root association, and all invariants that do not require importing recipes;
+* parent-side validation must verify protocol shape, transport safety limits, concrete native-spec structure, ordered requested-root association, and all invariants that do not require importing recipes;
 * recipe-dependent semantic validation remains inside the confined worker;
 * cache writes are part of the initial confinement policy, not a reason to move solving back into the parent;
 * unsupported-host compatibility uses the existing in-process implementation only according to ``config:sandbox:allow_fallback``; and
@@ -319,6 +319,10 @@ All returned fields are validated before the parent constructs native specs or t
 Recipe-controlled diagnostics and individual transport frames are bounded.
 The protocol must also prevent an untrusted worker from exhausting parent memory or storage with an unending response, but this safety policy must not encode an expected maximum environment or DAG size.
 
+The parent associates each returned root with an input by its validated position in the response.
+The worker owns semantic satisfaction checks, including whether a concrete package provides an abstract virtual root.
+Independently rebuilding provider metadata in the parent would import recipes before confinement and would not provide an independent trust source because recipes define the provider relationship.
+
 Fallback Contract
 -----------------
 
@@ -373,14 +377,15 @@ The response should contain:
 
 Acceptance checks:
 
-* [ ] native abstract and concrete specs round trip without importing a recipe in the parent;
-* [ ] duplicate keys, unknown fields, wrong types, stale versions, malformed specs, and invalid or oversized frames fail before parent-side mutation;
-* [ ] a worker cannot use raw standard output as a response channel;
-* [ ] large valid requests and concrete DAGs are not rejected because they exceed the shared command worker's single-message limit;
+* [x] native abstract and concrete specs round trip without importing a recipe in the parent;
+* [x] duplicate keys, unknown fields, wrong types, stale versions, malformed specs, and invalid or oversized frames fail before parent-side mutation;
+* [x] a worker cannot use raw standard output as a response channel;
+* [x] large valid requests and concrete DAGs are not rejected because they exceed the shared command worker's single-message limit;
 * [ ] moving to a worker adds no default solve-duration or solver-memory limit;
 * [ ] existing ``concretizer:timeout`` and ``concretizer:error_on_timeout`` behavior is preserved;
-* [ ] transport and diagnostic safety limits are independent of expected solve complexity; and
-* [ ] Python 3.6-compatible syntax and existing native-spec formats are retained where feasible.
+* [x] transport and diagnostic safety limits are independent of expected solve complexity;
+* [x] ordered root association is validated in the parent while virtual-provider and other recipe-dependent satisfaction checks remain worker-owned; and
+* [x] Python 3.6-compatible syntax and existing native-spec formats are retained where feasible.
 
 2. Prove one-shot solve parity before confinement
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -497,6 +502,8 @@ They become implementation decisions when the architecture approval record is co
   A representative real-environment benchmark may track overhead but does not define a supported maximum.
 * [x] User-visible warning and error order is preserved.
   Timers and solver statistics require structured semantic equivalence rather than byte-for-byte presentation parity.
+* [x] The parent validates ordered root association and native-spec integrity.
+  Semantic satisfaction, including virtual-provider selection, remains worker-owned so validation does not import recipes before confinement.
 
 Future Uses
 -----------

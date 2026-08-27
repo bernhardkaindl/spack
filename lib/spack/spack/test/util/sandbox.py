@@ -105,6 +105,102 @@ def test_json_worker_times_out_and_reaps_child():
     assert time.monotonic() - start < 0.5
 
 
+def test_streaming_json_worker_transfers_more_than_single_message_limit():
+    value = "x" * (spack.util.sandbox.MAX_MESSAGE_BYTES + 1)
+
+    response = spack.util.sandbox.run_json_worker_streaming(
+        {"value": value}, _echo_worker, timeout=10
+    )
+
+    assert response == {"echo": value}
+
+
+def test_streaming_json_worker_hides_child_standard_output(capsys):
+    assert spack.util.sandbox.run_json_worker_streaming(
+        {"value": "hello"}, _writing_worker, timeout=10
+    ) == {"value": "hello"}
+    assert capsys.readouterr().out == ""
+
+
+def test_streaming_json_worker_runs_setup_before_worker(tmp_path):
+    marker = tmp_path / "stream-setup-pid"
+
+    def setup():
+        marker.write_text(str(os.getpid()))
+
+    def worker(request):
+        return {"setup_pid": int(marker.read_text()), "worker_pid": os.getpid()}
+
+    result = spack.util.sandbox.run_json_worker_streaming({}, worker, setup, timeout=10)
+
+    assert result["setup_pid"] == result["worker_pid"]
+    assert result["worker_pid"] != os.getpid()
+
+
+def test_streaming_json_worker_closes_inherited_descriptors(tmp_path):
+    inherited_fd = os.open(str(tmp_path / "stream-inherited"), os.O_CREAT | os.O_RDWR, 0o600)
+
+    def worker(request):
+        try:
+            os.fstat(inherited_fd)
+        except OSError:
+            return {"inherited_open": False}
+        return {"inherited_open": True}
+
+    try:
+        result = spack.util.sandbox.run_json_worker_streaming({}, worker, timeout=10)
+    finally:
+        os.close(inherited_fd)
+
+    assert result == {"inherited_open": False}
+
+
+def test_streaming_json_worker_reports_child_exception():
+    with pytest.raises(
+        spack.util.sandbox.JsonWorkerError, match="RuntimeError: untrusted failure"
+    ):
+        spack.util.sandbox.run_json_worker_streaming(
+            {"value": "hello"}, _failing_worker, timeout=10
+        )
+
+
+def test_streaming_json_worker_honors_explicit_timeout():
+    start = time.monotonic()
+    with pytest.raises(spack.util.sandbox.JsonWorkerError, match="timed out"):
+        spack.util.sandbox.run_json_worker_streaming({}, _sleeping_worker, timeout=0.05)
+    assert time.monotonic() - start < 0.5
+
+
+def test_streaming_json_worker_enforces_optional_response_resource_limit():
+    with pytest.raises(spack.util.sandbox.JsonWorkerError, match="resource limit"):
+        spack.util.sandbox.run_json_worker_streaming(
+            {"value": "x" * 1024}, _echo_worker, timeout=10, max_response_bytes=128
+        )
+
+
+def test_streaming_json_reader_rejects_oversized_frame_before_payload():
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, struct.pack(">Q", spack.util.sandbox._STREAM_FRAME_BYTES + 1))
+        with pytest.raises(spack.util.sandbox.JsonWorkerError, match="frame exceeds"):
+            spack.util.sandbox._read_stream_message(read_fd)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_streaming_json_reader_rejects_duplicate_keys():
+    payload = b'{"field":1,"field":2}'
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, struct.pack(">Q", len(payload)) + payload + struct.pack(">Q", 0))
+        with pytest.raises(spack.util.sandbox.JsonWorkerError, match="duplicate keys"):
+            spack.util.sandbox._read_stream_message(read_fd)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 @pytest.mark.parametrize("payload", [b'{"field": 1, "field": 2}', None])
 def test_json_worker_rejects_invalid_messages(payload):
     read_fd, write_fd = os.pipe()
