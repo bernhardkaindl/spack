@@ -51,6 +51,8 @@ LANDLOCK_RESTRICT_SELF_TSYNC = 1 << 3
 SECCOMP_RET_ALLOW = 0x7FFF0000
 SECCOMP_RET_ERRNO = 0x00050000
 SECCOMP_RET_USER_NOTIF = 0x7FC00000
+SCMP_CMP_MASKED_EQ = 7
+CLONE_THREAD = 0x00010000
 SECCOMP_ADDFD_FLAG_SEND = 1 << 1
 SECCOMP_USER_NOTIF_FLAG_CONTINUE = 1
 SYS_PIDFD_OPEN = 434
@@ -227,6 +229,17 @@ class SeccompNotificationAddfd(ctypes.Structure):
         ("srcfd", ctypes.c_uint32),
         ("newfd", ctypes.c_uint32),
         ("newfd_flags", ctypes.c_uint32),
+    ]
+
+
+class SeccompArgCompare(ctypes.Structure):
+    """libseccomp syscall argument comparison."""
+
+    _fields_ = [
+        ("arg", ctypes.c_uint),
+        ("op", ctypes.c_uint),
+        ("datum_a", ctypes.c_uint64),
+        ("datum_b", ctypes.c_uint64),
     ]
 
 
@@ -497,6 +510,14 @@ class SeccompSandbox:
             ctypes.c_uint,
         ]
         self.libseccomp.seccomp_rule_add.restype = ctypes.c_int
+        self.libseccomp.seccomp_rule_add_array.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.POINTER(SeccompArgCompare),
+        ]
+        self.libseccomp.seccomp_rule_add_array.restype = ctypes.c_int
         self.libseccomp.seccomp_load.argtypes = [ctypes.c_void_p]
         self.libseccomp.seccomp_load.restype = ctypes.c_int
         self.libseccomp.seccomp_notify_fd.argtypes = [ctypes.c_void_p]
@@ -542,6 +563,20 @@ class SeccompSandbox:
         )
         if result < 0:
             raise OSError(-result, f"seccomp_rule_add({syscall}): {os.strerror(-result)}")
+
+    def _rule_add_masked_eq(
+        self, context, syscall: int, argument: int, mask: int, value: int, action: int
+    ) -> None:
+        comparison = SeccompArgCompare(argument, SCMP_CMP_MASKED_EQ, mask, value)
+        result = self.libseccomp.seccomp_rule_add_array(
+            context,
+            ctypes.c_uint32(action),
+            ctypes.c_int(syscall),
+            ctypes.c_uint(1),
+            ctypes.byref(comparison),
+        )
+        if result < 0:
+            raise OSError(-result, f"seccomp_rule_add_array({syscall}): {os.strerror(-result)}")
 
     def _load(self, context) -> None:
         result = self.libseccomp.seccomp_load(context)
@@ -620,6 +655,30 @@ class SeccompSandbox:
             raise OSError(errno.ENOMEM, "seccomp_init failed")
         try:
             for name in _NETWORK_WORKER_DENY_SYSCALLS:
+                syscall = self._get_syscall_number(name)
+                if syscall >= 0:
+                    self._rule_add(context, syscall)
+            self._load(context)
+        finally:
+            self.libseccomp.seccomp_release(context)
+
+    def deny_process_creation_except_threads(self) -> None:
+        """Allow thread-form ``clone`` while denying processes and executable replacement."""
+        self._prctl_no_new_privs()
+        context = self.libseccomp.seccomp_init(ctypes.c_uint32(SECCOMP_RET_ALLOW))
+        if not context:
+            raise OSError(errno.ENOMEM, "seccomp_init failed")
+        try:
+            clone = self._get_syscall_number("clone")
+            if clone >= 0:
+                self._rule_add_masked_eq(
+                    context, clone, 0, CLONE_THREAD, 0, SECCOMP_RET_ERRNO | errno.EPERM
+                )
+            clone3 = self._get_syscall_number("clone3")
+            if clone3 >= 0:
+                # libc can retry with legacy clone, whose flags seccomp can inspect directly.
+                self._rule_add(context, clone3, SECCOMP_RET_ERRNO | errno.ENOSYS)
+            for name in ("fork", "vfork", "execve", "execveat"):
                 syscall = self._get_syscall_number(name)
                 if syscall >= 0:
                     self._rule_add(context, syscall)
@@ -894,8 +953,8 @@ def restrict_concretizer_worker(
     sandbox.apply(
         block_network=True, block_process=False, block_ipc=True, allow_tcp_network_fallback=False
     )
-    # Clingo's asynchronous solve requires threads, so deny executable replacement separately.
-    SeccompSandbox().apply(block_sockets=False, block_exec=True)
+    # Clingo's asynchronous solve requires threads, but recipe code cannot create child processes.
+    SeccompSandbox().deny_process_creation_except_threads()
 
 
 def restrict_network_worker(
