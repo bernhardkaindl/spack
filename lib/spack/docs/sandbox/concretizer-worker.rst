@@ -357,7 +357,8 @@ The implementation still needs transport safety because the worker response is u
 * process large native-spec data incrementally or through multiple bounded frames; and
 * apply an administrative total transport-resource ceiling only if needed to prevent unbounded parent memory or storage consumption.
 
-Any total ceiling must be configurable, documented as a security resource policy rather than a normal solve-size expectation, and produce a specific diagnostic.
+The total ceiling defaults to one GiB and is configurable with ``config:sandbox:concretizer:max_response_bytes``.
+It is a security resource policy rather than a normal solve-size expectation and produces a specific diagnostic.
 It must not silently select in-process fallback.
 
 The versioned request should contain only JSON-compatible values:
