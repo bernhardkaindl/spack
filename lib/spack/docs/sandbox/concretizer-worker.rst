@@ -454,8 +454,10 @@ Support in order:
 * [x] ``concretize_one`` and one-shot together solves;
 * [x] together solves with reuse factories;
 * [x] ``solve_in_rounds()`` for ``unify: when_possible``;
-* [x] separate solves without nesting the existing unconstrained process pool around sandbox workers; and
-* [ ] direct shared-API output modes required by ``spack solve`` and tests.
+* [x] separate solves without nesting the existing unconstrained process pool around sandbox workers.
+
+Low-level ``spack solve`` setup, timer, and statistics modes are deferred to a later milestone.
+They require bounded structured output beyond the high-level concrete-root protocol.
 
 A together or multi-round operation initially uses one newly forked worker for the operation.
 The separate strategy uses one newly forked worker per root so independent solves can run in parallel.
@@ -471,7 +473,7 @@ Acceptance checks:
 * [x] warnings and errors preserve user-visible order and machine-readable output remains clean;
 * [ ] timers and solver statistics retain semantic fields without requiring byte-for-byte presentation parity;
 * [x] already-concretized environments do not launch a solver worker unnecessarily;
-* [ ] lockfile updates occur only after the complete response is validated; and
+* [x] lockfile updates occur only after the complete response is validated; and
 * [x] worker and permitted fallback modes have focused command and environment coverage.
 
 5. Broaden API and regression coverage
