@@ -3191,7 +3191,7 @@ class SpackSolverSetup:
                 continue
 
             current_libc = None
-            if compiler.external or spack.store.STORE.db.installed(compiler):
+            if compiler.external or spack.solver.reuse.is_installed(compiler):
                 current_libc = CompilerPropertyDetector(compiler).default_libc()
             else:
                 try:

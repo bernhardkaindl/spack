@@ -9,7 +9,7 @@ import os
 import pathlib
 import sysconfig
 import warnings
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import spack.binary_distribution
 import spack.caches
@@ -39,6 +39,9 @@ from spack.concretizer_worker.protocol import (
 )
 from spack.util.lock import FILE_TRACKER
 
+if TYPE_CHECKING:
+    from spack.solver.reuse import SpecFiltersFactory
+
 
 class ConcretizerWorkerError(spack.error.SpackError):
     """A validated Spack solver failure returned by the worker."""
@@ -46,6 +49,10 @@ class ConcretizerWorkerError(spack.error.SpackError):
 
 class ConcretizerWorkerConfigError(spack.error.ConfigError):
     """A validated configuration failure returned by the worker."""
+
+
+class ConcretizerWorkerPackageError(spack.error.PackageError):
+    """A validated package failure returned by the worker."""
 
 
 class ConcretizerWorkerUnsatisfiableSpecError(spack.error.UnsatisfiableSpecError):
@@ -67,14 +74,20 @@ class ConcretizerWorkerUnknownPackageError(spack.repo.UnknownPackageError):
 
 
 def _error_response(error: spack.error.SpackError) -> Dict[str, Any]:
+    from spack.solver.asp import InvalidVersionError
+
     if isinstance(error, spack.repo.UnknownPackageError):
         kind = "unknown_package"
+    elif isinstance(error, InvalidVersionError):
+        kind = "invalid_version"
     elif isinstance(error, spack.error.UnsatisfiableSpecError):
         kind = "unsatisfiable"
     elif isinstance(error, spack.error.SpecError):
         kind = "spec"
     elif isinstance(error, spack.error.ConfigError):
         kind = "config"
+    elif isinstance(error, spack.error.PackageError):
+        kind = "package"
     else:
         kind = "spack"
     return create_error_response(kind, error.message, error.long_message)
@@ -134,7 +147,9 @@ def _preflight_compiler_properties(
         spack.compilers.libraries.CompilerPropertyDetector(compiler).compiler_verbose_output()
 
 
-def solve_request(request: Dict[str, Any]) -> Dict[str, Any]:
+def solve_request(
+    request: Dict[str, Any], specs_factory: Optional["SpecFiltersFactory"] = None
+) -> Dict[str, Any]:
     """Run one validated together solve and return structured concrete roots."""
     validated = validate_request(request)
     if validated.strategy != TOGETHER:
@@ -153,13 +168,15 @@ def solve_request(request: Dict[str, Any]) -> Dict[str, Any]:
             validated.local_deprecated_for,
         ):
             with warnings.catch_warnings(record=True) as caught:
-                result = Solver().solve(
+                result = Solver(specs_factory=specs_factory).solve(
                     validated.specs,
                     tests=validated.tests,
                     allow_deprecated=validated.allow_deprecated,
                 )
     except spack.error.SpackError as error:
         return _error_response(error)
+    except AssertionError as error:
+        return create_error_response("assertion", str(error))
     return create_response(result.specs, warnings=[str(item.message) for item in caught])
 
 
@@ -167,19 +184,30 @@ def _raise_worker_error(response: Any) -> None:
     error = validate_error_response(response)
     if error is None:
         return
+    from spack.solver.asp import InvalidVersionError, UnsatisfiableSpecError
+
     exception_types = {
+        "assertion": AssertionError,
         "config": ConcretizerWorkerConfigError,
+        "invalid_version": InvalidVersionError,
+        "package": ConcretizerWorkerPackageError,
         "spack": ConcretizerWorkerError,
         "spec": spack.error.SpecError,
         "unknown_package": ConcretizerWorkerUnknownPackageError,
-        "unsatisfiable": ConcretizerWorkerUnsatisfiableSpecError,
+        "unsatisfiable": UnsatisfiableSpecError,
     }
     assert set(exception_types) == set(ERROR_KINDS)
+    if error.kind in ("assertion", "invalid_version", "unsatisfiable"):
+        raise exception_types[error.kind](error.message)
     raise exception_types[error.kind](error.message, error.long_message)
 
 
 def solve_in_worker(
-    specs: Sequence[spack.spec.Spec], *, tests: TestsType = False, allow_deprecated: bool = False
+    specs: Sequence[spack.spec.Spec],
+    *,
+    tests: TestsType = False,
+    allow_deprecated: bool = False,
+    factory: Optional["SpecFiltersFactory"] = None,
 ) -> ConcretizerWorkerResponse:
     """Run an unchanged one-shot solve in an unconstrained forked worker.
 
@@ -217,7 +245,7 @@ def solve_in_worker(
     )
     response = spack.util.sandbox.run_json_worker_streaming(
         request,
-        solve_request,
+        functools.partial(solve_request, specs_factory=factory),
         setup=functools.partial(_worker_setup, read_roots, write_roots),
         max_response_bytes=max_response_bytes,
     )
