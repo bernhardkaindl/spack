@@ -8,14 +8,15 @@ Current Status
 
 ``spack info`` is the first hardened normal command.
 
-Implemented concretizer-worker contract foundation
----------------------------------------------------
+Implemented concretizer worker
+------------------------------
 
-The concretizer worker is not integrated into a solve path and does not yet apply confinement.
-Its versioned launcher-neutral contract and scalable process transport are implemented.
+The versioned launcher-neutral contract, scalable process transport, solve integration, and
+confinement policy are implemented.
 
 The request carries abstract native specs, test-dependency selection, deprecated-version policy, solve strategy, and frozen local-store and build-cache reuse metadata.
-The response carries ordered final concrete native specs, DAG hashes, and bounded warnings.
+The response carries ordered final concrete native specs, DAG hashes, solve durations, and bounded
+warnings.
 Request creation, response restoration, and structural validation do not import package recipes.
 Virtual-provider and other recipe-dependent satisfaction checks remain worker-owned.
 
@@ -51,7 +52,13 @@ They also prove that child-process creation is denied while a normal asynchronou
 ``spack.concretize.concretize_one()`` and unified together solves now select the confined worker automatically when supported.
 They use the existing direct solver only when confinement is unavailable and the shared ``config:sandbox:allow_fallback`` policy permits fallback.
 This covers explicit ``spack spec`` inputs and normal callers that use those shared operations.
-When-possible, separate, and broad environment/install integration remain incomplete.
+When-possible solves now keep every round in one confined worker and return per-root producing-round
+durations for parent-owned progress events.
+Separate solves use one confined worker per unresolved root.
+The trusted parent caps concurrent workers at Spack's configured parallel job limit, validates only
+framed JSON responses, owns progress reporting, and reaps outstanding workers after failure or
+cancellation.
+Broad environment/install integration remains incomplete.
 
 Implemented ``spack info`` boundaries
 -------------------------------------
