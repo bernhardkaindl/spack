@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, NamedTuple, Sequence, Union
 
 import spack.spec
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 TOGETHER = "together"
 WHEN_POSSIBLE = "when_possible"
 SEPARATELY = "separately"
@@ -21,6 +21,7 @@ _REQUEST_KEYS = {
     "local_store_specs",
     "protocol",
     "specs",
+    "spec_strings",
     "strategy",
     "tests",
 }
@@ -28,7 +29,16 @@ _RESPONSE_KEYS = {"protocol", "results", "warnings"}
 _RESULT_KEYS = {"dag_hash", "input", "spec"}
 _ERROR_RESPONSE_KEYS = {"error", "protocol"}
 _ERROR_KEYS = {"kind", "long_message", "message"}
-ERROR_KINDS = ("config", "spack", "spec", "unknown_package", "unsatisfiable")
+ERROR_KINDS = (
+    "assertion",
+    "config",
+    "invalid_version",
+    "package",
+    "spack",
+    "spec",
+    "unknown_package",
+    "unsatisfiable",
+)
 _MAX_WARNINGS = 1024
 _MAX_WARNING_BYTES = 64 * 1024
 _MAX_ERROR_BYTES = 1024 * 1024
@@ -173,6 +183,7 @@ def create_request(
         "local_store_specs": [spec.to_dict() for spec in local_store_specs],
         "protocol": PROTOCOL_VERSION,
         "specs": [spec.to_dict() for spec in specs],
+        "spec_strings": [str(spec) for spec in specs],
         "strategy": strategy,
         "tests": _tests_to_json(tests),
     }
@@ -199,6 +210,14 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
         raise ConcretizerWorkerProtocolError("concretizer-worker request requires input specs")
     if not all(isinstance(spec, dict) for spec in request["specs"]):
         raise ConcretizerWorkerProtocolError("concretizer-worker request has invalid spec data")
+    if not isinstance(request["spec_strings"], list) or not all(
+        isinstance(spec, str) and spec for spec in request["spec_strings"]
+    ):
+        raise ConcretizerWorkerProtocolError("concretizer-worker request has invalid spec strings")
+    if len(request["spec_strings"]) != len(request["specs"]):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request spec representations do not match"
+        )
     if not isinstance(request["buildcache_specs"], list) or not all(
         isinstance(spec, dict) for spec in request["buildcache_specs"]
     ):
@@ -227,7 +246,8 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
         )
 
     try:
-        specs = [spack.spec.Spec.from_dict(spec) for spec in request["specs"]]
+        native_specs = [spack.spec.Spec.from_dict(spec) for spec in request["specs"]]
+        specs = [spack.spec.Spec(spec) for spec in request["spec_strings"]]
         buildcache_specs = [
             spack.spec.Spec.from_dict(spec) for spec in request["buildcache_specs"]
         ]
@@ -238,6 +258,10 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
         raise ConcretizerWorkerProtocolError(
             "concretizer-worker request contains an invalid spec"
         ) from error
+    if any(str(native) != text for native, text in zip(native_specs, request["spec_strings"])):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request spec representations do not match"
+        )
     if not all(spec.concrete for spec in buildcache_specs):
         raise ConcretizerWorkerProtocolError(
             "concretizer-worker request requires concrete build-cache specs"

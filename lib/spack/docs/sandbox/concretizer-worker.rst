@@ -451,7 +451,7 @@ Do not put worker policy in ``cmd/spec.py``, ``cmd/concretize.py``, ``cmd/instal
 
 Support in order:
 
-* [ ] ``concretize_one`` and one-shot together solves;
+* [x] ``concretize_one`` and one-shot together solves;
 * [ ] together solves with reuse factories;
 * [ ] ``solve_in_rounds()`` for ``unify: when_possible``;
 * [ ] separate solves without nesting the existing unconstrained process pool around sandbox workers; and
