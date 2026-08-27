@@ -52,6 +52,7 @@ import spack.package_base
 import spack.package_prefs
 import spack.platforms
 import spack.repo
+import spack.solver.reuse
 import spack.solver.splicing
 import spack.spec
 import spack.traverse
@@ -2610,7 +2611,9 @@ class SpackSolverSetup:
                 continue
 
             current_libc = None
-            if compiler.external or self.context.store.db.installed(compiler):
+            if compiler.external or spack.solver.reuse.local_store_contains(
+                compiler, store=self.context.store
+            ):
                 current_libc = CompilerPropertyDetector(
                     compiler, repo=self.context.repo, cache=self.compiler_cache
                 ).default_libc()
@@ -2957,7 +2960,11 @@ def possible_compilers(
     # Compilers from the local store
     supported_compilers = spack.compilers.config.supported_compilers(repo=context.repo)
     for pkg_name in supported_compilers:
-        result.update(context.store.db.query(pkg_name, repo=context.repo))
+        result.update(
+            spack.solver.reuse.specs_from_store_for_package(
+                pkg_name, store=context.store, repo=context.repo
+            )
+        )
 
     return result, rejected
 
@@ -3398,16 +3405,23 @@ def _ensure_no_deprecated(specs: Iterable[spack.spec.Spec], *, store: "spack.sto
         spack.spec.SpecDeprecatedError: if any deprecated spec is found
     """
     deprecated = []
-    with store.db.read_transaction():
-        for x in spack.traverse.traverse_nodes(list(specs)):
-            _, rec = store.db.query_by_spec_hash(x.dag_hash())
-            if rec and rec.deprecated_for:
-                deprecated.append(rec)
+    if spack.solver.reuse.using_local_store_snapshot():
+        for spec in spack.traverse.traverse_nodes(list(specs)):
+            replacement = spack.solver.reuse.deprecated_for(spec)
+            if replacement:
+                deprecated.append((spec, replacement))
+    else:
+        db = store.db
+        with db.read_transaction():
+            for spec in spack.traverse.traverse_nodes(list(specs)):
+                _, record = db.query_by_spec_hash(spec.dag_hash())
+                if record and record.deprecated_for:
+                    deprecated.append((record.spec, record.deprecated_for))
     if deprecated:
         msg = "\n    The following specs have been deprecated"
         msg += " in favor of specs with the hashes shown:\n"
-        for rec in deprecated:
-            msg += "        %s  --> %s\n" % (rec.spec, rec.deprecated_for)
+        for spec, replacement in deprecated:
+            msg += "        %s  --> %s\n" % (spec, replacement)
         msg += "\n"
         msg += "    For each package listed, choose another spec\n"
         raise spack.spec.SpecDeprecatedError(msg)

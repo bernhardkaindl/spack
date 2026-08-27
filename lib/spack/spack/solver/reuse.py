@@ -1,11 +1,12 @@
 # Copyright Spack Project Developers. See COPYRIGHT file for details.
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
+import contextlib
 import enum
 import functools
 import typing
 import warnings
-from typing import Any, Callable, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 
 import spack.binary_distribution
 import spack.config
@@ -26,8 +27,56 @@ if typing.TYPE_CHECKING:
     import spack.environment
 
 
+_BUILD_CACHE_SNAPSHOT: Optional[List[spack.spec.Spec]] = None
+_LOCAL_STORE_SNAPSHOT: Optional[List[spack.spec.Spec]] = None
+_LOCAL_EXTERNAL_ORIGIN_HASHES: Optional[Set[str]] = None
+_LOCAL_DEPRECATED_FOR: Optional[Dict[str, str]] = None
+
+
+@contextlib.contextmanager
+def use_buildcache_snapshot(specs: List[spack.spec.Spec]):
+    """Use a frozen build-cache candidate list for the current solve."""
+    global _BUILD_CACHE_SNAPSHOT
+    previous, _BUILD_CACHE_SNAPSHOT = _BUILD_CACHE_SNAPSHOT, specs
+    try:
+        yield
+    finally:
+        _BUILD_CACHE_SNAPSHOT = previous
+
+
+def buildcache_reuse_enabled(configuration: spack.config.Configuration) -> bool:
+    """Return whether the active reuse policy includes configured build caches."""
+    reuse_yaml = configuration.get("concretizer:reuse", False)
+    if reuse_yaml is False:
+        return False
+    if not isinstance(reuse_yaml, Mapping):
+        return True
+    sources = reuse_yaml.get("from", [{"type": "local"}, {"type": "buildcache"}])
+    return any(source["type"] == "buildcache" for source in sources)
+
+
+@contextlib.contextmanager
+def use_local_store_snapshot(
+    specs: List[spack.spec.Spec], external_origin_hashes: Set[str], deprecated_for: Dict[str, str]
+):
+    """Use a frozen local-store candidate list for the current solve."""
+    global _LOCAL_DEPRECATED_FOR, _LOCAL_EXTERNAL_ORIGIN_HASHES, _LOCAL_STORE_SNAPSHOT
+    previous_specs, _LOCAL_STORE_SNAPSHOT = _LOCAL_STORE_SNAPSHOT, specs
+    previous_origins, _LOCAL_EXTERNAL_ORIGIN_HASHES = (
+        _LOCAL_EXTERNAL_ORIGIN_HASHES,
+        external_origin_hashes,
+    )
+    previous_deprecated, _LOCAL_DEPRECATED_FOR = _LOCAL_DEPRECATED_FOR, deprecated_for
+    try:
+        yield
+    finally:
+        _LOCAL_STORE_SNAPSHOT = previous_specs
+        _LOCAL_EXTERNAL_ORIGIN_HASHES = previous_origins
+        _LOCAL_DEPRECATED_FOR = previous_deprecated
+
+
 def spec_filter_from_store(store, *, is_reusable, include=None, exclude=None) -> SpecFilter:
-    """Constructs a filter that takes the specs from the store passed as argument."""
+    """Construct a filter that takes specs from the supplied store or its frozen snapshot."""
     factory = functools.partial(_specs_from_store, store=store)
     return SpecFilter(factory=factory, is_usable=is_reusable, include=include, exclude=exclude)
 
@@ -141,14 +190,93 @@ def reusable_external_specs(context: "spack.context.SpackContext") -> List[spack
 
 
 def _specs_from_store(store):
+    if _LOCAL_STORE_SNAPSHOT is not None:
+        return _LOCAL_STORE_SNAPSHOT
     with store.db.read_transaction():
         # The order of reused specs does not matter to the solver, so skip sorting.
         return store.db.query(installed=True, sort=False)
 
 
+def local_store_snapshot(store):
+    """Return local reuse candidates and trusted install-record metadata."""
+    with store.db.read_transaction():
+        specs = store.db.query(installed=True, sort=False)
+        deprecated_specs = store.db.query(installed=InstallRecordStatus.DEPRECATED, sort=False)
+
+        def record_for(spec):
+            dag_hash = spec.dag_hash()
+            record = store.db._data.get(dag_hash)
+            if record is not None:
+                return record
+            for upstream in store.db.upstream_dbs:
+                record = upstream._data.get(dag_hash)
+                if record is not None:
+                    return record
+            return None
+
+        records = {spec.dag_hash(): record_for(spec) for spec in specs + deprecated_specs}
+        external_origins = {
+            spec.dag_hash()
+            for spec in specs
+            if records[spec.dag_hash()] and records[spec.dag_hash()].origin == "external-db"
+        }
+        deprecated_for = {
+            spec.dag_hash(): records[spec.dag_hash()].deprecated_for
+            for spec in deprecated_specs
+            if records[spec.dag_hash()] and records[spec.dag_hash()].deprecated_for
+        }
+    return specs, external_origins, deprecated_for
+
+
+def local_store_has_package(pkg_name: str, *, store) -> bool:
+    """Return whether a package is installed in a frozen snapshot or the supplied store."""
+    if _LOCAL_STORE_SNAPSHOT is not None:
+        return any(spec.name == pkg_name for spec in _LOCAL_STORE_SNAPSHOT)
+    return bool(store.db.query(pkg_name))
+
+
+def local_store_contains(spec: spack.spec.Spec, *, store) -> bool:
+    """Return whether a spec is installed in a frozen snapshot or the supplied store."""
+    if _LOCAL_STORE_SNAPSHOT is not None:
+        return any(candidate.dag_hash() == spec.dag_hash() for candidate in _LOCAL_STORE_SNAPSHOT)
+    return store.db.installed(spec)
+
+
+def specs_from_store_for_package(
+    pkg_name: str, *, store, repo: spack.repo.RepoPath
+) -> List[spack.spec.Spec]:
+    """Return installed package specs from a worker snapshot or the current store."""
+    if _LOCAL_STORE_SNAPSHOT is not None:
+        return [spec for spec in _LOCAL_STORE_SNAPSHOT if spec.name == pkg_name]
+    return store.db.query(pkg_name, repo=repo)
+
+
+def deprecated_for(spec: spack.spec.Spec) -> Optional[str]:
+    """Return a deprecation target from a worker snapshot, or signal direct lookup."""
+    if _LOCAL_DEPRECATED_FOR is None:
+        return None
+    return _LOCAL_DEPRECATED_FOR.get(spec.dag_hash())
+
+
+def using_local_store_snapshot() -> bool:
+    """Return whether local store metadata is frozen for a worker solve."""
+    return _LOCAL_STORE_SNAPSHOT is not None
+
+
+def specs_from_buildcache(
+    binary_index, config: spack.config.Configuration
+) -> List[spack.spec.Spec]:
+    """Return build-cache candidates from a frozen snapshot or the supplied index."""
+    if _BUILD_CACHE_SNAPSHOT is not None:
+        return _BUILD_CACHE_SNAPSHOT
+    return spack.binary_distribution.update_cache_and_get_specs(binary_index, config=config)
+
+
 def _specs_from_mirror(binary_index, config: spack.config.Configuration):
+    if _BUILD_CACHE_SNAPSHOT is not None:
+        return _BUILD_CACHE_SNAPSHOT
     try:
-        specs = spack.binary_distribution.update_cache_and_get_specs(binary_index, config=config)
+        specs = specs_from_buildcache(binary_index, config)
     except (spack.binary_distribution.FetchCacheError, IndexError):
         # this is raised when no mirrors had indices.
         # TODO: update mirror configuration so it can indicate that the
@@ -194,7 +322,11 @@ class ReusableSpecsSelector:
         configuration, store, repo = context.config, context.store, context.repo
         external_parser = create_external_parser(packages_with_externals, context=context)
         # Membership in this set replaces a per-spec query_by_spec_hash on the store
-        external_db_hashes = _external_db_hashes(store)
+        external_db_hashes = (
+            frozenset(_LOCAL_EXTERNAL_ORIGIN_HASHES)
+            if _LOCAL_EXTERNAL_ORIGIN_HASHES is not None
+            else _external_db_hashes(store)
+        )
         # _is_reusable only varies by local vs. build cache, so bind the two variants once
         local_is_reusable = functools.partial(
             _is_reusable,

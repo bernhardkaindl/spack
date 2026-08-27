@@ -13,6 +13,7 @@ import spack.config
 import spack.deptypes as dt
 import spack.platforms
 import spack.repo
+import spack.solver.reuse
 import spack.spec
 import spack.store
 from spack.error import SpackError
@@ -315,8 +316,8 @@ class StaticAnalysis(NoStaticAnalysis):
 
     def buildcache_specs(self) -> List[spack.spec.Spec]:
         if self._buildcache_specs is None:
-            self._buildcache_specs = spack.binary_distribution.update_cache_and_get_specs(
-                self.binary_index, config=self.configuration
+            self._buildcache_specs = spack.solver.reuse.specs_from_buildcache(
+                self.binary_index, self.configuration
             )
         return self._buildcache_specs
 
@@ -333,7 +334,9 @@ class StaticAnalysis(NoStaticAnalysis):
             return True
 
         reuse = self.configuration.get("concretizer:reuse")
-        if reuse is not False and self.store.db.query(pkg_name):
+        if reuse is not False and spack.solver.reuse.local_store_has_package(
+            pkg_name, store=self.store
+        ):
             return True
 
         if reuse is not False and any(x.name == pkg_name for x in self.buildcache_specs()):
