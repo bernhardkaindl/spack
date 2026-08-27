@@ -33,6 +33,25 @@ def test_request_round_trip_does_not_import_recipes(mock_packages, monkeypatch):
     assert restored.strategy == "together"
 
 
+def test_request_preserves_compiler_virtual_constraints():
+    spec = Spec("mpileaks ^libdwarf %gcc ^mpich %[virtuals=fortran] gcc %clang")
+
+    restored = concretizer_worker.validate_request(
+        concretizer_worker.create_request([spec])
+    ).specs[0]
+
+    assert restored == spec
+    assert str(restored) == str(spec)
+
+
+def test_request_rejects_mismatched_spec_representations():
+    request = concretizer_worker.create_request([Spec("pkg-a")])
+    request["spec_strings"][0] = "pkg-b"
+
+    with pytest.raises(concretizer_worker.ConcretizerWorkerProtocolError, match="do not match"):
+        concretizer_worker.validate_request(request)
+
+
 @pytest.mark.parametrize("strategy", concretizer_worker.STRATEGIES)
 def test_request_accepts_each_strategy(strategy):
     request = concretizer_worker.create_request([Spec("pkg-a")], strategy=strategy)

@@ -7,6 +7,7 @@ import contextlib
 import importlib
 import sys
 import time
+import warnings
 from collections import Counter
 from typing import (
     TYPE_CHECKING,
@@ -23,12 +24,12 @@ from typing import (
 
 import spack.compilers
 import spack.compilers.config
+import spack.concretizer_worker
 import spack.config
 import spack.context
 import spack.error
 import spack.hash_lookup
 import spack.repo
-import spack.solver.core
 import spack.traverse
 import spack.util.parallel
 from spack.concretize_ui import (
@@ -91,6 +92,15 @@ def _concretize_specs_together(
         factory: optional factory to produce a list of specs to be reused
     """
     allow_deprecated = spack.config.CONFIG.get("config:deprecated", False)
+    selection = spack.concretizer_worker.select_execution()
+    if selection.mode == spack.concretizer_worker.WORKER:
+        response = spack.concretizer_worker.solve_in_worker(
+            abstract_specs, tests=tests, allow_deprecated=allow_deprecated, factory=factory
+        )
+        for message in response.warnings:
+            warnings.warn(message)
+        return [spec.copy() for spec in response.specs]
+
     result = _solver(factory=factory).solve(
         abstract_specs, tests=tests, allow_deprecated=allow_deprecated
     )
@@ -331,24 +341,7 @@ def _solve_one(spec: Spec, *, tests: TestsType, factory: Optional["SpecFiltersFa
                 f"Spec {node} has no name; cannot concretize an anonymous spec"
             )
 
-    allow_deprecated = spack.config.CONFIG.get("config:deprecated", False)
-    result = _solver(factory=factory).solve([spec], tests=tests, allow_deprecated=allow_deprecated)
-
-    # take the best answer
-    opt, i, answer = min(result.answers)
-    name = spec.name
-    # TODO: Consolidate this code with similar code in solve.py
-    if spack.repo.PATH.is_virtual(spec.name):
-        providers = [s.name for s in answer.values() if s.package.provides(name)]
-        name = providers[0]
-
-    node = spack.solver.core.min_dupe_node(pkg=name)
-    assert node in answer, (
-        f"cannot find {name} in the list of specs {','.join([n.pkg for n in answer.keys()])}"
-    )
-
-    concretized = answer[node]
-    return concretized
+    return _concretize_specs_together([spec], tests=tests, factory=factory)[0]
 
 
 def solve_kind(unify: Any) -> SolveKind:
