@@ -14,7 +14,7 @@ Implemented concretizer-worker contract foundation
 The concretizer worker is not integrated into a solve path and does not yet apply confinement.
 Its versioned launcher-neutral contract and scalable process transport are implemented.
 
-The request carries abstract native specs, test-dependency selection, deprecated-version policy, and solve strategy.
+The request carries abstract native specs, test-dependency selection, deprecated-version policy, solve strategy, and frozen local-store and build-cache reuse metadata.
 The response carries ordered final concrete native specs, DAG hashes, and bounded warnings.
 Request creation, response restoration, and structural validation do not import package recipes.
 Virtual-provider and other recipe-dependent satisfaction checks remain worker-owned.
@@ -26,12 +26,26 @@ The total response ceiling defaults to one GiB and can be raised with ``config:s
 
 Focused tests cover malformed and stale requests and responses, ordered root association, DAG-hash validation, abstract, concrete, and spliced native-spec round trips, duplicate JSON keys, large payloads, optional timeout and response-resource policies, setup ordering, diagnostics, and legacy worker compatibility.
 
-The launcher-neutral one-shot path now runs the existing ``Solver.solve()`` in an unconstrained forked worker and restores final native specs in the parent.
+The launcher-neutral one-shot path now runs the existing ``Solver.solve()`` in a confined forked worker and restores final native specs in the parent.
 After inherited descriptors are closed, its setup hook discards stale lock bookkeeping and recreates the store and binary-cache index with fresh lock objects.
 An allowlisted error protocol preserves catchable Spack, configuration, spec, unknown-package, and unsatisfiable-spec categories; unexpected internal failures retain the transport failure path.
 
+Trusted parent preflight ensures Clingo is importable and imports only configured or installed
+compiler candidate recipes to populate compiler properties.
+Local-store specs and install metadata are frozen before every worker solve; build-cache candidates
+are refreshed and frozen only when enabled by reuse policy.
+The worker applies the existing reuse filters without store access or network refresh.
+
+Landlock allows reads from active repositories, Spack and Python runtime paths, and loaded
+configuration.
+Writes are limited to parent-selected persistent misc-cache and concretization-cache roots.
+Current cache readers parse structured data; cache content remains untrusted and subject to parser and native-spec validation.
+Seccomp denies sockets, executable replacement, and blocked IPC while allowing the threads required by Clingo's asynchronous solve.
+No solver-specific memory ceiling is imposed.
+
 Focused parity covers versions, variants, dependency DAGs, virtual roots, externals, installed-spec reuse, automatic splicing, compilers, platforms, test dependencies, ordered warnings, cache-enabled and cache-disabled operation, invalid inputs, and inherited solver timeout configuration.
 Transport lifecycle coverage includes explicit worker deadlines, parent interruption, truncated frames, child crashes, inherited-descriptor cleanup, and child reaping.
+Real kernel-boundary tests prove that selected recipe evaluation begins after confinement and cannot read or write unrelated paths, create TCP or Unix sockets, or execute a program.
 No normal command or shared ``spack.concretize`` function selects this worker yet.
 
 Implemented ``spack info`` boundaries

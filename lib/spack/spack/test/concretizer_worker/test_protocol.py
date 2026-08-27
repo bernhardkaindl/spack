@@ -40,6 +40,54 @@ def test_request_accepts_each_strategy(strategy):
     assert concretizer_worker.validate_request(request).strategy == strategy
 
 
+def test_request_round_trips_reuse_snapshots(mock_packages):
+    concrete = spack.concretize.concretize_one("pkg-a")
+    request = concretizer_worker.create_request(
+        [Spec("pkg-a")],
+        buildcache_specs=[concrete],
+        local_store_specs=[concrete],
+        local_external_origin_hashes=[concrete.dag_hash()],
+        local_deprecated_for={concrete.dag_hash(): "replacement-hash"},
+    )
+
+    restored = concretizer_worker.validate_request(request)
+
+    assert restored.buildcache_specs[0].dag_hash() == concrete.dag_hash()
+    assert restored.local_store_specs[0].dag_hash() == concrete.dag_hash()
+    assert restored.local_external_origin_hashes == [concrete.dag_hash()]
+    assert restored.local_deprecated_for == {concrete.dag_hash(): "replacement-hash"}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"buildcache_specs": [Spec("pkg-a")]},
+        {"local_store_specs": [Spec("pkg-a")]},
+        {"local_external_origin_hashes": [""]},
+        {"local_deprecated_for": {"hash": ""}},
+        {"local_deprecated_for": []},
+    ],
+)
+def test_request_rejects_invalid_reuse_snapshots(kwargs):
+    with pytest.raises(concretizer_worker.ConcretizerWorkerProtocolError):
+        concretizer_worker.create_request([Spec("pkg-a")], **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"local_external_origin_hashes": ["unknown-hash"]},
+        {"local_deprecated_for": {"unknown-hash": "replacement-hash"}},
+    ],
+)
+def test_request_rejects_unmatched_local_metadata(kwargs):
+    request = concretizer_worker.create_request([Spec("pkg-a")])
+    request.update(kwargs)
+
+    with pytest.raises(concretizer_worker.ConcretizerWorkerProtocolError, match="unmatched local"):
+        concretizer_worker.validate_request(request)
+
+
 def test_large_native_request_uses_scalable_transport():
     spec = Spec("pkg-a")
     large_flag = "x" * spack.util.sandbox.MAX_MESSAGE_BYTES

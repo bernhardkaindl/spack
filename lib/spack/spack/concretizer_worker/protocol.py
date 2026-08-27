@@ -8,12 +8,22 @@ from typing import Any, Dict, Iterable, List, NamedTuple, Sequence, Union
 
 import spack.spec
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 3
 TOGETHER = "together"
 WHEN_POSSIBLE = "when_possible"
 SEPARATELY = "separately"
 STRATEGIES = (TOGETHER, WHEN_POSSIBLE, SEPARATELY)
-_REQUEST_KEYS = {"allow_deprecated", "protocol", "specs", "strategy", "tests"}
+_REQUEST_KEYS = {
+    "allow_deprecated",
+    "buildcache_specs",
+    "local_external_origin_hashes",
+    "local_deprecated_for",
+    "local_store_specs",
+    "protocol",
+    "specs",
+    "strategy",
+    "tests",
+}
 _RESPONSE_KEYS = {"protocol", "results", "warnings"}
 _RESULT_KEYS = {"dag_hash", "input", "spec"}
 _ERROR_RESPONSE_KEYS = {"error", "protocol"}
@@ -37,6 +47,10 @@ class ConcretizerWorkerRequest(NamedTuple):
     tests: Union[bool, List[str]]
     allow_deprecated: bool
     strategy: str
+    buildcache_specs: List[spack.spec.Spec]
+    local_store_specs: List[spack.spec.Spec]
+    local_external_origin_hashes: List[str]
+    local_deprecated_for: Dict[str, str]
 
 
 class ConcretizerWorkerResponse(NamedTuple):
@@ -104,14 +118,59 @@ def create_request(
     tests: TestsType = False,
     allow_deprecated: bool = False,
     strategy: str = TOGETHER,
+    buildcache_specs: Sequence[spack.spec.Spec] = (),
+    local_store_specs: Sequence[spack.spec.Spec] = (),
+    local_external_origin_hashes: Sequence[str] = (),
+    local_deprecated_for: Union[Dict[str, str], None] = None,
 ) -> Dict[str, Any]:
     """Create a JSON-compatible request without imposing a solve-size ceiling."""
     if not isinstance(specs, Sequence) or isinstance(specs, (str, bytes)) or not specs:
         raise ConcretizerWorkerProtocolError("concretizer-worker request requires input specs")
     if not all(isinstance(spec, spack.spec.Spec) for spec in specs):
         raise ConcretizerWorkerProtocolError("concretizer-worker request contains an invalid spec")
+    if not isinstance(buildcache_specs, Sequence) or isinstance(buildcache_specs, (str, bytes)):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid build-cache specs"
+        )
+    if not all(isinstance(spec, spack.spec.Spec) and spec.concrete for spec in buildcache_specs):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request requires concrete build-cache specs"
+        )
+    if not isinstance(local_store_specs, Sequence) or isinstance(local_store_specs, (str, bytes)):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid local-store specs"
+        )
+    if not all(isinstance(spec, spack.spec.Spec) and spec.concrete for spec in local_store_specs):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request requires concrete local-store specs"
+        )
+    if not isinstance(local_external_origin_hashes, Sequence) or isinstance(
+        local_external_origin_hashes, (str, bytes)
+    ):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid local external origins"
+        )
+    if not all(
+        isinstance(dag_hash, str) and dag_hash for dag_hash in local_external_origin_hashes
+    ):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid local external origins"
+        )
+    if local_deprecated_for is None:
+        local_deprecated_for = {}
+    if not isinstance(local_deprecated_for, dict) or not all(
+        isinstance(dag_hash, str) and dag_hash and isinstance(replacement, str) and replacement
+        for dag_hash, replacement in local_deprecated_for.items()
+    ):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid local deprecation data"
+        )
     request = {
         "allow_deprecated": allow_deprecated,
+        "buildcache_specs": [spec.to_dict() for spec in buildcache_specs],
+        "local_external_origin_hashes": list(local_external_origin_hashes),
+        "local_deprecated_for": dict(local_deprecated_for),
+        "local_store_specs": [spec.to_dict() for spec in local_store_specs],
         "protocol": PROTOCOL_VERSION,
         "specs": [spec.to_dict() for spec in specs],
         "strategy": strategy,
@@ -140,14 +199,72 @@ def validate_request(request: Any) -> ConcretizerWorkerRequest:
         raise ConcretizerWorkerProtocolError("concretizer-worker request requires input specs")
     if not all(isinstance(spec, dict) for spec in request["specs"]):
         raise ConcretizerWorkerProtocolError("concretizer-worker request has invalid spec data")
+    if not isinstance(request["buildcache_specs"], list) or not all(
+        isinstance(spec, dict) for spec in request["buildcache_specs"]
+    ):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid build-cache spec data"
+        )
+    if not isinstance(request["local_store_specs"], list) or not all(
+        isinstance(spec, dict) for spec in request["local_store_specs"]
+    ):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid local-store spec data"
+        )
+    if not isinstance(request["local_external_origin_hashes"], list) or not all(
+        isinstance(dag_hash, str) and dag_hash
+        for dag_hash in request["local_external_origin_hashes"]
+    ):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid local external origins"
+        )
+    if not isinstance(request["local_deprecated_for"], dict) or not all(
+        isinstance(dag_hash, str) and dag_hash and isinstance(replacement, str) and replacement
+        for dag_hash, replacement in request["local_deprecated_for"].items()
+    ):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has invalid local deprecation data"
+        )
 
     try:
         specs = [spack.spec.Spec.from_dict(spec) for spec in request["specs"]]
+        buildcache_specs = [
+            spack.spec.Spec.from_dict(spec) for spec in request["buildcache_specs"]
+        ]
+        local_store_specs = [
+            spack.spec.Spec.from_dict(spec) for spec in request["local_store_specs"]
+        ]
     except Exception as error:
         raise ConcretizerWorkerProtocolError(
             "concretizer-worker request contains an invalid spec"
         ) from error
-    return ConcretizerWorkerRequest(specs, tests, request["allow_deprecated"], request["strategy"])
+    if not all(spec.concrete for spec in buildcache_specs):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request requires concrete build-cache specs"
+        )
+    if not all(spec.concrete for spec in local_store_specs):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request requires concrete local-store specs"
+        )
+    local_hashes = {spec.dag_hash() for spec in local_store_specs}
+    if not set(request["local_external_origin_hashes"]).issubset(local_hashes):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has unmatched local external origins"
+        )
+    if not set(request["local_deprecated_for"]).issubset(local_hashes):
+        raise ConcretizerWorkerProtocolError(
+            "concretizer-worker request has unmatched local deprecation data"
+        )
+    return ConcretizerWorkerRequest(
+        specs,
+        tests,
+        request["allow_deprecated"],
+        request["strategy"],
+        buildcache_specs,
+        local_store_specs,
+        list(request["local_external_origin_hashes"]),
+        dict(request["local_deprecated_for"]),
+    )
 
 
 def create_response(

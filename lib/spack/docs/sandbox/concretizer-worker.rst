@@ -32,7 +32,7 @@ Planning status:
 * [x] Resolve the remaining decision gates at the end of this page.
 * [x] Record final approval of the architecture decision package.
 * [x] Implement the scalable worker contract without changing solve semantics.
-* [ ] Apply confinement before the first recipe import in the worker.
+* [x] Apply confinement before the first recipe import in the worker.
 * [ ] Integrate every shared concretization strategy.
 * [ ] Validate command, environment, install, fallback, and direct-API behavior.
 
@@ -411,22 +411,31 @@ This includes ensuring Clingo is importable and determining whether repository i
 Parent preflight may prepare Clingo, indexes, configuration, and reuse inputs only where that work does not import ordinary package recipes.
 If Clingo bootstrap cannot avoid recipes, define the selected bootstrap recipes as a small trusted set with dedicated review and tests; do not turn bootstrap into a general parent-side recipe-import exception.
 Compiler-property detection may execute a selected compiler and write temporary and cache files on a cache miss.
-The initial implementation must prove that parent preflight can populate this data without ordinary recipe imports, or document and test a narrower supervised capability before granting it to the worker.
+The trusted parent imports only configured or installed compiler candidate recipes, executes their
+selected compiler tools, and populates compiler properties before confinement.
+Those compiler recipes form a specially reviewed trusted set; this exception does not include ordinary requested or transitive recipes.
+
+When build-cache reuse is enabled, the trusted parent refreshes configured mirror indexes and sends the resulting concrete native specs as a frozen request snapshot.
+The worker applies the existing reuse filters to that snapshot and receives no network access.
+
+The worker may persist provider, tag, patch, compiler, binary-index, Git-reference, and concretization cache data under parent-selected cache roots.
+Current misc-cache readers parse structured JSON or YAML-like data and do not execute code selected by cache contents.
+Treat all cache content as untrusted input and retain parser and native-spec validation.
 
 Apply rlimits, Landlock, network denial, denial of unapproved process execution, and IPC denial before request parsing can cause a recipe import.
 Add read paths only after a focused failure identifies a normal concretizer dependency.
 
 Acceptance checks:
 
-* [ ] the first selected and transitive recipe imports occur only after confinement is active;
-* [ ] recipe attempts to write files, open sockets, execute unapproved programs, or use blocked IPC fail;
-* [ ] inactive repositories and unrelated host paths are inaccessible;
-* [ ] normal Clingo import and control-file reads succeed;
-* [ ] compiler-property cache hits need no worker process execution or unrelated writes;
-* [ ] a cache miss fails clearly unless a separately approved narrow mechanism handles it;
-* [ ] only dedicated concretization-cache paths are writable;
-* [ ] cache path selection cannot be influenced by recipe data; and
-* [ ] direct kernel-boundary tests run on a supported Linux Landlock host.
+* [x] the first selected and transitive recipe imports occur only after confinement is active;
+* [x] recipe attempts to write files, open TCP or Unix sockets, execute unapproved programs, or use blocked IPC fail;
+* [x] inactive repositories and unrelated host paths are inaccessible;
+* [x] normal Clingo import, threads, and control-file reads succeed;
+* [x] compiler-property cache hits need no worker process execution or unrelated writes;
+* [x] trusted compiler preflight handles cache misses before confinement;
+* [x] only parent-selected misc-cache and concretization-cache paths are writable;
+* [x] cache path selection cannot be influenced by recipe data; and
+* [x] direct kernel-boundary tests run on a supported Linux Landlock host.
 
 4. Integrate all shared solve strategies
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -506,6 +515,11 @@ They become implementation decisions when the architecture approval record is co
   Timers and solver statistics require structured semantic equivalence rather than byte-for-byte presentation parity.
 * [x] The parent validates ordered root association and native-spec integrity.
   Semantic satisfaction, including virtual-provider selection, remains worker-owned so validation does not import recipes before confinement.
+* [x] Trusted preflight may import configured compiler recipes and execute their selected compilers to populate compiler properties.
+  These recipes require special review and are not a general recipe-import exception.
+* [x] The parent refreshes enabled build-cache reuse sources and sends a frozen concrete-spec snapshot; the worker applies normal reuse filtering without network access.
+* [x] The worker may update persistent parent-selected misc-cache and concretization-cache roots.
+  Cache data remains untrusted structured input and must not select executable code.
 
 Future Uses
 -----------
@@ -515,3 +529,6 @@ It can also support command hardening wherever a normal Spack operation calls th
 
 Potential later work includes a persistent solver service, remote solving, or a validated recipe-fact artifact.
 Each would need a separate threat model and protocol; none is required to protect recipe evaluation in the first implementation.
+
+* [ ] Audit every persistent misc-cache reader for malformed and poisoned structured input.
+  If any reader executes cache-selected code, move that cache family to invocation scratch before enabling the worker by default.
