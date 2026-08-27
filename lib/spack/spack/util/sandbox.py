@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional, Set
 
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 120
+DEFAULT_STREAM_RESPONSE_BYTES = 1024 * 1024 * 1024
 _MESSAGE_PREFIX_BYTES = 8
 _MAX_FAILURE_DIAGNOSTIC_BYTES = 1024 * 1024
 _STREAM_FRAME_BYTES = 64 * 1024
@@ -373,12 +374,13 @@ def run_json_worker_streaming(
     worker: Callable[[Any], Any],
     setup: Optional[Callable[[], None]] = None,
     timeout: Optional[float] = None,
-    max_response_bytes: Optional[int] = None,
+    max_response_bytes: Optional[int] = DEFAULT_STREAM_RESPONSE_BYTES,
 ) -> Any:
     """Run a POSIX child using scalable JSON split across bounded transport frames.
 
-    ``timeout`` and ``max_response_bytes`` are optional resource policies. Omitting them avoids
-    imposing generic solve-duration or response-size ceilings on callers such as concretization.
+    ``timeout`` is an optional resource policy. ``max_response_bytes`` has a large finite default
+    so an untrusted worker cannot exhaust parent storage; callers may raise it or explicitly pass
+    ``None`` when another host-enforced quota provides the total resource bound.
     """
     if not hasattr(os, "fork"):
         raise JsonWorkerError("sandbox worker launcher is unsupported on this platform")
