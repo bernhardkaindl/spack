@@ -32,6 +32,8 @@ from spack.vendor.typing_extensions import Protocol
 import spack.binary_distribution
 import spack.build_environment
 import spack.builder
+import spack.caches
+import spack.compilers.config
 import spack.config
 import spack.error
 import spack.hooks
@@ -185,6 +187,7 @@ def _selected_compilers(spec: spack.spec.Spec) -> List[Tuple[str, str, spack.spe
     """Return selected language, driver path, and compiler spec tuples without duplicates."""
     result = []
     seen = set()
+    compiler_names = set(spack.compilers.config.supported_compilers())
     for node in spec.traverse():
         for edge in node.edges_to_dependencies():
             selected_languages = set(edge.virtuals) & set(COMPILER_LANGUAGES)
@@ -194,6 +197,14 @@ def _selected_compilers(spec: spack.spec.Spec) -> List[Tuple[str, str, spack.spe
                 if path and (language, path) not in seen:
                     seen.add((language, path))
                     result.append((language, path, edge.spec))
+        if node.name not in compiler_names:
+            continue
+        configured = (node.extra_attributes or {}).get("compilers", {})
+        for language in COMPILER_LANGUAGES:
+            path = configured.get(language)
+            if path and (language, path) not in seen:
+                seen.add((language, path))
+                result.append((language, path, node))
     return result
 
 
@@ -765,6 +776,11 @@ class PrefixPivoter:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _prefix_pivoter_for_spec(spec: spack.spec.Spec, keep_prefix: bool) -> Optional[PrefixPivoter]:
+    """Return prefix protection for locally installed specs only."""
+    return None if spec.external else PrefixPivoter(spec.prefix, keep_prefix)
+
+
 class BuildRequest(NamedTuple):
     """Plain data describing a single build to be launched: the input of a build launcher."""
 
@@ -1023,6 +1039,13 @@ def compiler_support_paths(compiler_path: str) -> List[str]:
     return result
 
 
+def executable_support_paths(executable: str) -> List[str]:
+    """Return existing data files required by an individually selected executable."""
+    if os.path.basename(executable) != "file":
+        return []
+    return [path for path in FILE_RUNTIME_READ_PATHS if os.path.exists(path)]
+
+
 def allow_git_support_paths(sandbox: spack.sandbox.Sandbox) -> None:
     """Allow the helper directory selected by the host Git executable."""
     git = shutil.which("git")
@@ -1050,6 +1073,8 @@ def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) 
         sandbox.allow_read(compiler_path)
         for program_path in compiler_support_paths(compiler_path):
             sandbox.allow_read(program_path)
+            for support_path in executable_support_paths(program_path):
+                sandbox.allow_read(support_path)
     for path in system_compiler_header_paths(spec):
         sandbox.allow_read(path)
 
@@ -1089,6 +1114,7 @@ def _enable_sandbox(
 
     for repository in spack.repo.PATH.repos:
         sandbox.allow_read(repository.root)
+    sandbox.allow_read(spack.caches.fetch_cache_location())
 
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
@@ -1370,11 +1396,12 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
 
     # As a performance optimization, we do not serialize the environment which
     # is slow to serialize and not needed in the build job
-    prefix_pivoter = PrefixPivoter(spec.prefix, request.keep_prefix)
+    prefix_pivoter = _prefix_pivoter_for_spec(spec, request.keep_prefix)
     prefix_pivoted = False
     try:
-        prefix_pivoter.__enter__()
-        prefix_pivoted = True
+        if prefix_pivoter is not None:
+            prefix_pivoter.__enter__()
+            prefix_pivoted = True
         proc = Process(
             target=worker_function,
             args=(
@@ -1389,7 +1416,7 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
         )
         proc.start()
     except BaseException:
-        if prefix_pivoted:
+        if prefix_pivoted and prefix_pivoter is not None:
             prefix_pivoter.__exit__(*sys.exc_info())
         if network_proxy is not None:
             network_proxy.stop()
