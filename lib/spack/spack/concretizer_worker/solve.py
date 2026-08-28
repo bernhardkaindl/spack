@@ -165,6 +165,14 @@ def _preflight_compiler_properties(
     return sorted(all_libcs(context))
 
 
+def _ensure_clingo_importable() -> None:
+    """Bootstrap Clingo in its dedicated configuration before worker launch."""
+    from spack.bootstrap import ensure_bootstrap_configuration, ensure_clingo_importable_or_raise
+
+    with ensure_bootstrap_configuration():
+        ensure_clingo_importable_or_raise()
+
+
 def solve_request(
     request: Dict[str, Any], specs_factory: Optional["SpecFiltersFactory"] = None
 ) -> Dict[str, Any]:
@@ -257,10 +265,9 @@ def solve_in_worker(
     The worker inherits ``concretizer:timeout`` settings. The transport adds no competing
     deadline, so solver timeout and partial-answer behavior remain authoritative.
     """
-    from spack.bootstrap import ensure_clingo_importable_or_raise
     from spack.solver.reuse import buildcache_reuse_enabled, local_store_snapshot
 
-    ensure_clingo_importable_or_raise()
+    _ensure_clingo_importable()
     spack.compilers.config.all_compilers()
     context = spack.context.default()
     configured_compilers = spack.compilers.config.all_compilers_from(
@@ -269,7 +276,6 @@ def solve_in_worker(
     local_store_specs, local_external_origin_hashes, local_deprecated_for = local_store_snapshot(
         context.store
     )
-    _preflight_compiler_properties(context, configured_compilers, local_store_specs)
     host_libcs = _preflight_compiler_properties(context, configured_compilers, local_store_specs)
     buildcache_specs = (
         spack.binary_distribution.update_cache_and_get_specs(
@@ -313,12 +319,13 @@ def solve_separately_in_workers(
     factory: Optional["SpecFiltersFactory"] = None,
 ) -> Iterator[Tuple[int, ConcretizerWorkerResponse]]:
     """Concretize roots in separate confined workers with bounded parent scheduling."""
-    from spack.bootstrap import ensure_clingo_importable_or_raise
     from spack.solver.reuse import buildcache_reuse_enabled, local_store_snapshot
 
-    ensure_clingo_importable_or_raise()
+    _ensure_clingo_importable()
     context = spack.context.default()
-    configured_compilers = spack.compilers.config.all_compilers()
+    configured_compilers = spack.compilers.config.all_compilers_from(
+        context.config, repo=context.repo
+    )
     local_store_specs, local_external_origin_hashes, local_deprecated_for = local_store_snapshot(
         context.store
     )
