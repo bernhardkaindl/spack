@@ -528,6 +528,7 @@ def test_enable_sandbox_paths(
     assert pathlib.Path(spec.prefix).resolve() in allow_write_resolved
     assert custom_write.resolve() in allow_write_resolved
     assert pathlib.Path(tempfile.gettempdir()).resolve() in allow_write_resolved
+    assert os.environ["XDG_CACHE_HOME"] == str(stage_path / ".cache")
 
     assert mock_sandbox.apply_calls == [(expected_block_network, False, False, False)]
     assert build_rlimits == [True]

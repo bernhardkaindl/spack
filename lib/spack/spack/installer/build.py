@@ -88,14 +88,15 @@ HOST_RUNTIME_READ_PATHS = (
     "/lib64",
     "/usr/lib",
     "/usr/lib64",
-    "/usr/lib/locale",
+    "/usr/lib/locale",  # perl
     "/etc/ld.so.cache",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",
     "/proc/cpuinfo",
     "/etc/debian_version",
-    "/etc/hosts",
-    "/etc/passwd",
+    "/etc/fonts",  # font-util
+    "/etc/hosts",  # perl
+    "/etc/passwd",  # ncurses
     "/etc/mime.types",
     "/etc/ssl/certs",
     "/dev/urandom",
@@ -108,58 +109,69 @@ COMPILER_LANGUAGES = ("c", "cxx", "fortran")
 COMPILER_PROGRAMS = ("cc1", "cc1plus", "f951", "collect2", "lto1", "lto-wrapper", "cpp")
 # Keep these grouped by tool family so they can move to package-scoped policy later.
 # Observed package/phase provenance is documented in ``sandbox/install-worker.rst``.
-BINUTILS_PROGRAMS = ("as", "ld", "ar", "nm", "ranlib", "strip")
-COREUTILS_INSTALL_PROGRAMS = ("chmod", "cp", "install", "ln", "mkdir", "mv", "rm", "rmdir")
+BINUTILS_PROGRAMS = ("as", "ld", "ar", "nm", "ranlib", "strip")  # nm: pkgconf, berkeley-db
+COREUTILS_INSTALL_PROGRAMS = (
+    "chmod",
+    "cp",
+    "install",
+    "ln",
+    "mkdir",
+    "mv",
+    "rm",
+    "rmdir",  # pkgconf, berkeley-db
+)
 COREUTILS_FILE_PROGRAMS = (
     "cat",
-    "cmp",
-    "comm",
+    "cmp",  # diffutils
+    "comm",  # perl
     "cut",
-    "date",
-    "echo",
-    "head",
+    "date",  # diffutils
+    "echo",  # diffutils
+    "head",  # ncurses
     "ls",
-    # ncurses
-    "paste",
-    "realpath",
-    # ncurses
-    "sleep",
-    "split",
-    "tail",
+    "paste",  # ncurses
+    "realpath",  # perl
+    "sleep",  # ncurses
+    "split",  # perl
+    "tail",  # perl
     "touch",
-    "true",
+    "true",  # pkgconf, berkeley-db
     "wc",
 )
 COREUTILS_UTIL_PROGRAMS = (
     "basename",
-    "arch",
+    "arch",  # perl
     "dirname",
     "env",
     "expr",
-    # font-util
-    "id",
+    "id",  # font-util
     "pwd",
-    "sort",
+    "sort",  # pkgconf, berkeley-db
     "tr",
     "uname",
-    "uniq",
+    "uniq",  # pkgconf, berkeley-db, diffutils
 )
 BUILD_UTILITIES_PROGRAMS = (
-    "diff",
-    "egrep",
-    "file",
+    "diff",  # pkgconf, berkeley-db
+    "egrep",  # perl
+    "fc-cache",  # font-util
+    "file",  # pkgconf, berkeley-db
     "find",
     "git",
-    # font-util
-    "gzip",
+    "gzip",  # font-util
     "grep",
     "ldd",
-    # ncurses
-    "tbl",
+    "tbl",  # ncurses
     "which",
-    "xargs",
+    "xargs",  # diffutils
 )
-SCRIPT_INTERPRETER_PROGRAMS = ("awk", "bash", "mawk", "perl", "sed")
+SCRIPT_INTERPRETER_PROGRAMS = (
+    "awk",
+    "bash",
+    "mawk",  # ncurses
+    "perl",
+    "sed",
+)
 BUILD_PROGRAMS = (
     COMPILER_PROGRAMS
     + BINUTILS_PROGRAMS
@@ -864,6 +876,7 @@ def _enable_sandbox(
 
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
+    os.environ["XDG_CACHE_HOME"] = os.path.join(stage_path, ".cache")  # font-util
 
     # POSIX prescribes /tmp and /dev/null are present. In the future we can consider setting
     # TMPPATH to a sibling of the stage path to isolate concurrent builds better.
