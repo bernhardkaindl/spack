@@ -10,12 +10,14 @@ from typing import Any
 import pytest
 
 import spack.install_worker
+import spack.spec
 from spack.installer.base import ExitCode
 from spack.installer.build import (
     OVERWRITE_GARBAGE_SUFFIX,
     BinaryCacheMiss,
     ChildInfo,
     PrefixPivoter,
+    _prefix_pivoter_for_spec,
     _stage_source,
 )
 
@@ -103,6 +105,12 @@ class TestPrefixPivoter:
         assert not (existing_prefix / "old_file").exists()
         # Only the existing_prefix directory should remain
         assert len(list(tmp_path.iterdir())) == 1
+
+    def test_external_spec_does_not_pivot_prefix(self):
+        spec = spack.spec.Spec("external@=1.0", external_path="/")
+        spec._mark_concrete()
+
+        assert _prefix_pivoter_for_spec(spec, keep_prefix=False) is None
 
     def test_existing_prefix_failure_restores_original_prefix(
         self, tmp_path: pathlib.Path, existing_prefix: pathlib.Path
