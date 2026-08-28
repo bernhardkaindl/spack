@@ -324,6 +324,7 @@ COREUTILS_UTIL_PROGRAMS = (
     "dirname",
     "env",
     "expr",
+    # font-util
     "id",
     "pwd",
     "sort",
@@ -337,6 +338,7 @@ BUILD_UTILITIES_PROGRAMS = (
     "file",
     "find",
     "git",
+    # font-util
     "gzip",
     "grep",
     "ldd",
@@ -356,6 +358,7 @@ BUILD_PROGRAMS = (
 )
 #: Support files that compiler drivers may pass to subordinate tools.
 COMPILER_FILES = ("liblto_plugin.so",)
+#: Support files required by pkgconf and berkeley-db
 FILE_RUNTIME_READ_PATHS = ("/etc/magic", "/usr/share/file/magic.mgc")
 
 
