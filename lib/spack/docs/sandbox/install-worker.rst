@@ -363,8 +363,9 @@ trace every grant to an observed package phase.
      - configure and generated-source build
      - ``mawk``, ``sleep``, ``tbl``, ``paste``, ``head``, and ``/etc/passwd``
    * - ``font-util``
-     - configure and build
-     - ``id`` and ``gzip``
+     - configure, build, and install hooks
+     - ``id``, ``gzip``, ``fc-cache``, read-only ``/etc/fonts``, and ``XDG_CACHE_HOME`` redirected
+       into the writable stage
    * - ``perl``
      - configure
      - ``split``, ``realpath``, ``egrep``, ``tail``, ``arch``, ``comm``, ``/etc/hosts``,
