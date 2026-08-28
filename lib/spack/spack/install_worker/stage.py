@@ -17,12 +17,14 @@ import spack.repo
 import spack.sandbox
 import spack.spec
 import spack.stage
+import spack.store
 import spack.util.filesystem as fs
 import spack.util.sandbox
 import spack.util.url
 from spack.install_worker.request import create_request, validate_request
 from spack.util.executable import which_string
 from spack.util.ld_so_conf import host_dynamic_linker_search_paths
+from spack.util.lock import FILE_TRACKER
 from spack.util.proxy import DestinationPolicy
 
 _STAGE_REQUEST_KEYS = {"acquire_lock", "patch", "path", "request"}
@@ -129,7 +131,20 @@ def _local_stage_read_roots(package: spack.package_base.PackageBase) -> List[str
     return roots
 
 
+def _store_database_read_roots() -> List[str]:
+    """Return local and upstream database directories needed for prefix queries."""
+    databases = [spack.store.STORE.db] + list(spack.store.STORE.db.upstream_dbs)
+    return [str(database.database_directory) for database in databases]
+
+
+def _dependency_read_roots(spec: spack.spec.Spec) -> List[str]:
+    """Return installed non-external dependency prefixes selected by the concrete DAG."""
+    return [str(node.prefix) for node in spec.traverse(root=False) if not node.external]
+
+
 def _stage_setup(read_roots: List[str], write_roots: List[str]) -> None:
+    FILE_TRACKER.discard_after_fork()
+    spack.store.reinitialize()
     try:
         from spack.oci import opener
         from spack.util import web
@@ -189,6 +204,8 @@ def stage_package(
         _recipe_read_roots()
         + _expansion_read_roots(package.spec)
         + _local_stage_read_roots(package)
+        + _store_database_read_roots()
+        + _dependency_read_roots(package.spec)
     )
     write_roots = [stage_root, fetch_cache]
     if acquire_lock and stage_root != global_stage_root:
