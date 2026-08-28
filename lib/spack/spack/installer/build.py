@@ -99,8 +99,11 @@ HOST_RUNTIME_READ_PATHS = (
     "/etc/passwd",  # ncurses
     "/etc/mime.types",
     "/etc/ssl/certs",
-    "/dev/urandom",
+    "/dev/urandom", # vc
 )
+#: Support files required by pkgconf and berkeley-db
+FILE_RUNTIME_READ_PATHS = ("/etc/magic", "/usr/share/file/magic.mgc")
+
 #: Host paths required by selected system compilers.
 HOST_COMPILER_READ_PATHS = ("/usr/include",)
 #: Language virtuals whose concrete edges identify selected compiler drivers.
@@ -125,10 +128,11 @@ COREUTILS_FILE_PROGRAMS = (
     "cmp",  # diffutils
     "comm",  # perl
     "cut",
-    "date",  # diffutils
-    "echo",  # diffutils
+    "date",  # diffutils, libevent
+    "echo",  # diffutils, pkgconf
     "head",  # ncurses
     "ls",
+    "od",  # ninja
     "paste",  # ncurses
     "realpath",  # perl
     "sleep",  # ncurses
@@ -158,8 +162,9 @@ BUILD_UTILITIES_PROGRAMS = (
     "file",  # pkgconf, berkeley-db
     "find",
     "git",
-    "gzip",  # font-util
+    "gzip",  # font-util, git
     "grep",
+    "hexdump",
     "ldd",
     "tbl",  # ncurses
     "which",
@@ -183,8 +188,6 @@ BUILD_PROGRAMS = (
 )
 #: Support files that compiler drivers may pass to subordinate tools.
 COMPILER_FILES = ("liblto_plugin.so",)
-#: Support files required by pkgconf and berkeley-db
-FILE_RUNTIME_READ_PATHS = ("/etc/magic", "/usr/share/file/magic.mgc")
 
 
 class ProcessLike(Protocol):
