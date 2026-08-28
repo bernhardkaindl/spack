@@ -375,8 +375,8 @@ trace every grant to an observed package phase.
        and ``sh``
    * - ``libxml2``
      - expand a cached ``.tar.xz`` source archive
-     - ``tar``, ``xz``, and read access to the configured source-cache target behind the staged
-       archive symlink
+     - ``tar``, ``xz``, each selected tool's own prefix and link/run dependency closure, and read
+       access to the configured source-cache target behind the staged archive symlink
    * - non-archive source resources
      - install after staging
      - read-only access to the configured source cache for retained symlink targets, observed
