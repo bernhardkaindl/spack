@@ -24,9 +24,11 @@ import spack.util.sandbox
 from spack.fetch_strategy import FsCache, URLFetchStrategy
 from spack.install_worker.stage import (
     StageWorkerError,
+    _dependency_read_roots,
     _expansion_read_roots,
     _local_stage_read_roots,
     _stage_setup,
+    _store_database_read_roots,
     _tool_runtime_roots,
     _validate_stage_response,
     stage_package,
@@ -201,9 +203,11 @@ def test_stage_package_grants_lock_write_only_when_acquired(
     mock_archive, monkeypatch, tmp_path, acquire_lock
 ):
     package = _package_for_url(mock_archive.url, monkeypatch, tmp_path)
+    captured_read_roots = []
     captured_write_roots = []
 
     def capture_setup(read_roots, write_roots):
+        captured_read_roots.extend(read_roots)
         captured_write_roots.extend(write_roots)
 
     def run_worker(request, worker, proxy_policy, setup):
@@ -216,6 +220,8 @@ def test_stage_package_grants_lock_write_only_when_acquired(
     stage_package(package, acquire_lock=acquire_lock)
 
     stage_lock = os.path.join(spack.stage.get_stage_root(), ".lock")
+    assert set(_store_database_read_roots()).issubset(captured_read_roots)
+    assert set(_dependency_read_roots(package.spec)).issubset(captured_read_roots)
     assert (stage_lock in captured_write_roots) is acquire_lock
 
 
@@ -358,6 +364,27 @@ def test_stage_setup_failure_names_operation(monkeypatch):
         spack.util.sandbox.run_json_worker(
             {}, lambda request: {}, setup=lambda: _stage_setup([], [])
         )
+
+
+def test_stage_setup_reinitializes_store_before_confinement(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        spack.install_worker.stage.FILE_TRACKER,
+        "discard_after_fork",
+        lambda: events.append("locks"),
+    )
+    monkeypatch.setattr(
+        spack.install_worker.stage.spack.store, "reinitialize", lambda: events.append("store")
+    )
+    monkeypatch.setattr(
+        spack.sandbox,
+        "restrict_stage_worker",
+        lambda read_roots, write_roots: events.append("confine"),
+    )
+
+    _stage_setup([], [])
+
+    assert events == ["locks", "store", "confine"]
 
 
 def test_stage_response_must_match_parent_selected_path():
