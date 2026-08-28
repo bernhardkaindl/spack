@@ -203,6 +203,12 @@ individual resolved paths.  Its fixed host reads are ``/lib``, ``/lib64``, ``/us
 ``/bin/sh``, and ``/usr/include`` when a selected compiler resolves below ``/usr``.
 Every added tool or path requires a focused test demonstrating why it is needed.
 
+* [ ] Review why the generic compiler-wrapper ``cpp`` alias dispatches to the host-default
+  preprocessor instead of the compiler selected by ``SPACK_CC``.
+  If no compatibility constraint requires this behavior, bind ``cpp`` to the selected compiler and
+  remove the host-``cpp`` subordinate workaround in ``executable_support_paths()`` and its focused
+  ``test_cpp_executable_support_paths()`` regression.
+
 An optional alpha learning mode may propose package-specific executable grants.
 It is disabled by default and must name an already loaded configuration file as its policy target.
 The trusted installer parent, never package code, updates that file through Spack's structured configuration API.
@@ -357,6 +363,9 @@ trace every grant to an observed package phase.
      - ``cc1``, ``cc1plus``, ``f951``, ``collect2``, ``lto1``, ``lto-wrapper``,
        ``cpp``, ``as``, ``ld``, ``ar``, ``nm``, ``ranlib``, ``strip``,
        ``liblto_plugin.so``, and ``/usr/include``
+   * - ``libx11``
+     - configure preprocessor checks
+     - the exact ``cc1`` subordinate reported by the individually selected generic ``cpp`` wrapper
    * - ``gcc-runtime``
      - install
      - the exact C, C++, and Fortran drivers declared by its external compiler dependency,
