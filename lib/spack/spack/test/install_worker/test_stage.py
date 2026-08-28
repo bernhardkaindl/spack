@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import socket
 import subprocess
+import tarfile
 from types import SimpleNamespace
 
 import pytest
@@ -155,6 +156,21 @@ def test_stage_package_fetches_and_expands_through_proxy(archive_server, monkeyp
 
 def test_stage_package_reads_parent_selected_local_source(mock_archive, monkeypatch, tmp_path):
     package = _package_for_url(mock_archive.url, monkeypatch, tmp_path)
+
+    stage_path = stage_package(package)
+
+    assert stage_path == package.path
+    assert (tmp_path / "selected-stage" / "spack-src" / "configure").is_file()
+
+
+def test_stage_package_expands_cached_tar_xz(monkeypatch, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "configure").write_text("#!/bin/sh\n")
+    archive = tmp_path / "libxml2.tar.xz"
+    with tarfile.open(str(archive), "w:xz") as stream:
+        stream.add(str(source), arcname="libxml2")
+    package = _package_for_url(archive.as_uri(), monkeypatch, tmp_path)
 
     stage_path = stage_package(package)
 
