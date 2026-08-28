@@ -11,6 +11,23 @@ disable-model-invocation: false
 Use this workflow to make or review repository changes with checks scaled to the affected behavior.
 Prefer repository evidence and executable validation over assumptions about current conventions.
 
+## Save Validated Work First
+
+When the user has authorized commits for the current task or session, saving validated work is the
+first priority.  Do not continue into another defect, acceptance target, phase, or implementation
+topic while a completed change remains uncommitted.
+
+1. Split work by independently reviewable topic, with prerequisite fixes committed first.
+2. Run the focused executable checks for the current topic and ``git diff --check``.
+3. Stage explicit whole-file paths non-interactively and commit the validated topic.
+4. Immediately inspect ``git status --short`` and the commit file list, including untracked files.
+5. Only then continue to the next topic or broaden acceptance testing.
+
+Do not use interactive staging unless the user explicitly requests hunk-level commit construction.
+If one file contains inseparable changes from multiple topics, keep them in one accurately named
+commit rather than risking partial staging mistakes.  Never include unrelated user changes merely
+to make the worktree clean.
+
 ## Start From The Change Boundary
 
 1. Inspect `git status --short` before reading or editing.
