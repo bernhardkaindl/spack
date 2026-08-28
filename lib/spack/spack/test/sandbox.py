@@ -631,6 +631,35 @@ def test_file_executable_support_paths(monkeypatch):
     assert spack.installer.build.executable_support_paths("/usr/bin/grep") == []
 
 
+# The generic compiler-wrapper ``cpp`` alias currently dispatches to the host-default preprocessor,
+# which can differ from SPACK_CC. Preserve that behavior narrowly until the wrapper cleanup tracked
+# in sandbox/install-worker.rst binds ``cpp`` to the selected compiler.
+@pytest.mark.parametrize(
+    "returncode,stdout,expected",
+    [
+        (
+            0,
+            "/usr/libexec/gcc/x86_64-linux-gnu/13/cc1\n",
+            ["/usr/libexec/gcc/x86_64-linux-gnu/13/cc1"],
+        ),
+        (0, "cc1\n", []),
+        (1, "/absolute/cc1\n", []),
+    ],
+)
+def test_cpp_executable_support_paths(monkeypatch, returncode, stdout, expected):
+    completed = SimpleNamespace(returncode=returncode, stdout=stdout)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return completed
+
+    monkeypatch.setattr(spack.installer.build.subprocess, "run", run)
+
+    assert spack.installer.build.executable_support_paths("/usr/bin/cpp") == expected
+    assert calls == [["/usr/bin/cpp", "-print-prog-name=cc1"]]
+
+
 def test_allow_git_support_paths_uses_configured_exec_path(monkeypatch):
     sandbox = MockSandbox()
     monkeypatch.setattr(spack.installer.build.shutil, "which", lambda program: "/usr/bin/git")

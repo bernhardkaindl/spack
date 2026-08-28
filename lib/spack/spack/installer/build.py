@@ -99,7 +99,7 @@ HOST_RUNTIME_READ_PATHS = (
     "/etc/passwd",  # ncurses
     "/etc/mime.types",
     "/etc/ssl/certs",
-    "/dev/urandom", # vc
+    "/dev/urandom",  # vc
 )
 #: Support files required by pkgconf and berkeley-db
 FILE_RUNTIME_READ_PATHS = ("/etc/magic", "/usr/share/file/magic.mgc")
@@ -112,7 +112,15 @@ COMPILER_LANGUAGES = ("c", "cxx", "fortran")
 COMPILER_PROGRAMS = ("cc1", "cc1plus", "f951", "collect2", "lto1", "lto-wrapper", "cpp")
 # Keep these grouped by tool family so they can move to package-scoped policy later.
 # Observed package/phase provenance is documented in ``sandbox/install-worker.rst``.
-BINUTILS_PROGRAMS = ("as", "ld", "ar", "nm", "ranlib", "strip")  # nm: pkgconf, berkeley-db
+BINUTILS_PROGRAMS = (
+    "as",
+    "ld",
+    "ar",
+    "nm",
+    "objcopy",  # glib
+    "ranlib",
+    "strip",
+)
 COREUTILS_INSTALL_PROGRAMS = (
     "chmod",
     "cp",
@@ -779,9 +787,26 @@ def compiler_support_paths(compiler_path: str) -> List[str]:
 
 def executable_support_paths(executable: str) -> List[str]:
     """Return existing data files required by an individually selected executable."""
-    if os.path.basename(executable) != "file":
+    name = os.path.basename(executable)
+    if name == "file":
+        return [path for path in FILE_RUNTIME_READ_PATHS if os.path.exists(path)]
+    if name != "cpp":
         return []
-    return [path for path in FILE_RUNTIME_READ_PATHS if os.path.exists(path)]
+    # The generic compiler-wrapper ``cpp`` alias currently preserves host-default ``cpp``
+    # dispatch instead of selecting SPACK_CC. Follow that behavior narrowly until the wrapper can
+    # bind ``cpp`` to the selected compiler without breaking compatibility.
+    try:
+        completed = subprocess.run(
+            [executable, "-print-prog-name=cc1"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+    except OSError:
+        return []
+    cc1 = completed.stdout.strip()
+    return [cc1] if completed.returncode == 0 and os.path.isabs(cc1) else []
 
 
 def allow_git_support_paths(sandbox: spack.sandbox.Sandbox) -> None:
