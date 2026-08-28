@@ -328,7 +328,7 @@ def test_expansion_roots_include_gzip_helper_chain(monkeypatch):
     assert "/tools/sh" in read_roots
 
 
-def test_tool_runtime_roots_include_only_selected_tool_dependency_closure(tmp_path):
+def test_tool_runtime_roots_include_selected_tool_and_dependency_closure(tmp_path):
     tar_prefix = tmp_path / "tar"
     tar = tar_prefix / "bin" / "tar"
     tar.parent.mkdir(parents=True)
@@ -340,7 +340,7 @@ def test_tool_runtime_roots_include_only_selected_tool_dependency_closure(tmp_pa
 
     roots = _tool_runtime_roots(spec, [str(tar)])
 
-    assert roots == [str(libiconv.prefix)]
+    assert roots == [str(owner.prefix), str(libiconv.prefix)]
 
 
 def test_stage_setup_failure_names_operation(monkeypatch):
