@@ -1041,9 +1041,26 @@ def compiler_support_paths(compiler_path: str) -> List[str]:
 
 def executable_support_paths(executable: str) -> List[str]:
     """Return existing data files required by an individually selected executable."""
-    if os.path.basename(executable) != "file":
+    name = os.path.basename(executable)
+    if name == "file":
+        return [path for path in FILE_RUNTIME_READ_PATHS if os.path.exists(path)]
+    if name != "cpp":
         return []
-    return [path for path in FILE_RUNTIME_READ_PATHS if os.path.exists(path)]
+    # The generic compiler-wrapper ``cpp`` alias currently preserves host-default ``cpp``
+    # dispatch instead of selecting SPACK_CC. Follow that behavior narrowly until the wrapper can
+    # bind ``cpp`` to the selected compiler without breaking compatibility.
+    try:
+        completed = subprocess.run(
+            [executable, "-print-prog-name=cc1"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+    except OSError:
+        return []
+    cc1 = completed.stdout.strip()
+    return [cc1] if completed.returncode == 0 and os.path.isabs(cc1) else []
 
 
 def allow_git_support_paths(sandbox: spack.sandbox.Sandbox) -> None:
@@ -1077,6 +1094,80 @@ def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) 
                 sandbox.allow_read(support_path)
     for path in system_compiler_header_paths(spec):
         sandbox.allow_read(path)
+
+
+def build_environment_bin_paths(
+    env_mods: spack.util.environment.EnvironmentModifications,
+) -> List[str]:
+    """Return dependency bin directories contributed by the build environment setup."""
+    return [
+        str(modification.value)
+        for modification in env_mods.group_by_name().get("PATH", [])
+        if isinstance(modification, spack.util.environment.PrependPath)
+        and os.path.basename(os.path.normpath(str(modification.value))) in ("bin", "bin64")
+    ]
+
+
+def allow_sandbox_commands(
+    sandbox: spack.sandbox.Sandbox,
+    stage_path: str,
+    spec: Optional[spack.spec.Spec] = None,
+    build_environment_paths: Optional[List[str]] = None,
+) -> None:
+    """Allow fixed compatibility commands through a staging-local ``PATH``."""
+    sandbox_bin = os.path.join(stage_path, "spack-sandbox-bin")
+    os.makedirs(sandbox_bin, exist_ok=True)
+
+    def stage_command(source: str, name: str) -> None:
+        sandbox.allow_read(source)
+        link = os.path.join(sandbox_bin, name)
+        if os.path.lexists(link):
+            if os.path.realpath(link) == os.path.realpath(source):
+                return
+            os.unlink(link)
+        os.symlink(source, link)
+
+    for name in SANDBOX_COMMANDS:
+        source = os.path.join(SANDBOX_COMMAND_DIR, name)
+        if not os.path.isfile(source):
+            raise spack.error.InstallError(f"Missing sandbox command: {source}")
+        stage_command(source, name)
+    for name in BUILD_PROGRAMS:
+        if name in COMPILER_PROGRAMS or name in BINUTILS_PROGRAMS:
+            continue
+        source = shutil.which(name)
+        if source:
+            stage_command(source, name)
+    for bin_dir in build_environment_paths or []:
+        if not os.path.isdir(bin_dir):
+            continue
+        for name in os.listdir(bin_dir):
+            source = os.path.join(bin_dir, name)
+            if os.path.isfile(source) and os.access(source, os.X_OK):
+                stage_command(source, name)
+    if spec is not None:
+        for language, compiler_path, _compiler_spec in _selected_compilers(spec):
+            stage_command(compiler_path, os.path.basename(compiler_path))
+            for alias in COMPILER_DRIVER_ALIASES.get(language, ()):
+                stage_command(compiler_path, alias)
+            for source in compiler_support_paths(compiler_path):
+                name = os.path.basename(source)
+                aliases = [
+                    alias
+                    for alias in BINUTILS_PROGRAMS
+                    if name == alias or name.endswith("-" + alias)
+                ]
+                resolved_source = os.path.realpath(source)
+                is_spack_wrapper = (
+                    os.path.basename(os.path.dirname(resolved_source)) == "spack"
+                    and os.path.basename(os.path.dirname(os.path.dirname(resolved_source)))
+                    == "libexec"
+                )
+                if not aliases or not os.path.isfile(source) or is_spack_wrapper:
+                    continue
+                for alias in aliases:
+                    stage_command(source, alias)
+    os.environ["PATH"] = sandbox_bin
 
 
 class SandboxListeners(NamedTuple):

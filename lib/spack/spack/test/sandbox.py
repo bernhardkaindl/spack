@@ -931,6 +931,79 @@ def test_compiler_support_paths_queries_all_build_tools(monkeypatch):
         for program in spack.installer.build.BUILD_PROGRAMS
         for prefix in ("/wrapper/", "/host/")
     }
+    assert "tar" in spack.installer.build.BUILD_PROGRAMS
+    assert "make" in spack.installer.build.BUILD_PROGRAMS
+
+
+def test_allow_sandbox_commands_stages_real_compiler_binutils(tmp_path, monkeypatch):
+    allowed = []
+    compiler = tmp_path / "g++"
+    assembler = tmp_path / "host" / "bin" / "x86_64-linux-gnu-as"
+    wrapper = tmp_path / "libexec" / "spack" / "as"
+    compiler.touch()
+    assembler.parent.mkdir(parents=True)
+    wrapper.parent.mkdir(parents=True)
+    assembler.touch()
+    wrapper.touch()
+
+    class Sandbox:
+        def allow_read(self, path):
+            allowed.append(path)
+
+    monkeypatch.setattr(
+        spack.installer.build, "_selected_compilers", lambda spec: [("cxx", str(compiler), spec)]
+    )
+    monkeypatch.setattr(
+        spack.installer.build,
+        "compiler_support_paths",
+        lambda path: [str(wrapper), str(assembler)],
+    )
+    monkeypatch.setattr(
+        spack.installer.build.shutil,
+        "which",
+        lambda program: str(wrapper) if program == "as" else None,
+    )
+
+    stage_bin = tmp_path / "stage" / "spack-sandbox-bin"
+    stage_bin.mkdir(parents=True)
+    (stage_bin / "as").symlink_to(wrapper)
+    spack.installer.build.allow_sandbox_commands(Sandbox(), str(tmp_path / "stage"), spec=object())
+
+    assert (stage_bin / "g++").is_symlink()
+    assert (stage_bin / "g++").resolve() == compiler
+    assert (stage_bin / "as").is_symlink()
+    assert (stage_bin / "as").resolve() == assembler
+    assert str(wrapper) not in allowed
+
+
+def test_allow_sandbox_commands_stages_build_environment_bin_paths(tmp_path, monkeypatch):
+    dependency_bin = tmp_path / "dependency" / "bin"
+    ambient_bin = tmp_path / "ambient" / "bin"
+    dependency_bin.mkdir(parents=True)
+    ambient_bin.mkdir(parents=True)
+    dependency_tool = dependency_bin / "dependency-tool"
+    ambient_tool = ambient_bin / "ambient-tool"
+    for executable in (dependency_tool, ambient_tool):
+        executable.touch()
+        executable.chmod(0o755)
+
+    class Sandbox:
+        def allow_read(self, path):
+            pass
+
+    monkeypatch.setattr(spack.installer.build.shutil, "which", lambda program: None)
+
+    env_mods = spack.util.environment.EnvironmentModifications()
+    env_mods.prepend_path("PATH", dependency_bin)
+    build_environment_paths = spack.installer.build.build_environment_bin_paths(env_mods)
+
+    stage_bin = tmp_path / "stage" / "spack-sandbox-bin"
+    spack.installer.build.allow_sandbox_commands(
+        Sandbox(), str(tmp_path / "stage"), build_environment_paths=build_environment_paths
+    )
+
+    assert (stage_bin / "dependency-tool").resolve() == dependency_tool
+    assert not (stage_bin / "ambient-tool").exists()
 
 
 def test_file_executable_support_paths(monkeypatch):
@@ -942,6 +1015,35 @@ def test_file_executable_support_paths(monkeypatch):
         "/usr/share/file/magic.mgc"
     ]
     assert spack.installer.build.executable_support_paths("/usr/bin/grep") == []
+
+
+# The generic compiler-wrapper ``cpp`` alias currently dispatches to the host-default preprocessor,
+# which can differ from SPACK_CC. Preserve that behavior narrowly until the wrapper cleanup tracked
+# in sandbox/install-worker.rst binds ``cpp`` to the selected compiler.
+@pytest.mark.parametrize(
+    "returncode,stdout,expected",
+    [
+        (
+            0,
+            "/usr/libexec/gcc/x86_64-linux-gnu/13/cc1\n",
+            ["/usr/libexec/gcc/x86_64-linux-gnu/13/cc1"],
+        ),
+        (0, "cc1\n", []),
+        (1, "/absolute/cc1\n", []),
+    ],
+)
+def test_cpp_executable_support_paths(monkeypatch, returncode, stdout, expected):
+    completed = SimpleNamespace(returncode=returncode, stdout=stdout)
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return completed
+
+    monkeypatch.setattr(spack.installer.build.subprocess, "run", run)
+
+    assert spack.installer.build.executable_support_paths("/usr/bin/cpp") == expected
+    assert calls == [["/usr/bin/cpp", "-print-prog-name=cc1"]]
 
 
 def test_allow_git_support_paths_uses_configured_exec_path(monkeypatch):
