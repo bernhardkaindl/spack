@@ -373,6 +373,10 @@ trace every grant to an observed package phase.
      - fetch and expand
      - ``tar``, ``unzip``, ``gzip``, ``gunzip``, ``bunzip2``, ``xz``, ``7z``, ``patch``,
        and ``sh``
+   * - ``libxml2``
+     - expand a cached ``.tar.xz`` source archive
+     - ``tar``, ``xz``, and read access to the configured source-cache target behind the staged
+       archive symlink
    * - non-archive source resources
      - install after staging
      - read-only access to the configured source cache for retained symlink targets, observed
