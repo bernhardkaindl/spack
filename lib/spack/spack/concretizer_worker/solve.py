@@ -153,6 +153,14 @@ def _preflight_compiler_properties(
     return sorted(all_libcs())
 
 
+def _ensure_clingo_importable() -> None:
+    """Bootstrap Clingo in its dedicated configuration before worker launch."""
+    from spack.bootstrap import ensure_bootstrap_configuration, ensure_clingo_importable_or_raise
+
+    with ensure_bootstrap_configuration():
+        ensure_clingo_importable_or_raise()
+
+
 def solve_request(
     request: Dict[str, Any], specs_factory: Optional["SpecFiltersFactory"] = None
 ) -> Dict[str, Any]:
@@ -245,10 +253,9 @@ def solve_in_worker(
     The worker inherits ``concretizer:timeout`` settings. The transport adds no competing
     deadline, so solver timeout and partial-answer behavior remain authoritative.
     """
-    from spack.bootstrap import ensure_clingo_importable_or_raise
     from spack.solver.reuse import buildcache_reuse_enabled, local_store_snapshot
 
-    ensure_clingo_importable_or_raise()
+    _ensure_clingo_importable()
     configured_compilers = spack.compilers.config.all_compilers()
     local_store_specs, local_external_origin_hashes, local_deprecated_for = local_store_snapshot(
         spack.config.CONFIG
@@ -294,10 +301,9 @@ def solve_separately_in_workers(
     factory: Optional["SpecFiltersFactory"] = None,
 ) -> Iterator[Tuple[int, ConcretizerWorkerResponse]]:
     """Concretize roots in separate confined workers with bounded parent scheduling."""
-    from spack.bootstrap import ensure_clingo_importable_or_raise
     from spack.solver.reuse import buildcache_reuse_enabled, local_store_snapshot
 
-    ensure_clingo_importable_or_raise()
+    _ensure_clingo_importable()
     configured_compilers = spack.compilers.config.all_compilers()
     local_store_specs, local_external_origin_hashes, local_deprecated_for = local_store_snapshot(
         spack.config.CONFIG
