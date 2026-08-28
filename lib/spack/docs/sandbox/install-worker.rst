@@ -250,6 +250,15 @@ It may be implemented before the staging worker, but it does not block this plan
 The staging worker must import the selected package recipe after confinement is active.
 It receives only the parent-selected concrete spec, repository state, and other minimal normal Spack state needed to invoke existing package methods.
 It must not depend on a new concretization or source-plan protocol.
+After inherited descriptors are closed, setup discards inherited lock bookkeeping and reinitializes
+the store before applying confinement.
+This lets patch methods query installed dependency prefixes without using stale database lock file
+descriptors.
+The parent grants read-only access to active local and upstream database directories for those
+queries; staging workers do not receive store write access.
+It also grants read-only access to installed non-external dependency prefixes selected by the
+concrete DAG, so patch methods can inspect dependency headers and libraries without exposing broad
+external prefixes.
 
 Build workers may also import dependency recipes lazily after confinement.
 This is required when a concrete spec was restored from the concretizer-worker protocol and does
@@ -378,6 +387,10 @@ trace every grant to an observed package phase.
      - expand a cached ``.tar.xz`` source archive
      - ``tar``, ``xz``, each selected tool's own prefix and link/run dependency closure, and read
        access to the configured source-cache target behind the staged archive symlink
+   * - ``py-pillow``
+     - patch dependency search paths
+     - fresh inherited lock/store state, read-only local and upstream database directories, and
+       read-only non-external dependency prefixes for headers and libraries
    * - non-archive source resources
      - install after staging
      - read-only access to the configured source cache for retained symlink targets, observed

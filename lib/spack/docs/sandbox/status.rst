@@ -97,6 +97,8 @@ Implemented ``spack stage`` and installer staging boundary
 Supported hosts stage source in a confined worker through the existing ``Stage`` and fetcher abstractions.
 The worker uses the invocation proxy for network access and may write only its selected stage, fetch cache, and any exact stage-lock file it acquires.
 It can execute only individually selected archive-expansion tools.
+Its setup recreates inherited lock and store state before confinement so recipe patch methods can
+query installed dependency prefixes safely.
 
 The existing installer reuses this worker at its source-staging boundary.
 It retains scheduling, jobserver limits, state and log channels, terminal UI, hooks, builder phases, database actions, and binary-cache behavior.
