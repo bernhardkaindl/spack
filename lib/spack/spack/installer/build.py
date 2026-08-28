@@ -1118,6 +1118,7 @@ def _enable_sandbox(
 
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
+    os.environ["XDG_CACHE_HOME"] = os.path.join(stage_path, ".cache")  # font-util
 
     # POSIX prescribes /tmp and /dev/null are present. In the future we can consider setting
     # TMPPATH to a sibling of the stage path to isolate concurrent builds better.
