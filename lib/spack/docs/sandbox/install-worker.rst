@@ -329,6 +329,52 @@ The implemented Linux baseline, validated from real package build failures, is:
      )
    compiler_files = ("liblto_plugin.so",)
 
+Build capability provenance
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The baseline remains grouped in Python for the initial implementation.
+Keep this evidence when moving capabilities into package-scoped YAML whitelists so reviewers can
+trace every grant to an observed package phase.
+
+.. list-table:: Observed build sandbox capabilities
+   :header-rows: 1
+   :widths: 24 38 38
+
+   * - Package or subsystem
+     - Observed phase
+     - Required capability
+   * - compiler drivers
+     - compile and link
+     - ``cc1``, ``cc1plus``, ``f951``, ``collect2``, ``lto1``, ``lto-wrapper``,
+       ``cpp``, ``as``, ``ld``, ``ar``, ``nm``, ``ranlib``, ``strip``,
+       ``liblto_plugin.so``, and ``/usr/include``
+   * - ``gcc-runtime``
+     - install
+     - the exact C, C++, and Fortran drivers declared by its external compiler dependency,
+       plus their individually resolved support programs and files
+   * - ``pkgconf`` and ``berkeley-db``
+     - Autoconf and libtool configure/link
+     - ``file``, ``diff``, ``rmdir``, ``true``, ``nm``, ``sort``, ``uniq``, and the
+       ``file`` magic databases
+   * - ``diffutils``
+     - configure and build
+     - ``echo``, ``cmp``, ``uniq``, ``date``, and ``xargs``
+   * - ``ncurses``
+     - configure and generated-source build
+     - ``mawk``, ``sleep``, ``tbl``, ``paste``, ``head``, and ``/etc/passwd``
+   * - ``perl``
+     - configure
+     - ``split``, ``realpath``, ``egrep``, ``tail``, ``arch``, ``comm``, ``/etc/hosts``,
+       and locale data
+   * - stage archive expansion
+     - fetch and expand
+     - ``tar``, ``unzip``, ``gzip``, ``gunzip``, ``bunzip2``, ``xz``, ``7z``, ``patch``,
+       and ``sh``
+   * - non-archive source resources
+     - install after staging
+     - read-only access to the configured source cache for retained symlink targets, observed
+       with ``ca-certificates-mozilla``
+
 Retain and relocate tests proving: dependency prefixes are readable; the stage and exact prefix are writable; the prefix parent is not writable; configured symlinks resolve correctly; and sbang, Spack runtime, package directories, loader inputs, selected drivers, selected support paths, and compiler plugins are readable.
 Also retain filesystem-only, network-only, and no-op policy tests.
 

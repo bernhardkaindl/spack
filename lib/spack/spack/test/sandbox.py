@@ -19,6 +19,8 @@ import tempfile
 from types import SimpleNamespace
 from typing import List, Tuple, cast
 
+import spack.caches
+import spack.compilers.config
 import spack.concretize
 import spack.installer.build
 import spack.repo
@@ -507,6 +509,7 @@ def test_enable_sandbox_paths(
         assert pathlib.Path(dep.prefix).resolve() in allow_read_resolved
     for repository in spack.repo.PATH.repos:
         assert pathlib.Path(repository.root).resolve() in allow_read_resolved
+    assert pathlib.Path(spack.caches.fetch_cache_location()).resolve() in allow_read_resolved
 
     # Verify symlink resolution in read_calls
     assert custom_read_target.resolve() in allow_read_resolved
@@ -616,6 +619,17 @@ def test_compiler_support_paths_queries_all_build_tools(monkeypatch):
     }
 
 
+def test_file_executable_support_paths(monkeypatch):
+    monkeypatch.setattr(
+        spack.installer.build.os.path, "exists", lambda path: path == "/usr/share/file/magic.mgc"
+    )
+
+    assert spack.installer.build.executable_support_paths("/usr/bin/file") == [
+        "/usr/share/file/magic.mgc"
+    ]
+    assert spack.installer.build.executable_support_paths("/usr/bin/grep") == []
+
+
 def test_allow_git_support_paths_uses_configured_exec_path(monkeypatch):
     sandbox = MockSandbox()
     monkeypatch.setattr(spack.installer.build.shutil, "which", lambda program: "/usr/bin/git")
@@ -643,7 +657,9 @@ def test_allow_selected_compiler_paths(tmp_path: pathlib.Path, monkeypatch):
 
     compiler_spec = SimpleNamespace(extra_attributes={"compilers": compiler_paths})
     selected_edge = SimpleNamespace(spec=compiler_spec, virtuals=("c", "cxx"))
-    node = SimpleNamespace(edges_to_dependencies=lambda: [selected_edge, selected_edge])
+    node = SimpleNamespace(
+        name="root", edges_to_dependencies=lambda: [selected_edge, selected_edge]
+    )
     spec = SimpleNamespace(traverse=lambda: [node])
     sandbox = MockSandbox()
     monkeypatch.setattr(spack.installer.build, "compiler_support_paths", lambda path: [])
@@ -655,6 +671,24 @@ def test_allow_selected_compiler_paths(tmp_path: pathlib.Path, monkeypatch):
     assert pathlib.Path(compiler_paths["cxx"]).resolve() in allowed
     assert pathlib.Path(compiler_paths["fortran"]).resolve() not in allowed
     assert len(allowed) == 2
+
+
+def test_allow_compiler_package_paths_for_runtime(tmp_path: pathlib.Path, monkeypatch):
+    compiler = tmp_path / "gcc"
+    compiler.touch()
+    compiler_spec = SimpleNamespace(
+        name="gcc",
+        extra_attributes={"compilers": {"c": str(compiler)}},
+        edges_to_dependencies=lambda: [],
+    )
+    spec = SimpleNamespace(traverse=lambda: [compiler_spec])
+    sandbox = MockSandbox()
+    monkeypatch.setattr(spack.installer.build, "compiler_support_paths", lambda path: [])
+    monkeypatch.setattr(spack.compilers.config, "supported_compilers", lambda: ["gcc"])
+
+    spack.installer.build.allow_compiler_paths(sandbox, cast(spack.spec.Spec, spec))
+
+    assert pathlib.Path(compiler).resolve() in [resolved for _, resolved in sandbox.read_calls]
 
 
 def test_sandbox_tcp_network_fallback_requires_abi_v4(monkeypatch):

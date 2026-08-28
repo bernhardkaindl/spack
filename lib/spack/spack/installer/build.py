@@ -32,6 +32,8 @@ from spack.vendor.typing_extensions import Protocol
 import spack.binary_distribution
 import spack.build_environment
 import spack.builder
+import spack.caches
+import spack.compilers.config
 import spack.config
 import spack.error
 import spack.hooks
@@ -80,16 +82,20 @@ OVERWRITE_BACKUP_SUFFIX = ".old"
 OVERWRITE_GARBAGE_SUFFIX = ".garbage"
 
 #: Host paths required by dynamically linked build tools at runtime.
+#: Package-specific provenance is documented in ``sandbox/install-worker.rst``.
 HOST_RUNTIME_READ_PATHS = (
     "/lib",
     "/lib64",
     "/usr/lib",
     "/usr/lib64",
+    "/usr/lib/locale",
     "/etc/ld.so.cache",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",
     "/proc/cpuinfo",
     "/etc/debian_version",
+    "/etc/hosts",
+    "/etc/passwd",
     "/etc/mime.types",
     "/etc/ssl/certs",
     "/dev/urandom",
@@ -100,12 +106,53 @@ HOST_COMPILER_READ_PATHS = ("/usr/include",)
 COMPILER_LANGUAGES = ("c", "cxx", "fortran")
 #: Subordinate executables that compiler drivers may invoke.
 COMPILER_PROGRAMS = ("cc1", "cc1plus", "f951", "collect2", "lto1", "lto-wrapper", "cpp")
-BINUTILS_PROGRAMS = ("as", "ld", "ar", "ranlib", "strip")
-COREUTILS_INSTALL_PROGRAMS = ("chmod", "cp", "install", "ln", "mkdir", "mv", "rm")
-COREUTILS_FILE_PROGRAMS = ("cat", "cut", "ls", "touch", "wc")
-COREUTILS_UTIL_PROGRAMS = ("basename", "dirname", "env", "expr", "pwd", "sort", "tr", "uname")
-BUILD_UTILITIES_PROGRAMS = ("find", "git", "grep", "ldd", "which", "xargs")
-SCRIPT_INTERPRETER_PROGRAMS = ("awk", "bash", "perl", "sed")
+# Keep these grouped by tool family so they can move to package-scoped policy later.
+# Observed package/phase provenance is documented in ``sandbox/install-worker.rst``.
+BINUTILS_PROGRAMS = ("as", "ld", "ar", "nm", "ranlib", "strip")
+COREUTILS_INSTALL_PROGRAMS = ("chmod", "cp", "install", "ln", "mkdir", "mv", "rm", "rmdir")
+COREUTILS_FILE_PROGRAMS = (
+    "cat",
+    "cmp",
+    "comm",
+    "cut",
+    "date",
+    "echo",
+    "head",
+    "ls",
+    "paste",
+    "realpath",
+    "sleep",
+    "split",
+    "tail",
+    "touch",
+    "true",
+    "wc",
+)
+COREUTILS_UTIL_PROGRAMS = (
+    "basename",
+    "arch",
+    "dirname",
+    "env",
+    "expr",
+    "pwd",
+    "sort",
+    "tr",
+    "uname",
+    "uniq",
+)
+BUILD_UTILITIES_PROGRAMS = (
+    "diff",
+    "egrep",
+    "file",
+    "find",
+    "git",
+    "grep",
+    "ldd",
+    "tbl",
+    "which",
+    "xargs",
+)
+SCRIPT_INTERPRETER_PROGRAMS = ("awk", "bash", "mawk", "perl", "sed")
 BUILD_PROGRAMS = (
     COMPILER_PROGRAMS
     + BINUTILS_PROGRAMS
@@ -117,6 +164,7 @@ BUILD_PROGRAMS = (
 )
 #: Support files that compiler drivers may pass to subordinate tools.
 COMPILER_FILES = ("liblto_plugin.so",)
+FILE_RUNTIME_READ_PATHS = ("/etc/magic", "/usr/share/file/magic.mgc")
 
 
 class ProcessLike(Protocol):
@@ -443,6 +491,11 @@ class PrefixPivoter:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _prefix_pivoter_for_spec(spec: spack.spec.Spec, keep_prefix: bool) -> Optional[PrefixPivoter]:
+    """Return prefix protection for locally installed specs only."""
+    return None if spec.external else PrefixPivoter(spec.prefix, keep_prefix)
+
+
 class BuildRequest(NamedTuple):
     """Plain data describing a single build to be launched: the input of a build launcher."""
 
@@ -701,6 +754,13 @@ def compiler_support_paths(compiler_path: str) -> List[str]:
     return result
 
 
+def executable_support_paths(executable: str) -> List[str]:
+    """Return existing data files required by an individually selected executable."""
+    if os.path.basename(executable) != "file":
+        return []
+    return [path for path in FILE_RUNTIME_READ_PATHS if os.path.exists(path)]
+
+
 def allow_git_support_paths(sandbox: spack.sandbox.Sandbox) -> None:
     """Allow the helper directory selected by the host Git executable."""
     git = shutil.which("git")
@@ -724,7 +784,15 @@ def allow_git_support_paths(sandbox: spack.sandbox.Sandbox) -> None:
 def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) -> None:
     """Allow compiler drivers and their exact support paths selected by concrete language edges."""
     compiler_paths: Set[str] = set()
+    compiler_names = set(spack.compilers.config.supported_compilers())
     for node in spec.traverse():
+        if node.name in compiler_names:
+            configured_compilers = (node.extra_attributes or {}).get("compilers", {})
+            compiler_paths.update(
+                configured_compilers[language]
+                for language in COMPILER_LANGUAGES
+                if configured_compilers.get(language)
+            )
         for edge in node.edges_to_dependencies():
             selected_languages = set(edge.virtuals) & set(COMPILER_LANGUAGES)
             if not selected_languages:
@@ -741,6 +809,8 @@ def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) 
         sandbox.allow_read(compiler_path)
         for program_path in compiler_support_paths(compiler_path):
             sandbox.allow_read(program_path)
+            for support_path in executable_support_paths(program_path):
+                sandbox.allow_read(support_path)
         real_compiler_path = Path(compiler_path).resolve()
         if real_compiler_path.exists() and str(real_compiler_path).startswith("/usr/"):
             for path in HOST_COMPILER_READ_PATHS:
@@ -782,6 +852,7 @@ def _enable_sandbox(
 
     for repository in spack.repo.PATH.repos:
         sandbox.allow_read(repository.root)
+    sandbox.allow_read(spack.caches.fetch_cache_location())
 
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
@@ -1034,11 +1105,12 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
 
     # As a performance optimization, we do not serialize the environment which
     # is slow to serialize and not needed in the build job
-    prefix_pivoter = PrefixPivoter(spec.prefix, request.keep_prefix)
+    prefix_pivoter = _prefix_pivoter_for_spec(spec, request.keep_prefix)
     prefix_pivoted = False
     try:
-        prefix_pivoter.__enter__()
-        prefix_pivoted = True
+        if prefix_pivoter is not None:
+            prefix_pivoter.__enter__()
+            prefix_pivoted = True
         proc = Process(
             target=worker_function,
             args=(
@@ -1053,7 +1125,7 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
         )
         proc.start()
     except BaseException:
-        if prefix_pivoted:
+        if prefix_pivoted and prefix_pivoter is not None:
             prefix_pivoter.__exit__(*sys.exc_info())
         if network_proxy is not None:
             network_proxy.stop()
