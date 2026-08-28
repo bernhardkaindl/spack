@@ -94,6 +94,7 @@ def _tool_runtime_roots(spec: spack.spec.Spec, tool_paths: List[str]) -> List[st
         except ValueError:
             owns_tool = False
         if owns_tool:
+            roots.append(str(node.prefix))
             roots.extend(
                 str(dependency.prefix)
                 for dependency in node.traverse(root=False, deptype=("link", "run"))
