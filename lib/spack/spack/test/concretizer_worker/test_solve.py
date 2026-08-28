@@ -18,6 +18,7 @@ import spack.config as spack_config
 import spack.error as spack_error
 import spack.platforms as spack_platforms
 import spack.repo as spack_repo
+import spack.store
 import spack.util.libc
 import spack.util.sandbox
 from spack.old_installer import PackageInstaller
@@ -89,16 +90,19 @@ def test_worker_bootstraps_clingo_once_in_parent_before_launch(mock_packages, mo
     import spack.bootstrap
 
     parent_pid = os.getpid()
+    normal_store_root = spack.store.STORE.root
     events = []
     real_bootstrap = spack.bootstrap.ensure_clingo_importable_or_raise
     real_runner = spack.util.sandbox.run_json_worker_streaming
 
     def bootstrap():
-        events.append(("bootstrap", os.getpid()))
+        events.append(
+            ("bootstrap", os.getpid(), spack.bootstrap.is_bootstrapping(), spack.store.STORE.root)
+        )
         real_bootstrap()
 
     def run_worker(*args, **kwargs):
-        events.append(("launch", os.getpid()))
+        events.append(("launch", os.getpid(), spack.store.STORE.root))
         return real_runner(*args, **kwargs)
 
     monkeypatch.setattr(spack.bootstrap, "ensure_clingo_importable_or_raise", bootstrap)
@@ -106,7 +110,10 @@ def test_worker_bootstraps_clingo_once_in_parent_before_launch(mock_packages, mo
 
     concretizer_worker.solve_in_worker([Spec("pkg-a")])
 
-    assert events == [("bootstrap", parent_pid), ("launch", parent_pid)]
+    assert events == [
+        ("bootstrap", parent_pid, True, spack.bootstrap.store_path()),
+        ("launch", parent_pid, normal_store_root),
+    ]
 
 
 def test_compiler_preflight_includes_configured_and_installed(mock_packages, monkeypatch):

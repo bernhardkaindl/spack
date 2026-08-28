@@ -417,7 +417,10 @@ It sends the detected host ``glibc`` or ``musl`` specs as an exact-external-spec
 so the worker does not execute compilers or infer libc compatibility after confinement.
 Those compiler recipes form a specially reviewed trusted set; this exception does not include ordinary requested or transitive recipes.
 
-Clingo bootstrap completes once in the trusted parent before worker launch.
+Clingo bootstrap completes in the trusted parent, under the dedicated bootstrap configuration and
+store, before worker launch.
+A bootstrap metadata entry may install its existing compatibility set of binaries, but those specs
+do not enter the normal store or appear in normal ``spack find`` output.
 The worker does not select or install a different bootstrap DAG.
 
 When build-cache reuse is enabled, the trusted parent refreshes configured mirror indexes and sends the resulting concrete native specs as a frozen request snapshot.
@@ -444,7 +447,7 @@ Acceptance checks:
 * [x] compiler-property cache hits need no worker process execution or unrelated writes;
 * [x] trusted compiler preflight handles cache misses before confinement;
 * [x] worker reuse consumes parent-detected host libc compatibility metadata;
-* [x] Clingo bootstrap completes in the parent before the worker is launched;
+* [x] Clingo bootstrap uses its dedicated store in the parent before the worker is launched;
 * [x] only parent-selected misc-cache and concretization-cache paths are writable;
 * [x] cache path selection cannot be influenced by recipe data; and
 * [x] direct kernel-boundary tests run on a supported Linux Landlock host.
