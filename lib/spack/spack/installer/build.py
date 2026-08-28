@@ -119,8 +119,10 @@ COREUTILS_FILE_PROGRAMS = (
     "echo",
     "head",
     "ls",
+    # ncurses
     "paste",
     "realpath",
+    # ncurses
     "sleep",
     "split",
     "tail",
@@ -152,6 +154,7 @@ BUILD_UTILITIES_PROGRAMS = (
     "gzip",
     "grep",
     "ldd",
+    # ncurses
     "tbl",
     "which",
     "xargs",
