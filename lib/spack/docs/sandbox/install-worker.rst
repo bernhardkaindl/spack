@@ -362,6 +362,9 @@ trace every grant to an observed package phase.
    * - ``ncurses``
      - configure and generated-source build
      - ``mawk``, ``sleep``, ``tbl``, ``paste``, ``head``, and ``/etc/passwd``
+   * - ``font-util``
+     - configure and build
+     - ``id`` and ``gzip``
    * - ``perl``
      - configure
      - ``split``, ``realpath``, ``egrep``, ``tail``, ``arch``, ``comm``, ``/etc/hosts``,
