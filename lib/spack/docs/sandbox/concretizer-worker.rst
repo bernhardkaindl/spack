@@ -309,7 +309,10 @@ The confined worker owns:
 
 The worker receives no direct network access and no arbitrary process-execution capability.
 It reads all configured active repository roots, Spack and Python runtime files, Clingo modules and control files, and trusted configuration or database inputs proven necessary by focused tests.
-Inactive repositories and unrelated host paths remain inaccessible.
+For API-v2 composition it also reads ``spack_repo`` namespace directories selected by the trusted
+parent's Python search path, allowing sibling repositories to provide shared build systems.
+Repositories that are neither active nor Python-visible, and unrelated host paths, remain
+inaccessible.
 The initial worker may write only its dedicated concretization-cache paths.
 No other filesystem write access is granted.
 

@@ -45,6 +45,9 @@ The worker applies the existing reuse filters without store access or network re
 
 Landlock allows reads from active repositories, Spack and Python runtime paths, and loaded
 configuration.
+It also allows only ``spack_repo`` namespace directories present on the trusted parent Python
+search path, enabling API-v2 cross-repository build-system imports without exposing unrelated
+search-path entries.
 Writes are limited to parent-selected persistent misc-cache and concretization-cache roots.
 Current cache readers parse structured data; cache content remains untrusted and subject to parser and native-spec validation.
 Seccomp denies sockets, ``fork``, ``vfork``, executable replacement, and blocked IPC.

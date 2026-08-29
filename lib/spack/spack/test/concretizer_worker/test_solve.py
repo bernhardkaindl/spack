@@ -5,6 +5,7 @@
 import os
 import socket
 import subprocess
+import sys
 import warnings
 
 import pytest
@@ -84,6 +85,19 @@ def test_worker_uses_configured_response_limit(mock_packages, mutable_config, mo
     concretizer_worker.solve_in_worker([Spec("pkg-a")])
 
     assert observed == [(None, configured_limit)]
+
+
+def test_repository_namespace_roots_include_only_spack_repositories(tmp_path, monkeypatch):
+    import spack.concretizer_worker.solve as worker_solve
+
+    repository_path = tmp_path / "repository-path"
+    namespace_root = repository_path / "spack_repo"
+    namespace_root.mkdir(parents=True)
+    unrelated_path = tmp_path / "unrelated"
+    unrelated_path.mkdir()
+    monkeypatch.setattr(sys, "path", [str(repository_path), str(unrelated_path)])
+
+    assert worker_solve._repository_namespace_roots() == [str(namespace_root)]
 
 
 def test_worker_bootstraps_clingo_once_in_parent_before_launch(mock_packages, monkeypatch):
