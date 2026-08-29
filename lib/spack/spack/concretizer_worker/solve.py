@@ -7,6 +7,7 @@
 import functools
 import os
 import pathlib
+import sys
 import sysconfig
 import time
 import warnings
@@ -104,6 +105,16 @@ def _worker_setup(read_roots: List[str], write_roots: List[str]) -> None:
     spack.sandbox.restrict_concretizer_worker(read_roots, write_roots)
 
 
+def _repository_namespace_roots() -> List[str]:
+    """Return Python-visible API-v2 package repository namespace roots."""
+    roots = []
+    for python_path in sys.path:
+        namespace_root = os.path.join(python_path or os.getcwd(), "spack_repo")
+        if os.path.isdir(namespace_root):
+            roots.append(namespace_root)
+    return roots
+
+
 def _worker_paths() -> Tuple[List[str], List[str]]:
     """Derive worker filesystem capabilities from trusted active Spack state."""
     from spack.solver.asp import ConcretizationCache
@@ -120,6 +131,7 @@ def _worker_paths() -> Tuple[List[str], List[str]]:
         read_roots.append(repository.root)
         if repository.python_path:
             read_roots.append(repository.python_path)
+    read_roots.extend(_repository_namespace_roots())
     for scope in spack.config.CONFIG.active_scopes:
         path = getattr(scope, "path", None)
         if path:
