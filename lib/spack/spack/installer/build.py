@@ -365,6 +365,7 @@ BUILD_UTILITIES_PROGRAMS = (
     "grep",
     "hexdump",
     "ldd",
+    "tar",  # self-extracting installers such as CUDA
     "tbl",  # ncurses
     "which",
     "xargs",  # diffutils
@@ -1179,6 +1180,11 @@ def _enable_sandbox(
 
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
+    build_tmpdir = os.path.join(stage_path, "spack-src")
+    os.environ["TMPDIR"] = build_tmpdir
+    os.environ["TMP"] = build_tmpdir
+    os.environ["TEMP"] = build_tmpdir
+    tempfile.tempdir = build_tmpdir
     os.environ["XDG_CACHE_HOME"] = os.path.join(stage_path, ".cache")  # font-util
 
     # POSIX prescribes /tmp and /dev/null are present. In the future we can consider setting

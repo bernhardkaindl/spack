@@ -30,6 +30,7 @@ from spack.util.proxy import DestinationPolicy
 _STAGE_REQUEST_KEYS = {"acquire_lock", "patch", "path", "request"}
 _STAGE_RESPONSE_KEYS = {"dag_hash", "path"}
 _STAGE_TOOLS = ("tar", "unzip", "gzip", "gunzip", "bunzip2", "xz", "7z", "patch", "sh")
+_STAGE_WORKER_TIMEOUT_SECONDS = 3600
 
 
 class StageWorkerError(ValueError):
@@ -215,5 +216,6 @@ def stage_package(
         _stage_worker,
         DestinationPolicy.allow_any(),
         setup=lambda: _stage_setup(read_roots, write_roots),
+        timeout=_STAGE_WORKER_TIMEOUT_SECONDS,
     )
     return _validate_stage_response(response, package.spec.dag_hash(), expected_stage_path)

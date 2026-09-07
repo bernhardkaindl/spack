@@ -205,13 +205,15 @@ def test_stage_package_grants_lock_write_only_when_acquired(
     package = _package_for_url(mock_archive.url, monkeypatch, tmp_path)
     captured_read_roots = []
     captured_write_roots = []
+    captured_timeout = []
 
     def capture_setup(read_roots, write_roots):
         captured_read_roots.extend(read_roots)
         captured_write_roots.extend(write_roots)
 
-    def run_worker(request, worker, proxy_policy, setup):
+    def run_worker(request, worker, proxy_policy, setup, timeout):
         setup()
+        captured_timeout.append(timeout)
         return {"dag_hash": package.spec.dag_hash(), "path": package.stage.path}
 
     monkeypatch.setattr(spack.install_worker.stage, "_stage_setup", capture_setup)
@@ -223,6 +225,7 @@ def test_stage_package_grants_lock_write_only_when_acquired(
     assert set(_store_database_read_roots()).issubset(captured_read_roots)
     assert set(_dependency_read_roots(package.spec)).issubset(captured_read_roots)
     assert (stage_lock in captured_write_roots) is acquire_lock
+    assert captured_timeout == [3600]
 
 
 def test_stage_package_preserves_mirror_and_fetch_failure(
