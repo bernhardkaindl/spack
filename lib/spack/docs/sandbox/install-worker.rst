@@ -137,14 +137,12 @@ Grant stage-root write access, parent-selected package inputs, and proxy configu
 Use ``run_json_worker_with_network`` or a narrow evolution of that mechanism.
 Do not recreate proxy or fetch logic.
 
-Normal staging may invoke only individually resolved ``tar``, ``unzip``, ``patch``, compression
-fallback tools, and subordinate helpers such as GNU tar's ``gunzip`` and its shell interpreter.
-Their loader/library paths are readable.  For a tool selected from the concrete DAG, only that
-tool's link/run dependency closure is added; an unselected executable remains inaccessible.
-Stage and build workers currently impose no installer memory ceiling because package builds can
-legitimately require most of a large host.  They retain limits inherited from the invoking process or
-service.  Future adaptive admission and throttling have a dedicated planning page in the sandbox
-documentation.
+Normal staging may invoke only individually resolved ``tar``, ``unzip``, ``patch``, compression fallback tools, and subordinate helpers such as GNU tar's ``gunzip`` and its shell interpreter.
+Their loader/library paths are readable.
+For a tool selected from the concrete DAG, only that tool's link/run dependency closure is added; an unselected executable remains inaccessible.
+Stage and build workers currently impose no installer memory ceiling because package builds can legitimately require most of a large host.
+They retain limits inherited from the invoking process or service.
+Future adaptive admission and throttling have a dedicated planning page in the sandbox documentation.
 
 Preserve:
 
@@ -197,30 +195,22 @@ The parent derives capabilities from the concrete spec and trusted configuration
 Discover compiler drivers dynamically from concrete ``c``, ``cxx``, and ``fortran`` virtual edges.
 Query each selected driver for subordinate programs and plugin files.
 Do not grant compiler directories wholesale.
-The Linux system-tool baseline is derived from real package builds and allows tools only as
-individual resolved paths.  Its fixed host reads are ``/lib``, ``/lib64``, ``/usr/lib``,
-``/usr/lib64``, dynamic-loader configuration, ``/proc/cpuinfo``, distribution and MIME metadata,
-``/bin/sh``, and ``/usr/include`` when a selected compiler resolves below ``/usr``.
+The Linux system-tool baseline is derived from real package builds and allows tools only as individual resolved paths.
+Its fixed host reads are ``/lib``, ``/lib64``, ``/usr/lib``, ``/usr/lib64``, dynamic-loader configuration, ``/proc/cpuinfo``, distribution and MIME metadata, ``/bin/sh``, and ``/usr/include`` when a selected compiler resolves below ``/usr``.
 Every added tool or path requires a focused test demonstrating why it is needed.
 
-* [ ] Review why the generic compiler-wrapper ``cpp`` alias dispatches to the host-default
-  preprocessor instead of the compiler selected by ``SPACK_CC``.
-  If no compatibility constraint requires this behavior, bind ``cpp`` to the selected compiler and
-  remove the host-``cpp`` subordinate workaround in ``executable_support_paths()`` and its focused
-  ``test_cpp_executable_support_paths()`` regression.
+* [ ] Review why the generic compiler-wrapper ``cpp`` alias dispatches to the host-default preprocessor instead of the compiler selected by ``SPACK_CC``.
+  If no compatibility constraint requires this behavior, bind ``cpp`` to the selected compiler and remove the host-``cpp`` subordinate workaround in ``executable_support_paths()`` and its focused ``test_cpp_executable_support_paths()`` regression.
 
 An optional alpha learning mode may propose package-specific executable grants.
 It is disabled by default and must name an already loaded configuration file as its policy target.
 The trusted installer parent, never package code, updates that file through Spack's structured configuration API.
 Learned entries use package-name selectors and individually resolved executable paths; they never grant an executable's parent directory.
 
-Learning mode also routes build-phase TCP through an invocation-scoped proxy owned by the trusted
-installer parent.  It permits public HTTP, HTTPS, and FTP destinations for discovery, warns
-immediately for each new canonical destination, and prints a deduplicated package summary after the
-build attempt.  The parent records each destination in a reusable ``network-allow-<host>`` group and
-adds the package-name selector.  Outside learning mode, only matching network groups may use the
-proxy; builds never receive direct socket access unless the explicit legacy ``allow_network`` option
-is enabled.
+Learning mode also routes build-phase TCP through an invocation-scoped proxy owned by the trusted installer parent.
+It permits public HTTP, HTTPS, and FTP destinations for discovery, warns immediately for each new canonical destination, and prints a deduplicated package summary after the build attempt.
+The parent records each destination in a reusable ``network-allow-<host>`` group and adds the package-name selector.
+Outside learning mode, only matching network groups may use the proxy; builds never receive direct socket access unless the explicit legacy ``allow_network`` option is enabled.
 
 Landlock does not report denied paths.
 Learning therefore combines three signals before granting an executable:
@@ -244,8 +234,7 @@ Acceptance checks:
 * [ ] learning is disabled by default, validates traced executable paths in the trusted parent, and never grants from log text alone;
 * [ ] learned package-name whitelists are written only to the configured loaded scope; and
 * [ ] learning retries preserve locks, dependency ordering, failure propagation, and database behavior and stop on repeated denials.
-* [ ] learning reports and persists canonical build download destinations through the trusted
-  proxy, and learned groups remain enforceable after learning is disabled;
+* [ ] learning reports and persists canonical build download destinations through the trusted proxy, and learned groups remain enforceable after learning is disabled;
 
 Concretization Dependency
 -------------------------
@@ -256,21 +245,14 @@ It may be implemented before the staging worker, but it does not block this plan
 The staging worker must import the selected package recipe after confinement is active.
 It receives only the parent-selected concrete spec, repository state, and other minimal normal Spack state needed to invoke existing package methods.
 It must not depend on a new concretization or source-plan protocol.
-After inherited descriptors are closed, setup discards inherited lock bookkeeping and reinitializes
-the store before applying confinement.
-This lets patch methods query installed dependency prefixes without using stale database lock file
-descriptors.
-The parent grants read-only access to active local and upstream database directories for those
-queries; staging workers do not receive store write access.
-It also grants read-only access to installed non-external dependency prefixes selected by the
-concrete DAG, so patch methods can inspect dependency headers and libraries without exposing broad
-external prefixes.
+After inherited descriptors are closed, setup discards inherited lock bookkeeping and reinitializes the store before applying confinement.
+This lets patch methods query installed dependency prefixes without using stale database lock file descriptors.
+The parent grants read-only access to active local and upstream database directories for those queries; staging workers do not receive store write access.
+It also grants read-only access to installed non-external dependency prefixes selected by the concrete DAG, so patch methods can inspect dependency headers and libraries without exposing broad external prefixes.
 
 Build workers may also import dependency recipes lazily after confinement.
-This is required when a concrete spec was restored from the concretizer-worker protocol and does
-not carry inherited Python package objects.
-The build policy grants read-only access to every parent-selected active repository root; inactive
-repositories and unrelated host paths remain inaccessible.
+This is required when a concrete spec was restored from the concretizer-worker protocol and does not carry inherited Python package objects.
+The build policy grants read-only access to every parent-selected active repository root. inactive repositories and unrelated host paths remain inaccessible.
 
 * [ ] Harden recipe evaluation used by ``spack spec`` and environment concretization as its own project.
 * [x] Prove that a concrete spec produced directly or by the concretizer worker enters the same installer worker path.
@@ -348,8 +330,7 @@ Build capability provenance
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The baseline remains grouped in Python for the initial implementation.
-Keep this evidence when moving capabilities into package-scoped YAML whitelists so reviewers can
-trace every grant to an observed package phase.
+Keep this evidence when moving capabilities into package-scoped YAML whitelists so reviewers can trace every grant to an observed package phase.
 
 .. list-table:: Observed build sandbox capabilities
    :header-rows: 1
