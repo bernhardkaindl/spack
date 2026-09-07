@@ -185,8 +185,8 @@ Always run `git diff --check` before presenting or committing a change.
 
 ## Documentation
 
-For sandbox RST, load and follow `.github/skills/sandbox-documentation/SKILL.md`
-as the owning workflow.
+For every RST change under `lib/spack/docs/`, load and follow
+`.github/skills/sandbox-documentation/SKILL.md` as the owning workflow.
 
 The definitive documentation checks are:
 

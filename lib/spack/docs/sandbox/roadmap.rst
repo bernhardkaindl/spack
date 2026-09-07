@@ -37,8 +37,7 @@ Build-phase confinement
 * Grant selected compilers, build tools, dependency prefixes, stage, and install-prefix access without opening their parent directories.
 * Preserve existing hooks, phases, logs, metadata archiving, prefix commit, and database behavior.
 * Keep build-time network access denied by default.
-* Replace the current unlimited installer worker memory profile with the measured Linux admission,
-  throttling, and recovery design in the adaptive build memory scheduling plan.
+* Replace the current unlimited installer worker memory profile with the measured Linux admission, throttling, and recovery design in the adaptive build memory scheduling plan.
 
 Build-time downloads
 ^^^^^^^^^^^^^^^^^^^^
@@ -49,17 +48,13 @@ Do not grant this capability by default.
 An administrator-controlled policy must identify eligible packages and allowed destinations before implementation.
 The worker must still use the proxy for every outbound connection.
 
-Keep the local proxy and sanitized HTTP, HTTPS, and FTP proxy environment active whenever build
-networking is disabled, including when learning is disabled and no destination group matches.
-The denying proxy must reject an attempted download promptly with an isolation-specific diagnostic
-instead of allowing DNS failures, connection hangs, or generic hostname-resolution errors.
+Keep the local proxy and sanitized HTTP, HTTPS, and FTP proxy environment active whenever build networking is disabled, including when learning is disabled and no destination group matches.
+The denying proxy must reject an attempted download promptly with an isolation-specific diagnostic instead of allowing DNS failures, connection hangs, or generic hostname-resolution errors.
 
-Report each new canonical destination immediately whether it is allowed or denied.  When learning
-is disabled, reporting must never update configuration.  If a package fails after one or more
-denied or unlisted attempts, repeat the deduplicated network warnings after that package's failure
-output so they remain visible beside the final error.  Tests must cover bounded denial latency,
-warning deduplication and placement, unchanged configuration, and cleanup of proxy and seccomp
-notification resources after both success and failure.
+Report each new canonical destination immediately whether it is allowed or denied.
+When learning is disabled, reporting must never update configuration.
+If a package fails after one or more denied or unlisted attempts, repeat the deduplicated network warnings after that package's failure output so they remain visible beside the final error.
+Tests must cover bounded denial latency, warning deduplication and placement, unchanged configuration, and cleanup of proxy and seccomp notification resources after both success and failure.
 
 Checksum parity coverage
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -77,8 +72,7 @@ Later command boundaries
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 * Harden ``spack spec``, environment concretization, and implicit install concretization through the shared :doc:`concretizer-worker` plan.
-* Extend the concretizer-worker protocol for low-level ``spack solve`` setup output, timers, and
-  Clingo statistics after the high-level command boundary is complete.
+* Extend the concretizer-worker protocol for low-level ``spack solve`` setup output, timers, and Clingo statistics after the high-level command boundary is complete.
 * Continue installation and staging hardening through :doc:`install-worker`.
 * See :doc:`planned-work` for namespace isolation and later assessments.
 
