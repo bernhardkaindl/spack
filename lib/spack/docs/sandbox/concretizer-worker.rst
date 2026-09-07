@@ -309,10 +309,8 @@ The confined worker owns:
 
 The worker receives no direct network access and no arbitrary process-execution capability.
 It reads all configured active repository roots, Spack and Python runtime files, Clingo modules and control files, and trusted configuration or database inputs proven necessary by focused tests.
-For API-v2 composition it also reads ``spack_repo`` namespace directories selected by the trusted
-parent's Python search path, allowing sibling repositories to provide shared build systems.
-Repositories that are neither active nor Python-visible, and unrelated host paths, remain
-inaccessible.
+For API-v2 composition it also reads ``spack_repo`` namespace directories selected by the trusted parent's Python search path, allowing sibling repositories to provide shared build systems.
+Repositories that are neither active nor Python-visible, and unrelated host paths, remain inaccessible.
 The initial worker may write only its dedicated concretization-cache paths.
 No other filesystem write access is granted.
 
@@ -414,16 +412,12 @@ This includes ensuring Clingo is importable and determining whether repository i
 Parent preflight may prepare Clingo, indexes, configuration, and reuse inputs only where that work does not import ordinary package recipes.
 If Clingo bootstrap cannot avoid recipes, define the selected bootstrap recipes as a small trusted set with dedicated review and tests; do not turn bootstrap into a general parent-side recipe-import exception.
 Compiler-property detection may execute a selected compiler and write temporary and cache files on a cache miss.
-The trusted parent imports only configured or installed compiler candidate recipes, executes their
-selected compiler tools, and populates compiler properties before confinement.
-It sends the detected host ``glibc`` or ``musl`` specs as an exact-external-spec request snapshot,
-so the worker does not execute compilers or infer libc compatibility after confinement.
+The trusted parent imports only configured or installed compiler candidate recipes, executes their selected compiler tools, and populates compiler properties before confinement.
+It sends the detected host ``glibc`` or ``musl`` specs as an exact-external-spec request snapshot, so the worker does not execute compilers or infer libc compatibility after confinement.
 Those compiler recipes form a specially reviewed trusted set; this exception does not include ordinary requested or transitive recipes.
 
-Clingo bootstrap completes in the trusted parent, under the dedicated bootstrap configuration and
-store, before worker launch.
-A bootstrap metadata entry may install its existing compatibility set of binaries, but those specs
-do not enter the normal store or appear in normal ``spack find`` output.
+Clingo bootstrap completes in the trusted parent, under the dedicated bootstrap configuration and store, before worker launch.
+A bootstrap metadata entry may install its existing compatibility set of binaries, but those specs do not enter the normal store or appear in normal ``spack find`` output.
 The worker does not select or install a different bootstrap DAG.
 
 When build-cache reuse is enabled, the trusted parent refreshes configured mirror indexes and sends the resulting concrete native specs as a frozen request snapshot.

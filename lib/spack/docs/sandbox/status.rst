@@ -11,12 +11,10 @@ Current Status
 Implemented concretizer worker
 ------------------------------
 
-The versioned launcher-neutral contract, scalable process transport, solve integration, and
-confinement policy are implemented.
+The versioned launcher-neutral contract, scalable process transport, solve integration, and confinement policy are implemented.
 
 The request carries abstract native specs, test-dependency selection, deprecated-version policy, solve strategy, and frozen local-store and build-cache reuse metadata.
-The response carries ordered final concrete native specs, DAG hashes, solve durations, and bounded
-warnings.
+The response carries ordered final concrete native specs, DAG hashes, solve durations, and bounded warnings.
 Request creation, response restoration, and structural validation do not import package recipes.
 Virtual-provider and other recipe-dependent satisfaction checks remain worker-owned.
 
@@ -31,23 +29,15 @@ The launcher-neutral one-shot path now runs the existing ``Solver.solve()`` in a
 After inherited descriptors are closed, its setup hook discards stale lock bookkeeping and recreates the store and binary-cache index with fresh lock objects.
 An allowlisted error protocol preserves catchable Spack, configuration, spec, unknown-package, and unsatisfiable-spec categories; unexpected internal failures retain the transport failure path.
 
-Trusted parent preflight ensures Clingo is importable and imports only configured or installed
-compiler candidate recipes to populate compiler properties.
-Bootstrap uses its dedicated configuration and store before worker launch, then restores the normal
-store before preflight continues.
-Worker selection therefore does not expose bootstrap compatibility binaries through normal
-``spack find`` output or select a different Clingo bootstrap DAG.
-Detected host ``glibc`` or ``musl`` specs cross the protocol as a validated frozen snapshot;
-libc reuse compatibility therefore does not depend on compiler execution inside the worker.
-Local-store specs and install metadata are frozen before every worker solve; build-cache candidates
-are refreshed and frozen only when enabled by reuse policy.
+Trusted parent preflight ensures Clingo is importable and imports only configured or installed compiler candidate recipes to populate compiler properties.
+Bootstrap uses its dedicated configuration and store before worker launch, then restores the normal store before preflight continues.
+Worker selection therefore does not expose bootstrap compatibility binaries through normal ``spack find`` output or select a different Clingo bootstrap DAG.
+Detected host ``glibc`` or ``musl`` specs cross the protocol as a validated frozen snapshot; libc reuse compatibility therefore does not depend on compiler execution inside the worker.
+Local-store specs and install metadata are frozen before every worker solve; build-cache candidates are refreshed and frozen only when enabled by reuse policy.
 The worker applies the existing reuse filters without store access or network refresh.
 
-Landlock allows reads from active repositories, Spack and Python runtime paths, and loaded
-configuration.
-It also allows only ``spack_repo`` namespace directories present on the trusted parent Python
-search path, enabling API-v2 cross-repository build-system imports without exposing unrelated
-search-path entries.
+Landlock allows reads from active repositories, Spack and Python runtime paths, and loaded configuration.
+It also allows only ``spack_repo`` namespace directories present on the trusted parent Python search path, enabling API-v2 cross-repository build-system imports without exposing unrelated search-path entries.
 Writes are limited to parent-selected persistent misc-cache and concretization-cache roots.
 Current cache readers parse structured data; cache content remains untrusted and subject to parser and native-spec validation.
 Seccomp denies sockets, ``fork``, ``vfork``, executable replacement, and blocked IPC.
@@ -61,17 +51,11 @@ They also prove that child-process creation is denied while a normal asynchronou
 ``spack.concretize.concretize_one()`` and unified together solves now select the confined worker automatically when supported.
 They use the existing direct solver only when confinement is unavailable and the shared ``config:sandbox:allow_fallback`` policy permits fallback.
 This covers explicit ``spack spec`` inputs and normal callers that use those shared operations.
-When-possible solves now keep every round in one confined worker and return per-root producing-round
-durations for parent-owned progress events.
+When-possible solves now keep every round in one confined worker and return per-root producing-round durations for parent-owned progress events.
 Separate solves use one confined worker per unresolved root.
-The trusted parent caps concurrent workers at Spack's configured parallel job limit, validates only
-framed JSON responses, owns progress reporting, and reaps outstanding workers after failure or
-cancellation.
-Focused command and environment coverage includes ``spack spec`` output modes, all three
-environment strategies, implicit ``spack install`` concretization, configured fallback, invalid
-response rejection before environment mutation, and already-concretized environment no-op behavior.
-Low-level ``spack solve`` timer/statistics transport and broader direct-API regression coverage
-remain deferred.
+The trusted parent caps concurrent workers at Spack's configured parallel job limit, validates only framed JSON responses, owns progress reporting, and reaps outstanding workers after failure or cancellation.
+Focused command and environment coverage includes ``spack spec`` output modes, all three environment strategies, implicit ``spack install`` concretization, configured fallback, invalid response rejection before environment mutation, and already-concretized environment no-op behavior.
+Low-level ``spack solve`` timer/statistics transport and broader direct-API regression coverage remain deferred.
 
 Implemented ``spack info`` boundaries
 -------------------------------------
@@ -100,16 +84,13 @@ Implemented ``spack stage`` and installer staging boundary
 Supported hosts stage source in a confined worker through the existing ``Stage`` and fetcher abstractions.
 The worker uses the invocation proxy for network access and may write only its selected stage, fetch cache, and any exact stage-lock file it acquires.
 It can execute only individually selected archive-expansion tools.
-Its setup recreates inherited lock and store state before confinement so recipe patch methods can
-query installed dependency prefixes safely.
+Its setup recreates inherited lock and store state before confinement so recipe patch methods can query installed dependency prefixes safely.
 
 The existing installer reuses this worker at its source-staging boundary.
 It retains scheduling, jobserver limits, state and log channels, terminal UI, hooks, builder phases, database actions, and binary-cache behavior.
-Build workers can lazily import recipes from parent-selected active repositories through read-only
-Landlock access, including dependency recipes referenced by concretizer-worker-restored specs.
+Build workers can lazily import recipes from parent-selected active repositories through read-only Landlock access, including dependency recipes referenced by concretizer-worker-restored specs.
 The installer child owns the stage context and lock, so its worker applies the requested patch behavior without reacquiring the lock.
-Installer stage and build workers currently impose no Spack memory ceiling, while retaining core-dump
-suppression and any limits inherited from the invoking process or service.
+Installer stage and build workers currently impose no Spack memory ceiling, while retaining core-dump suppression and any limits inherited from the invoking process or service.
 
 Focused tests cover proxy-mediated fetch and expansion, patching under the parent-held stage lock, direct network and filesystem denial, source installation, cache-only behavior, scheduler ordering, cancellation, state handling, and database updates.
 

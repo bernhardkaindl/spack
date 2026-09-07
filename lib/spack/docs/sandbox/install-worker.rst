@@ -205,11 +205,8 @@ Missing policy paths are ignored, so the same immutable policy supports differen
 Missing, malformed, or unsupported policy data fails sandbox setup instead of restoring broad header access.
 Every added tool or path requires a focused test demonstrating why it is needed.
 
-* [ ] Review why the generic compiler-wrapper ``cpp`` alias dispatches to the host-default
-  preprocessor instead of the compiler selected by ``SPACK_CC``.
-  If no compatibility constraint requires this behavior, bind ``cpp`` to the selected compiler and
-  remove the host-``cpp`` subordinate workaround in ``executable_support_paths()`` and its focused
-  ``test_cpp_executable_support_paths()`` regression.
+* [ ] Review why the generic compiler-wrapper ``cpp`` alias dispatches to the host-default preprocessor instead of the compiler selected by ``SPACK_CC``.
+  If no compatibility constraint requires this behavior, bind ``cpp`` to the selected compiler and remove the host-``cpp`` subordinate workaround in ``executable_support_paths()`` and its focused ``test_cpp_executable_support_paths()`` regression.
 
 An optional alpha learning mode may propose package-specific executable grants.
 It is disabled by default and must name an already loaded configuration file as its policy target.
@@ -254,21 +251,14 @@ It may be implemented before the staging worker, but it does not block this plan
 The staging worker must import the selected package recipe after confinement is active.
 It receives only the parent-selected concrete spec, repository state, and other minimal normal Spack state needed to invoke existing package methods.
 It must not depend on a new concretization or source-plan protocol.
-After inherited descriptors are closed, setup discards inherited lock bookkeeping and reinitializes
-the store before applying confinement.
-This lets patch methods query installed dependency prefixes without using stale database lock file
-descriptors.
-The parent grants read-only access to active local and upstream database directories for those
-queries; staging workers do not receive store write access.
-It also grants read-only access to installed non-external dependency prefixes selected by the
-concrete DAG, so patch methods can inspect dependency headers and libraries without exposing broad
-external prefixes.
+After inherited descriptors are closed, setup discards inherited lock bookkeeping and reinitializes the store before applying confinement.
+This lets patch methods query installed dependency prefixes without using stale database lock file descriptors.
+The parent grants read-only access to active local and upstream database directories for those queries; staging workers do not receive store write access.
+It also grants read-only access to installed non-external dependency prefixes selected by the concrete DAG, so patch methods can inspect dependency headers and libraries without exposing broad external prefixes.
 
 Build workers may also import dependency recipes lazily after confinement.
-This is required when a concrete spec was restored from the concretizer-worker protocol and does
-not carry inherited Python package objects.
-The build policy grants read-only access to every parent-selected active repository root; inactive
-repositories and unrelated host paths remain inaccessible.
+This is required when a concrete spec was restored from the concretizer-worker protocol and does not carry inherited Python package objects.
+The build policy grants read-only access to every parent-selected active repository root. inactive repositories and unrelated host paths remain inaccessible.
 
 * [ ] Harden recipe evaluation used by ``spack spec`` and environment concretization as its own project.
 * [x] Prove that a concrete spec produced directly or by the concretizer worker enters the same installer worker path.
@@ -346,8 +336,7 @@ Build capability provenance
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The baseline remains grouped in Python for the initial implementation.
-Keep this evidence when moving capabilities into package-scoped YAML whitelists so reviewers can
-trace every grant to an observed package phase.
+Keep this evidence when moving capabilities into package-scoped YAML whitelists so reviewers can trace every grant to an observed package phase.
 
 .. list-table:: Observed build sandbox capabilities
    :header-rows: 1
