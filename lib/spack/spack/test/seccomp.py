@@ -24,6 +24,7 @@ class SpySeccompSandbox(spack.sandbox.SeccompSandbox):
     def __init__(self):
         self.rules_added = []
         self.masked_rules_added = []
+        self.not_equal_rules_added = []
         self.loaded = False
         self.listener_fd = 42
         self.prctl_called = False
@@ -43,6 +44,11 @@ class SpySeccompSandbox(spack.sandbox.SeccompSandbox):
     ) -> None:
         self.masked_rules_added.append((syscall, argument, mask, value, action))
 
+    def _rule_add_not_equal(
+        self, context, syscall: int, argument: int, value: int, action: int
+    ) -> None:
+        self.not_equal_rules_added.append((syscall, argument, value, action))
+
     def _load(self, context) -> None:
         self.loaded = True
 
@@ -56,6 +62,20 @@ def test_seccomp_sandbox_calls_prctl_no_new_privs():
     assert spy.prctl_called
     assert spy.loaded
     assert len(spy.rules_added) == len(spack.sandbox._SOCKET_SYSCALLS)
+    assert spy.not_equal_rules_added == [
+        (
+            spy._get_syscall_number("socketpair"),
+            0,
+            spack.sandbox.LINUX_AF_UNIX,
+            spack.sandbox.SECCOMP_RET_ERRNO | errno.EPERM,
+        ),
+        (
+            spy._get_syscall_number("socket"),
+            0,
+            spack.sandbox.LINUX_AF_UNIX,
+            spack.sandbox.SECCOMP_RET_ERRNO | errno.EPERM,
+        ),
+    ]
 
 
 def test_seccomp_sandbox_groups():
@@ -67,6 +87,7 @@ def test_seccomp_sandbox_groups():
         + len(spack.sandbox._IPC_SYSCALLS)
     )
     assert len(spy.rules_added) == total_expected
+    assert len(spy.not_equal_rules_added) == 2
 
 
 def test_seccomp_allows_only_thread_clone():
@@ -130,6 +151,14 @@ def test_seccomp_denies_network_bypass_after_listener_transfer():
     assert spy.rules_added == [
         (spy._get_syscall_number(name), spack.sandbox.SECCOMP_RET_ERRNO | errno.EPERM)
         for name in spack.sandbox._NETWORK_WORKER_DENY_SYSCALLS
+    ]
+    assert spy.not_equal_rules_added == [
+        (
+            spy._get_syscall_number("socketpair"),
+            0,
+            spack.sandbox.LINUX_AF_UNIX,
+            spack.sandbox.SECCOMP_RET_ERRNO | errno.EPERM,
+        )
     ]
 
 

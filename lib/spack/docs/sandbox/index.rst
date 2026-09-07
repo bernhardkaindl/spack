@@ -13,6 +13,7 @@ Documentation map
 
 * :doc:`overview`: scope and shared trust boundary.
 * :doc:`status`: implemented behavior and focused validation.
+* :doc:`solved-issues`: resolved failures, root causes, and retained regression boundaries.
 * :doc:`roadmap`: immediate command-hardening milestones.
 * :doc:`planned-work`: later work, including namespace isolation.
 * :doc:`design-decisions`: open design questions for review.
@@ -29,6 +30,7 @@ Documentation map
 
    overview
    status
+   solved-issues
    roadmap
    planned-work
    design-decisions
