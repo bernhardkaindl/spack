@@ -136,6 +136,7 @@ Installation calls ``do_patch()`` unless patching is disabled.
 Grant stage-root write access, parent-selected package inputs, and proxy configuration.
 Use ``run_json_worker_with_network`` or a narrow evolution of that mechanism.
 Do not recreate proxy or fetch logic.
+The stage worker uses a bounded one-hour deadline so multi-gigabyte installers can finish downloading and expanding.
 
 Normal staging may invoke only individually resolved ``tar``, ``unzip``, ``patch``, compression fallback tools, and subordinate helpers such as GNU tar's ``gunzip`` and its shell interpreter.
 Their loader/library paths are readable.
@@ -190,12 +191,16 @@ It receives the concrete spec and prepared stage and prefix; it does not change 
 
 Read access includes non-external dependency prefixes, the selected package directory, Spack runtime and sbang resources, selected loader files, and selected compiler tools.
 Write access is limited to the stage, exact selected prefix, necessary temporary space, and explicit trusted configuration.
+The build worker sets ``TMPDIR``, ``TMP``, and ``TEMP`` to ``stage/spack-src`` before confinement.
+Package-specific installers create that child directory and may use it for extraction.
+The recursive stage write rule permits this without pre-creating a recipe-owned directory.
 The parent derives capabilities from the concrete spec and trusted configuration.
 
 Discover compiler drivers dynamically from concrete ``c``, ``cxx``, and ``fortran`` virtual edges.
 Query each selected driver for subordinate programs and plugin files.
 Do not grant compiler directories wholesale.
 The Linux system-tool baseline is derived from real package builds and allows tools only as individual resolved paths.
+It includes ``tar`` for self-extracting installers that unpack payloads through the host archive tool.
 Its fixed host reads are ``/lib``, ``/lib64``, ``/usr/lib``, ``/usr/lib64``, dynamic-loader configuration, ``/proc/cpuinfo``, distribution and MIME metadata, ``/bin/sh``, and ``/usr/include`` when a selected compiler resolves below ``/usr``.
 Every added tool or path requires a focused test demonstrating why it is needed.
 

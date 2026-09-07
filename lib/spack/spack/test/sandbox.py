@@ -180,6 +180,31 @@ def test_landlock_sandbox_network_uses_internal_seccomp(monkeypatch):
     assert sandbox.prctl_called
 
 
+def test_landlock_sandbox_allows_nested_stage_writes(tmp_path: pathlib.Path):
+    """A package can create its temporary directory below an allowed stage."""
+    try:
+        sandbox = spack.sandbox.get_sandbox()
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    stage_path = tmp_path / "stage"
+    stage_path.mkdir()
+
+    def worker(request):
+        del request
+        temporary_path = stage_path / "tmp"
+        temporary_path.mkdir()
+        marker = temporary_path / "marker"
+        marker.touch()
+        return marker.exists()
+
+    result = run_json_worker(
+        {}, worker, setup=lambda: (sandbox.allow_write(stage_path), sandbox.apply())
+    )
+
+    assert result
+
+
 def test_recipe_import_sandbox_policy(monkeypatch):
     sandbox = MockSandbox()
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
@@ -514,6 +539,7 @@ def test_enable_sandbox_paths(
     """Test that _enable_sandbox in the installer calls allow_read/allow_write correctly."""
     mock_sandbox = MockSandbox()
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+    monkeypatch.setattr(tempfile, "tempdir", tempfile.tempdir)
     build_rlimits = []
     monkeypatch.setattr(
         spack.sandbox, "set_build_worker_rlimits", lambda: build_rlimits.append(True)
@@ -582,7 +608,12 @@ def test_enable_sandbox_paths(
     assert stage_path.resolve() in allow_write_resolved
     assert pathlib.Path(spec.prefix).resolve() in allow_write_resolved
     assert custom_write.resolve() in allow_write_resolved
-    assert pathlib.Path(tempfile.gettempdir()).resolve() in allow_write_resolved
+    tmpdir = pathlib.Path(tempfile.gettempdir()).resolve()
+    assert tmpdir.parent in allow_write_resolved
+    assert os.environ["TMPDIR"] == str(tmpdir)
+    assert os.environ["TMP"] == str(tmpdir)
+    assert os.environ["TEMP"] == str(tmpdir)
+    assert tempfile.gettempdir() == str(tmpdir)
     assert os.environ["XDG_CACHE_HOME"] == str(stage_path / ".cache")
 
     assert mock_sandbox.apply_calls == [(expected_block_network, False, False, False)]
@@ -673,6 +704,7 @@ def test_compiler_support_paths_queries_all_build_tools(monkeypatch):
         for program in spack.installer.build.BUILD_PROGRAMS
         for prefix in ("/wrapper/", "/host/")
     }
+    assert "tar" in spack.installer.build.BUILD_PROGRAMS
 
 
 def test_file_executable_support_paths(monkeypatch):
