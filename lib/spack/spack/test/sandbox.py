@@ -444,6 +444,61 @@ def test_concretizer_worker_denies_fork(tmp_path):
     assert result in (errno.EPERM, errno.EACCES)
 
 
+def test_build_network_sandbox_allows_anonymous_socketpair():
+    """Cargo uses an anonymous Unix socket pair to report child-launch errors."""
+    try:
+        sandbox = spack.sandbox.get_sandbox()
+        if not sandbox.network_isolation_available():
+            pytest.skip("build network isolation is unavailable")
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    def worker(request):
+        try:
+            left, right = socket.socketpair(
+                socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC
+            )
+        except OSError as error:
+            socketpair_errno = error.errno
+            socketpair_io_errno = None
+            socketpair_round_trip = False
+        else:
+            socketpair_errno = None
+            try:
+                right.sendmsg([b"x"])
+                socketpair_round_trip = left.recv(1) == b"x"
+            except OSError as error:
+                socketpair_io_errno = error.errno
+                socketpair_round_trip = False
+            else:
+                socketpair_io_errno = None
+            finally:
+                left.close()
+                right.close()
+
+        try:
+            unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        except OSError as error:
+            unix_socket_errno = error.errno
+        else:
+            unix_socket.close()
+            unix_socket_errno = None
+
+        return {
+            "socketpair_errno": socketpair_errno,
+            "socketpair_io_errno": socketpair_io_errno,
+            "socketpair_round_trip": socketpair_round_trip,
+            "unix_socket_errno": unix_socket_errno,
+        }
+
+    result = run_json_worker({}, worker, setup=lambda: sandbox.apply(block_network=True))
+
+    assert result["socketpair_errno"] is None
+    assert result["socketpair_io_errno"] is None
+    assert result["socketpair_round_trip"]
+    assert result["unix_socket_errno"] in (errno.EPERM, errno.EACCES)
+
+
 @pytest.mark.parametrize(
     "allow_network,expected_block_network", [(None, True), (False, True), (True, False)]
 )

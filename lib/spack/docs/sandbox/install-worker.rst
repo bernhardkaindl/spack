@@ -363,6 +363,11 @@ trace every grant to an observed package phase.
      - ``cc1``, ``cc1plus``, ``f951``, ``collect2``, ``lto1``, ``lto-wrapper``,
        ``cpp``, ``as``, ``ld``, ``ar``, ``nm``, ``ranlib``, ``strip``,
        ``liblto_plugin.so``, and ``/usr/include``
+   * - ``rust`` and other nested build tools
+     - launch compiler and linker subprocesses
+     - anonymous Unix ``socketpair`` IPC for child-launch error reporting; pathname-based Unix
+       sockets and network communication remain denied; see
+       :ref:`sandbox-solved-rust-cargo-socketpair`
    * - ``libx11``
      - configure preprocessor checks
      - the exact ``cc1`` subordinate reported by the individually selected generic ``cpp`` wrapper

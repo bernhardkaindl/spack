@@ -51,8 +51,10 @@ LANDLOCK_RESTRICT_SELF_TSYNC = 1 << 3
 SECCOMP_RET_ALLOW = 0x7FFF0000
 SECCOMP_RET_ERRNO = 0x00050000
 SECCOMP_RET_USER_NOTIF = 0x7FC00000
+SCMP_CMP_NE = 1
 SCMP_CMP_MASKED_EQ = 7
 CLONE_THREAD = 0x00010000
+LINUX_AF_UNIX = 1
 SECCOMP_ADDFD_FLAG_SEND = 1 << 1
 SECCOMP_USER_NOTIF_FLAG_CONTINUE = 1
 SYS_PIDFD_OPEN = 434
@@ -60,6 +62,9 @@ SYS_PIDFD_GETFD = 438
 SECCOMP_IOCTL_NOTIF_ADDFD = 0x40182103
 MAX_EXECUTABLE_PATH_BYTES = 4096
 
+# Build tools such as Cargo require anonymous AF_UNIX socket pairs and message I/O for
+# child-launch error reporting. Workers close inherited descriptors before confinement, so
+# allowing I/O on already-open descriptors does not expose a parent network connection.
 _SOCKET_SYSCALLS = (
     "accept",
     "accept4",
@@ -70,28 +75,16 @@ _SOCKET_SYSCALLS = (
     "getsockopt",
     "listen",
     "recvmmsg",
-    "recvfrom",
-    "recvmsg",
     "sendmmsg",
-    "sendmsg",
     "sendto",
     "setsockopt",
     "shutdown",
     "socket",
     "socketcall",
-    "socketpair",
 )
 
-_NETWORK_WORKER_DENY_SYSCALLS = (
-    "accept",
-    "accept4",
-    "bind",
-    "listen",
-    "sendmmsg",
-    "sendmsg",
-    "socketcall",
-    "socketpair",
-)
+# The network supervisor handles addressable sockets; anonymous AF_UNIX socket pairs remain local.
+_NETWORK_WORKER_DENY_SYSCALLS = ("accept", "accept4", "bind", "listen", "sendmmsg", "socketcall")
 
 _PROCESS_EXEC_SYSCALLS = ("clone", "clone3", "fork", "vfork", "execve", "execveat")
 _EXEC_SYSCALLS = ("execve", "execveat")
@@ -578,6 +571,28 @@ class SeccompSandbox:
         if result < 0:
             raise OSError(-result, f"seccomp_rule_add_array({syscall}): {os.strerror(-result)}")
 
+    def _rule_add_not_equal(
+        self, context, syscall: int, argument: int, value: int, action: int
+    ) -> None:
+        comparison = SeccompArgCompare(argument, SCMP_CMP_NE, value, 0)
+        result = self.libseccomp.seccomp_rule_add_array(
+            context,
+            ctypes.c_uint32(action),
+            ctypes.c_int(syscall),
+            ctypes.c_uint(1),
+            ctypes.byref(comparison),
+        )
+        if result < 0:
+            raise OSError(-result, f"seccomp_rule_add_array({syscall}): {os.strerror(-result)}")
+
+    def _deny_non_unix_socketpairs(self, context) -> None:
+        """Allow only anonymous Unix socket pairs used for local build IPC."""
+        syscall = self._get_syscall_number("socketpair")
+        if syscall >= 0:
+            self._rule_add_not_equal(
+                context, syscall, 0, LINUX_AF_UNIX, SECCOMP_RET_ERRNO | errno.EPERM
+            )
+
     def _load(self, context) -> None:
         result = self.libseccomp.seccomp_load(context)
         if result < 0:
@@ -658,6 +673,7 @@ class SeccompSandbox:
                 syscall = self._get_syscall_number(name)
                 if syscall >= 0:
                     self._rule_add(context, syscall)
+            self._deny_non_unix_socketpairs(context)
             self._load(context)
         finally:
             self.libseccomp.seccomp_release(context)
@@ -785,6 +801,8 @@ class SeccompSandbox:
                     syscall = self._get_syscall_number(name)
                     if syscall >= 0:
                         self._rule_add(context, syscall)
+            if block_sockets:
+                self._deny_non_unix_socketpairs(context)
             self._load(context)
         finally:
             self.libseccomp.seccomp_release(context)

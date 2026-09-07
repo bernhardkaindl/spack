@@ -157,6 +157,7 @@ COREUTILS_UTIL_PROGRAMS = (
     "env",
     "expr",
     "id",  # font-util
+    "mktemp",  # seen in openblas build log (build completes without it)
     "pwd",
     "sort",  # pkgconf, berkeley-db
     "tr",
