@@ -49,6 +49,13 @@ The user interface is a worker option for the existing installer, not a new comm
 Build-phase confinement is a later, separate milestone.
 Compiler selection and build-tool access are recorded now, but must not delay staging integration.
 
+When build-phase confinement is enabled, Spack enters a private user and mount namespace before applying Landlock.
+The namespace maps the invoking user's numeric UID and GID to the same values, so programs do not mistake the unprivileged worker for UID 0.
+It bind-mounts an empty stage-owned directory over ``/usr/share/aclocal`` unless the concrete spec has an external ``autoconf`` dependency.
+This prevents sandboxed builds from scanning host Autoconf macros while preserving the host macro directory for a host-provided Autoconf.
+When unprivileged user and mount namespaces are unavailable, Spack warns and retains the existing Landlock behavior instead of failing unrelated builds.
+Other namespace or mount setup failures fail the build before recipe-controlled build phases run.
+
 Trust Boundary
 --------------
 
@@ -206,13 +213,13 @@ Query each selected driver for subordinate programs and plugin files.
 Do not grant compiler directories wholesale.
 The Linux system-tool baseline is derived from real package builds and allows tools only as individual resolved paths.
 It includes ``tar`` for self-extracting installers that unpack payloads through the host archive tool.
-Its fixed host reads include ``/lib``, ``/lib64``, ``/usr/lib``, ``/usr/lib64``, dynamic-loader configuration, ``/proc/cpuinfo``, distribution and MIME metadata, and ``/bin/sh``.
-System compilers do not receive a recursive ``/usr/include`` grant.
-The trusted, shipped ``share/spack/sandbox/linux-header-policy.yaml`` file lists individual glibc headers and glibc and Linux UAPI subdirectories relative to the system include root.
+Its fixed host reads are ``/lib``, ``/lib64``, ``/usr/lib``, ``/usr/lib64``, dynamic-loader configuration, ``/proc/cpuinfo``, distribution and MIME metadata, and ``/bin/sh``.
+When a selected compiler resolves below ``/usr``, the worker loads the versioned immutable ``share/spack/sandbox/linux-header-policy.yaml`` file before confinement.
+It grants only the listed glibc and Linux UAPI files and directories that exist on the host, their target-specific equivalents, the selected compiler's internal include directories, and one compatible libstdc++ header tree.
 The listed glibc-compatible files include ``crypt.h`` because Perl requires the libxcrypt interface while bootstrapping, and making libxcrypt a build dependency would introduce a dependency cycle.
-Spack expands target-specific entries using the GCC installation tuple reported by selected compiler drivers and grants only one compatible libstdc++ version.
-Missing policy paths are ignored, so the same immutable policy supports different glibc-based Linux distribution layouts without querying ``dpkg``, RPM, APK, or another package manager at runtime.
-Missing, malformed, or unsupported policy data fails sandbox setup instead of restoring broad header access.
+It never grants the ``/usr/include`` parent.
+The runtime policy uses compiler-reported paths and filesystem presence checks without querying a distribution package manager.
+For non-GCC C++ compilers, the policy selects the newest installed libstdc++ version at or below its compatibility ceiling and masks competing GCC installation candidates in the existing private mount namespace.
 Every added tool or path requires a focused test demonstrating why it is needed.
 
 * [ ] Review why the generic compiler-wrapper ``cpp`` alias dispatches to the host-default preprocessor instead of the compiler selected by ``SPACK_CC``.
@@ -365,7 +372,8 @@ Keep this evidence when moving capabilities into package-scoped YAML whitelists 
      - compile and link
      - ``cc1``, ``cc1plus``, ``f951``, ``collect2``, ``lto1``, ``lto-wrapper``,
        ``cpp``, ``as``, ``ld``, ``ar``, ``nm``, ``ranlib``, ``strip``,
-       ``liblto_plugin.so``, and ``/usr/include``
+       ``liblto_plugin.so``, explicit libc and Linux UAPI header paths, compiler-internal headers,
+       and one compatible libstdc++ header tree
    * - ``rust`` and other nested build tools
      - launch compiler and linker subprocesses
      - anonymous Unix ``socketpair`` IPC for child-launch error reporting; pathname-based Unix
