@@ -192,6 +192,7 @@ It receives the concrete spec and prepared stage and prefix; it does not change 
 Read access includes non-external dependency prefixes, the selected package directory, Spack runtime and sbang resources, selected loader files, and selected compiler tools.
 Write access is limited to the stage, exact selected prefix, necessary temporary space, and explicit trusted configuration.
 The build worker sets ``TMPDIR``, ``TMP``, and ``TEMP`` to ``stage/spack-src`` before confinement.
+The trusted installer grants read and write access to the exact GNU Make jobserver FIFO passed to the build worker without granting its parent directory.
 Package-specific installers create that child directory and may use it for extraction.
 The recursive stage write rule permits this without pre-creating a recipe-owned directory.
 The parent derives capabilities from the concrete spec and trusted configuration.
@@ -240,6 +241,7 @@ Acceptance checks:
 * [ ] selected C, C++, and Fortran compilers work with reported front ends, assembler, linker, archive tools, and plugins;
 * [ ] bare reported names resolve through both wrapper PATH and host default PATH;
 * [ ] core utilities work only at their approved resolved paths;
+* [x] recursive GNU Make processes can open the exact trusted jobserver FIFO under confinement;
 * [ ] unselected compilers, arbitrary host binaries, sibling prefixes, and the install-prefix parent remain inaccessible; and
 * [ ] logs, hooks, metadata archiving, and prefix commit retain current behavior.
 * [ ] learning is disabled by default, validates traced executable paths in the trusted parent, and never grants from log text alone;

@@ -23,7 +23,7 @@ import tty
 import warnings
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
-from typing import Callable, MutableMapping, Optional, Tuple
+from typing import Callable, List, MutableMapping, Optional, Tuple
 
 import spack.spec
 import spack.util.tty
@@ -263,6 +263,9 @@ class FifoMakeflags(Makeflags):
     def apply(self, env: MutableMapping[str, str]) -> None:
         env["MAKEFLAGS"] = f" -j{self.num_jobs} --jobserver-auth=fifo:{self.fifo_path}"
 
+    def sandbox_paths(self) -> List[str]:
+        return [self.fifo_path]
+
 
 class PipeMakeflags(Makeflags):
     """Compatibility wrapper for old gmake that requires a pipe-based jobserver.
@@ -287,6 +290,9 @@ class PipeMakeflags(Makeflags):
         os.set_inheritable(w, True)
         # passing -jN here would make old gmake ignore the jobserver
         env["MAKEFLAGS"] = f" -j {self.flag}={r},{w}"
+
+    def sandbox_paths(self) -> List[str]:
+        return [self.fifo_path]
 
 
 class PosixJobServer(JobServerBase):
