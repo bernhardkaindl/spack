@@ -81,6 +81,12 @@ OVERWRITE_BACKUP_SUFFIX = ".old"
 #: Suffix for temporary cleanup during failed install
 OVERWRITE_GARBAGE_SUFFIX = ".garbage"
 
+#: Temporary compatibility destinations required for Cargo dependency downloads.
+DEFAULT_BUILD_NETWORK_DESTINATIONS: Tuple[str, ...] = (
+    "https://index.crates.io:443",
+    "https://static.crates.io:443",
+)
+
 #: Host paths required by dynamically linked build tools at runtime.
 #: Package-specific provenance is documented in ``sandbox/install-worker.rst``.
 HOST_RUNTIME_READ_PATHS = (
@@ -1288,7 +1294,10 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
     network_attempts: List[str] = []
     if config.get("enable", False) and not config.get("allow_network", False):
         learning = spack.install_worker.learning.enabled(config)
-        destinations = spack.install_worker.learning.matching_network_destinations(spec, config)
+        destinations = list(DEFAULT_BUILD_NETWORK_DESTINATIONS)
+        destinations.extend(
+            spack.install_worker.learning.matching_network_destinations(spec, config)
+        )
         if learning or destinations:
             policy = (
                 spack.util.proxy.DestinationPolicy.allow_any()

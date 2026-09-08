@@ -468,7 +468,7 @@ def test_connect_supervisor_duplicates_descendant_socket(monkeypatch):
     listener.listen()
     worker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     worker_fd = worker_socket.fileno()
-    seccomp = _FakeSeccomp(_notification(pid=456, target_fd=worker_fd))
+    seccomp = _FakeSeccomp(_notification(pid=457, target_fd=worker_fd))
     opened = []
     duplicated = []
     monkeypatch.setattr(
@@ -489,6 +489,7 @@ def test_connect_supervisor_duplicates_descendant_socket(monkeypatch):
         seccomp=cast(Any, seccomp),
         duplicate_fd=duplicate,
         thread_group_id=lambda thread_id, is_valid: 123,
+        task_process_id=lambda thread_id, is_valid: 456,
     )
     try:
         supervisor.handle_once()
