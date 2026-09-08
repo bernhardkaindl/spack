@@ -203,13 +203,14 @@ def _permitted_gcc_installation(compiler_path: str, compiler_spec, policy: dict)
     reported = _gcc_installation(compiler_path)
     if reported is None:
         return None
-    if compiler_spec.name == "gcc":
-        return reported
     installations = _versioned_directories_by_major(reported.parent)
-    maximum_major = policy["libstdcxx"]["maximum_major_for_non_gcc"]
-    safe_majors = [major for major in installations if major <= maximum_major]
-    permitted_major = max(safe_majors) if safe_majors else _major_version(reported.name)
-    candidates = installations.get(permitted_major, [])
+    if compiler_spec.name == "gcc":
+        candidates = [reported]
+    else:
+        maximum_major = policy["libstdcxx"]["maximum_major_for_non_gcc"]
+        safe_majors = [major for major in installations if major <= maximum_major]
+        permitted_major = max(safe_majors) if safe_majors else _major_version(reported.name)
+        candidates = installations.get(permitted_major, [])
     if not candidates:
         return None
     header_root = Path(policy["system_include_root"]) / "c++"
@@ -255,13 +256,16 @@ def system_compiler_header_paths(
         installation = _gcc_installation(compiler_path)
         if installation is not None:
             targets.add(installation.parent.name)
-    target_values = (
-        policy["glibc"]["target_files"]
-        + policy["glibc"]["target_directories"]
-        + policy["linux"]["target_directories"]
-    )
     for target in targets:
-        paths.extend(_policy_paths(include_root / target, target_values))
+        target_root = include_root / target
+        paths.extend(
+            _policy_paths(
+                target_root,
+                policy["glibc"]["target_files"]
+                + policy["glibc"]["target_directories"]
+                + policy["linux"]["target_directories"],
+            )
+        )
 
     for language, compiler_path, compiler_spec in system_selected:
         if language != "cxx":
@@ -280,6 +284,46 @@ def system_compiler_header_paths(
             ]
         )
     return list(dict.fromkeys(paths))
+
+
+def gcc_installation_dirs_to_mask(
+    spec: spack.spec.Spec, policy: Optional[dict] = None
+) -> List[str]:
+    """Hide system GCC installations other than the one permitted for selected C++."""
+    policy = policy if policy is not None else _load_linux_header_policy()
+    selected = _selected_compilers(spec)
+    required_installations = {
+        installation
+        for _language, compiler_path, compiler_spec in selected
+        for installation in [_gcc_installation(compiler_path)]
+        if compiler_spec.name == "gcc" and installation is not None
+    }
+    for language, compiler_path, compiler_spec in selected:
+        if language != "cxx" or not str(Path(compiler_path).resolve()).startswith("/usr/"):
+            continue
+        permitted = _permitted_gcc_installation(compiler_path, compiler_spec, policy)
+        if permitted is None:
+            return []
+        return [
+            str(path)
+            for paths in _versioned_directories_by_major(permitted.parent).values()
+            for path in paths
+            if path != permitted and path not in required_installations
+        ]
+    return []
+
+
+def default_hide_as_empty_dirs(spec: spack.spec.Spec) -> List[str]:
+    """Return host directories hidden as empty by default for this build.
+
+    Skipped when ``autoconf`` is an external dependency, since a host autoconf legitimately
+    relies on its own system macro directory.
+    """
+    hidden_dirs = []
+    if not any(dep.name == "autoconf" and dep.external for dep in spec.traverse(root=False)):
+        hidden_dirs.append("/usr/share/aclocal")
+    hidden_dirs.extend(gcc_installation_dirs_to_mask(spec))
+    return hidden_dirs
 
 
 #: Host paths required by dynamically linked build tools at runtime.
@@ -890,6 +934,11 @@ def worker_function(
         return
 
     global_state.restore()
+    sandbox_config = spack.config.CONFIG.get("config:sandbox", {})
+    mount_namespace_ready = False
+    if sandbox_config.get("enable", False):
+        hidden_dirs = default_hide_as_empty_dirs(spec)
+        mount_namespace_ready = spack.sandbox.prepare_empty_directory_masking(hidden_dirs)
 
     if sys.platform != "win32":
         # Isolate the process group to shield against Ctrl+C and enable safe killpg() cleanup. In
@@ -948,7 +997,7 @@ def worker_function(
     exit_code = ExitCode.SUCCESS
 
     try:
-        _install(request, state_stream, spack.store.STORE, makeflags)
+        _install(request, state_stream, spack.store.STORE, makeflags, mount_namespace_ready)
     except spack.error.StopPhase:
         exit_code = ExitCode.STOPPED_AT_PHASE
     except ProcessError as e:
@@ -1237,11 +1286,25 @@ def _enable_sandbox(
     stage_path: str,
     proxy_url: Optional[str] = None,
     makeflags: Optional[Makeflags] = None,
+    mount_namespace_ready: bool = False,
 ) -> SandboxListeners:
     if not config.get("enable", False):
         return SandboxListeners(None, None)
 
     spack.sandbox.set_build_worker_rlimits()
+    hidden_dirs = default_hide_as_empty_dirs(spec)
+    try:
+        masked_dirs = spack.sandbox.hide_directories_as_empty(
+            hidden_dirs, stage_path, namespace_ready=mount_namespace_ready
+        )
+    except OSError as e:
+        raise spack.error.InstallError(
+            f"Cannot mask host directories in build sandbox: {e}"
+        ) from e
+    if hidden_dirs and not masked_dirs:
+        spack.util.tty.warn(
+            "Build sandbox could not mask host directories; kernel namespaces unavailable"
+        )
     try:
         sandbox = spack.sandbox.get_sandbox()
     except spack.sandbox.SandboxError as e:
@@ -1304,6 +1367,9 @@ def _enable_sandbox(
 
     for path in HOST_RUNTIME_READ_PATHS:
         sandbox.allow_read(path)
+    if masked_dirs:
+        for path in hidden_dirs:
+            sandbox.allow_read(path)
     sandbox.allow_read(Path("/bin/sh"))
     allow_compiler_paths(sandbox, spec)
     allow_git_support_paths(sandbox)
@@ -1366,6 +1432,7 @@ def _install(
     state_stream: io.TextIOWrapper,
     store: spack.store.Store,
     makeflags: Makeflags,
+    mount_namespace_ready: bool = False,
 ) -> None:
     """Install a spec from build cache or source."""
     spec, explicit, install_policy = request.spec, request.explicit, request.install_policy
@@ -1468,6 +1535,7 @@ def _install(
             stage.path,
             request.network_proxy_url,
             makeflags,
+            mount_namespace_ready,
         )
         if listeners.exec_fd is not None:
             send_exec_listener(listeners.exec_fd, state_stream)
