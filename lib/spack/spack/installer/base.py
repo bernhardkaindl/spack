@@ -14,7 +14,7 @@ import socket
 import sys
 import threading
 from multiprocessing.connection import Connection
-from typing import Callable, MutableMapping, NamedTuple, Optional, Union
+from typing import Callable, List, MutableMapping, NamedTuple, Optional, Union
 
 from spack.vendor.typing_extensions import Literal
 
@@ -215,6 +215,10 @@ class Makeflags(abc.ABC):
     @abc.abstractmethod
     def apply(self, env: MutableMapping[str, str]) -> None:
         """Set MAKEFLAGS in the given environment, if there is anything to set."""
+
+    def sandbox_paths(self) -> List[str]:
+        """Paths that must remain accessible after the build sandbox is enabled."""
+        return []
 
 
 class NoMakeflags(Makeflags):

@@ -23,6 +23,7 @@ import spack.caches
 import spack.compilers.config
 import spack.concretize
 import spack.installer.build
+import spack.installer.posix
 import spack.repo
 import spack.sandbox
 import spack.spec
@@ -583,7 +584,11 @@ def test_enable_sandbox_paths(
     if allow_network is not None:
         config["allow_network"] = allow_network
 
-    _enable_sandbox(config, spec, str(stage_path))
+    jobserver_fifo = tmp_path / "jobserver" / "jobserver_fifo"
+    jobserver_fifo.parent.mkdir()
+    os.mkfifo(str(jobserver_fifo))
+    makeflags = spack.installer.posix.FifoMakeflags(str(jobserver_fifo), 4)
+    _enable_sandbox(config, spec, str(stage_path), makeflags=makeflags)
 
     allow_read_resolved = [c[1] for c in mock_sandbox.read_calls]
     for dep in spec.traverse(root=False):
@@ -608,6 +613,7 @@ def test_enable_sandbox_paths(
     assert stage_path.resolve() in allow_write_resolved
     assert pathlib.Path(spec.prefix).resolve() in allow_write_resolved
     assert custom_write.resolve() in allow_write_resolved
+    assert jobserver_fifo.resolve() in allow_write_resolved
     tmpdir = pathlib.Path(tempfile.gettempdir()).resolve()
     assert tmpdir.parent in allow_write_resolved
     assert os.environ["TMPDIR"] == str(tmpdir)
