@@ -191,7 +191,9 @@ It receives the concrete spec and prepared stage and prefix; it does not change 
 
 Read access includes non-external dependency prefixes, the selected package directory, Spack runtime and sbang resources, selected loader files, and selected compiler tools.
 Write access is limited to the stage, exact selected prefix, necessary temporary space, and explicit trusted configuration.
-The build worker sets ``TMPDIR``, ``TMP``, and ``TEMP`` to ``stage/spack-src`` before confinement.
+The build worker creates ``stage/spack-build-tmp`` and sets ``TMPDIR``, ``TMP``, and ``TEMP`` to it before confinement.
+This sibling directory keeps temporary entries out of ``stage/spack-src``, where build tools may treat them as source files or packages.
+The worker preserves inherited ``JAVA_TOOL_OPTIONS`` and appends ``-Djava.io.tmpdir=stage/spack-build-tmp`` because Java does not use those environment variables for its temporary directory.
 The trusted installer grants read and write access to the exact GNU Make jobserver FIFO passed to the build worker without granting its parent directory.
 Package-specific installers create that child directory and may use it for extraction.
 The recursive stage write rule permits this without pre-creating a recipe-owned directory.
