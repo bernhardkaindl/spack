@@ -174,12 +174,14 @@ BUILD_UTILITIES_PROGRAMS = (
     "diff",  # pkgconf, berkeley-db
     "egrep",  # perl
     "fc-cache",  # font-util
+    "fgrep",  # bazel
     "file",  # pkgconf, berkeley-db
     "find",
     "git",
     "gzip",  # font-util, git
     "grep",
     "hexdump",
+    "md5sum",  # bazel
     "ldd",
     "tar",  # self-extracting installers such as CUDA
     "tbl",  # ncurses
