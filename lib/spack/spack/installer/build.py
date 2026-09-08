@@ -1200,7 +1200,13 @@ def _enable_sandbox(
 
     # POSIX prescribes /tmp and /dev/null are present. In the future we can consider setting
     # TMPPATH to a sibling of the stage path to isolate concurrent builds better.
-    sandbox.allow_write(tempfile.gettempdir())
+    # glibc’s tmpfile() does not consult TMPDIR and does not have a runtime override.
+    # We may use LD_PRELOAD to entercept tmpfile() but bypassed by static binaries
+    # and direcy syscalls.
+    # We might use Seccomp user notification around openat(..., O_TMPFILE, ...):
+    # theoretically capable of emulation or FD injection. Complex, but should work if done right.
+    # A private mount namespace would be safest, but requires that the host supports them.
+    sandbox.allow_write("/tmp")  # Required for tmpfile()
     sandbox.allow_write(os.devnull)
 
     # Python multiprocessing requires /dev/shm for POSIX semaphore support.
