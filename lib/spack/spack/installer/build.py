@@ -1018,11 +1018,17 @@ def _enable_sandbox(
 
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
-    build_tmpdir = os.path.join(stage_path, "spack-src")
+    build_tmpdir = os.path.join(stage_path, "spack-build-tmp")
+    os.makedirs(build_tmpdir, exist_ok=True)
     os.environ["TMPDIR"] = build_tmpdir
     os.environ["TMP"] = build_tmpdir
     os.environ["TEMP"] = build_tmpdir
     tempfile.tempdir = build_tmpdir
+    java_tmpdir = f"-Djava.io.tmpdir={build_tmpdir}"
+    inherited_java_options = os.environ.get("JAVA_TOOL_OPTIONS")
+    os.environ["JAVA_TOOL_OPTIONS"] = (
+        f"{inherited_java_options} {java_tmpdir}" if inherited_java_options else java_tmpdir
+    )
     os.environ["XDG_CACHE_HOME"] = os.path.join(stage_path, ".cache")  # font-util
 
     # POSIX prescribes /tmp and /dev/null are present. In the future we can consider setting

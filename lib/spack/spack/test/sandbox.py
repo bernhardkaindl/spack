@@ -588,6 +588,7 @@ def test_enable_sandbox_paths(
     jobserver_fifo.parent.mkdir()
     os.mkfifo(str(jobserver_fifo))
     makeflags = spack.installer.posix.FifoMakeflags(str(jobserver_fifo), 4)
+    monkeypatch.setenv("JAVA_TOOL_OPTIONS", "-Xmx2g")
     _enable_sandbox(config, spec, str(stage_path), makeflags=makeflags)
 
     allow_read_resolved = [c[1] for c in mock_sandbox.read_calls]
@@ -615,12 +616,15 @@ def test_enable_sandbox_paths(
     assert custom_write.resolve() in allow_write_resolved
     assert jobserver_fifo.resolve() in allow_write_resolved
     tmpdir = pathlib.Path(tempfile.gettempdir()).resolve()
+    assert tmpdir == (stage_path / "spack-build-tmp").resolve()
+    assert tmpdir.is_dir()
     assert tmpdir.parent in allow_write_resolved
     assert os.environ["TMPDIR"] == str(tmpdir)
     assert os.environ["TMP"] == str(tmpdir)
     assert os.environ["TEMP"] == str(tmpdir)
     assert tempfile.gettempdir() == str(tmpdir)
     assert os.environ["XDG_CACHE_HOME"] == str(stage_path / ".cache")
+    assert os.environ["JAVA_TOOL_OPTIONS"] == f"-Xmx2g -Djava.io.tmpdir={tmpdir}"
 
     assert mock_sandbox.apply_calls == [(expected_block_network, False, False, False)]
     assert build_rlimits == [True]
