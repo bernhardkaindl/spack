@@ -79,6 +79,8 @@ Architecture Constraints
 * Do not allow a worker with unrestricted ``connect``.
   Worker use is automatic when supported.
   When support is unavailable, the trusted direct path is allowed only when ``config:sandbox:allow_fallback`` is ``true``; otherwise the command fails with capability diagnostics.
+  Until the bootstrap branch accepts their schema, ``allow_fallback``, ``concretizer``, ``learning``, and ``whitelists`` are omitted from shipped defaults and bootstrap ``config.yaml`` propagation.
+  Their strict internal defaults remain active when the options are absent.
 * Put new worker protocol, launch, policy, and capability code in dedicated install-worker modules with dedicated tests.
   Existing command and installer files receive only small integration adapters.
 
