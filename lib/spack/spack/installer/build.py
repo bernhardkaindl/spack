@@ -936,7 +936,7 @@ def worker_function(
     exit_code = ExitCode.SUCCESS
 
     try:
-        _install(request, state_stream, spack.store.STORE)
+        _install(request, state_stream, spack.store.STORE, makeflags)
     except spack.error.StopPhase:
         exit_code = ExitCode.STOPPED_AT_PHASE
     except ProcessError as e:
@@ -1159,7 +1159,11 @@ def _configure_build_proxy(proxy_url: str) -> None:
 
 
 def _enable_sandbox(
-    config: dict, spec: spack.spec.Spec, stage_path: str, proxy_url: Optional[str] = None
+    config: dict,
+    spec: spack.spec.Spec,
+    stage_path: str,
+    proxy_url: Optional[str] = None,
+    makeflags: Optional[Makeflags] = None,
 ) -> SandboxListeners:
     if not config.get("enable", False):
         return SandboxListeners(None, None)
@@ -1256,7 +1260,10 @@ def _rewire_no_db(
 
 
 def _install(
-    request: BuildRequest, state_stream: io.TextIOWrapper, store: spack.store.Store
+    request: BuildRequest,
+    state_stream: io.TextIOWrapper,
+    store: spack.store.Store,
+    makeflags: Makeflags,
 ) -> None:
     """Install a spec from build cache or source."""
     spec, explicit, install_policy = request.spec, request.explicit, request.install_policy
@@ -1358,6 +1365,7 @@ def _install(
             spec,
             stage.path,
             request.network_proxy_url,
+            makeflags,
         )
         if listeners.exec_fd is not None:
             send_exec_listener(listeners.exec_fd, state_stream)
