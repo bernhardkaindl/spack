@@ -14,7 +14,7 @@ import re
 import sys
 import time
 from collections import deque
-from typing import Callable, Deque, Dict, Generator, List, NamedTuple, Optional, TextIO, Union, cast
+from typing import Callable, Deque, Dict, Generator, List, NamedTuple, Optional, Set, TextIO, Union
 
 import spack.config
 import spack.util.tty.color
@@ -216,6 +216,7 @@ class TerminalUI(InstallerUI):
         self.completed = 0
         self.builds: Dict[str, BuildInfo] = {}
         self.finished_builds: List[BuildInfo] = []
+        self.persisted_failures: Set[str] = set()
         self.spinner_index = 0
         self.dirty = True  # Start dirty to draw initial state
         self.active_area_rows = 0
@@ -294,6 +295,7 @@ class TerminalUI(InstallerUI):
         """Remove a build from the display (e.g. after a binary cache miss before retry)."""
         self.builds.pop(build_id, None)
         self.log_history.pop(build_id, None)
+        self.persisted_failures.discard(build_id)
         if self.tracked_build_id == build_id:
             self.log_stream_buffer = b""
             self.log_ends_with_newline = True
@@ -600,6 +602,7 @@ class TerminalUI(InstallerUI):
             # After resize, active_area_rows is invalidated due to possible line wrapping. Set to
             # 0 to force newlines instead of cursor movement.
             self.active_area_rows = 0
+
         max_width, max_height = self.terminal_size
 
         # First flush the finished builds. These are "persisted" in terminal history.
@@ -610,6 +613,20 @@ class TerminalUI(InstallerUI):
             self.finished_builds.clear()
             # Finished builds can span multiple lines, overlapping our "active area", invalidating
             # active_area_rows. Set to 0 to force newlines instead of cursor movement.
+            self.active_area_rows = 0
+
+        # Persist failed rows at full width, like successful rows, but retain their build records
+        # for log-summary navigation.
+        failures = [
+            build
+            for build in self.builds.values()
+            if build.state == "failed" and build.id not in self.persisted_failures
+        ]
+        if failures:
+            for build in failures:
+                self._render_build(build, buffer, now=now)
+                self._println(buffer, force_newline=True)
+                self.persisted_failures.add(build.id)
             self.active_area_rows = 0
 
         # Then a header followed by the active builds. This is the "mutable" part of the display.
@@ -639,11 +656,11 @@ class TerminalUI(InstallerUI):
         if self.blocked and not has_unfinished:
             self._println(buffer, "Waiting for other Spack install process...")
 
-        displayed_builds = (
-            [b for b in self.builds.values() if self._is_displayed(b)]
-            if self.search_term
-            else self.builds.values()
-        )
+        displayed_builds = [
+            build
+            for build in self.builds.values()
+            if build.state != "failed" and (not self.search_term or self._is_displayed(build))
+        ]
         len_builds = len(displayed_builds)
 
         # Truncate if we have more builds than fit on the screen. In that case we have to reserve
@@ -797,6 +814,8 @@ class TerminalUI(InstallerUI):
     def _redraw_overview_with_log_history(self, build_id: str) -> None:
         if self.headless or not self.is_tty:
             return
+        # The full-screen redraw removes persisted rows, so emit them again below the log.
+        self.persisted_failures.clear()
         self.log_stream_buffer = b""
         history = self.log_history.get(build_id, ())
         history_rows = sum(chunk.count(b"\n") for chunk in history)
@@ -888,9 +907,7 @@ class TerminalUI(InstallerUI):
         else:
             yield f" {build_info.state}"
 
-        progress = (
-            build_info.progress if build_info.state not in ("finished", "failed") else None
-        )
+        progress = build_info.progress if build_info.state not in ("finished", "failed") else None
 
         # Duration and progress percentage
         elapsed = (

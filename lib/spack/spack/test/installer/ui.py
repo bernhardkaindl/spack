@@ -969,8 +969,7 @@ class TestLogFollowing:
         [build_id] = add_mock_builds(tui, 1)
 
         tui.on_log_output(
-            build_id,
-            b"[51 / 100] Compiling dir/file.cc; 42s local ... (16 actions, 15 running)\n",
+            build_id, b"[51 / 100] Compiling dir/file.cc; 42s local ... (16 actions, 15 running)\n"
         )
 
         assert fake_stdout.getvalue() == ""
@@ -1018,14 +1017,10 @@ class TestLogFollowing:
         [build_id] = add_mock_builds(tui, 1)
 
         tui.on_log_output(build_id, b"CMake message\n")
-        assert tui.builds[build_id].progress == inst.BuildProgress(
-            None, "CMake message"
-        )
+        assert tui.builds[build_id].progress == inst.BuildProgress(None, "CMake message")
 
         tui.on_log_output(build_id, b"-- Checking\n")
-        assert tui.builds[build_id].progress == inst.BuildProgress(
-            None, "Checking"
-        )
+        assert tui.builds[build_id].progress == inst.BuildProgress(None, "Checking")
 
         tui.on_log_output(build_id, b"[ 99%] Linking C executable timeit-target\n")
         assert tui.builds[build_id].progress == inst.BuildProgress(
@@ -1869,6 +1864,62 @@ class TestLineRendering:
         tui.on_state_changed("pkg", "failed")
         assert "failed: /tmp/pkg.log" in fake_stdout.getvalue()
 
+    def test_live_overview_failed_lines_show_log_paths(self):
+        """The live overview persists full failed rows above running rows."""
+        tui, fake_time, fake_stdout = create_tui(total=4, terminal_cols=40, color=False)
+        on_build_added(tui, "rwn56m6", name="py-boost-histogram", version="1.7.1")
+        on_build_added(
+            tui,
+            "yl2vfsh",
+            name="yasm",
+            version="1.3.0",
+            log_path="/tmp/spack-stage-yasm-yl2vfsh/spack-build-out.txt",
+        )
+        on_build_added(
+            tui,
+            "xvgpoe4",
+            name="davix",
+            version="0.8.10",
+            log_path="/tmp/spack-stage-davix-xvgpoe4/spack-build-out.txt",
+        )
+        on_build_added(tui, "rlfantf", name="rust", version="1.97.1")
+        tui.on_state_changed("rwn56m6", "finished")
+        fake_time[0] = inst.CLEANUP_TIMEOUT + 0.1
+        tui.on_state_changed("yl2vfsh", "failed")
+        tui.on_state_changed("xvgpoe4", "failed")
+        tui.on_state_changed("rlfantf", "building")
+
+        tui.render()
+
+        output = fake_stdout.getvalue()
+        yasm_line = next(line for line in output.splitlines() if "yasm@1.3.0" in line)
+        davix_line = next(line for line in output.splitlines() if "davix@0.8.10" in line)
+        assert "failed: /tmp/spack-stage-yasm-yl2vfsh/spack-build-out.txt" in yasm_line
+        assert "failed: /tmp/spack-stage-davix-xvgpoe4/spack-build-out.txt" in davix_line
+
+        assert output.index("py-boost-histogram@1.7.1") < output.index("yasm@1.3.0")
+        assert output.index("yasm@1.3.0") < output.index("davix@0.8.10")
+        assert output.index("davix@0.8.10") < output.index("rust@1.97.1")
+
+        fake_stdout.clear()
+        fake_time[0] += inst.SPINNER_INTERVAL
+        tui.render()
+        assert "yasm@1.3.0" not in fake_stdout.getvalue()
+        assert "davix@0.8.10" not in fake_stdout.getvalue()
+
+    def test_failed_rows_reappear_after_switching_from_verbose_mode(self):
+        """Failed rows remain visible when returning to the overview with ``v``."""
+        tui, _, fake_stdout = create_tui(total=1, verbose=True, color=False)
+        [build_id] = add_mock_builds(tui, 1)
+        tui.on_state_changed(build_id, "failed")
+        tui.render()
+        fake_stdout.clear()
+
+        tui.on_input("v")
+        output = fake_stdout.getvalue()
+
+        assert f"[x] {build_id[:7]} pkg0@0.0" in output
+
     def test_external_indicator(self):
         """External packages are rendered with the [e] indicator."""
         tui, _, fake_stdout = create_tui(is_tty=False, total=1)
@@ -1898,9 +1949,7 @@ class TestLineRendering:
 
     def test_persisted_finished_line_keeps_prefix_in_narrow_terminal(self):
         """A persisted completed build always shows its install prefix."""
-        tui, fake_time, fake_stdout = create_tui(
-            total=1, terminal_cols=30, color=False
-        )
+        tui, fake_time, fake_stdout = create_tui(total=1, terminal_cols=30, color=False)
         on_build_added(tui, "pkg", prefix="/quite/long/prefix/path")
         tui.on_state_changed("pkg", "finished")
         fake_time.append(inst.CLEANUP_TIMEOUT + 0.1)
