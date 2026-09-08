@@ -200,6 +200,30 @@ def test_config_yaml_is_preserved_during_bootstrap(mutable_config):
     assert spack.config.CONFIG.get("config:test_stage") == expected_dir
 
 
+def test_bootstrap_config_omits_unsupported_sandbox_options(mutable_config):
+    sandbox = {
+        "enable": True,
+        "allow_network": False,
+        "allow_read": ["/read"],
+        "allow_write": ["/write"],
+        "allow_fallback": False,
+        "concretizer": {"max_response_bytes": 1024},
+        "learning": {"enabled": False},
+        "whitelists": {},
+    }
+    mutable_config.set("config:sandbox", sandbox)
+
+    sanitized = spack.bootstrap.config._read_and_sanitize_configuration()
+
+    assert sanitized["config"]["sandbox"] == {
+        "enable": True,
+        "allow_network": False,
+        "allow_read": ["/read"],
+        "allow_write": ["/write"],
+    }
+    assert mutable_config.get("config:sandbox") == sandbox
+
+
 @pytest.mark.regression("26548")
 def test_bootstrap_custom_store_in_environment(mutable_config, tmp_path: pathlib.Path):
     # Test that the custom store in an environment is taken into account
