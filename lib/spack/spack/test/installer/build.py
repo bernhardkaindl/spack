@@ -13,6 +13,7 @@ import spack.install_worker
 import spack.spec
 from spack.installer.base import ExitCode
 from spack.installer.build import (
+    DEFAULT_BUILD_NETWORK_DESTINATIONS,
     OVERWRITE_GARBAGE_SUFFIX,
     BinaryCacheMiss,
     ChildInfo,
@@ -20,6 +21,16 @@ from spack.installer.build import (
     _prefix_pivoter_for_spec,
     _stage_source,
 )
+from spack.util.proxy import DestinationPolicy
+
+
+def test_default_build_network_destinations_only_allow_cargo_downloads():
+    policy = DestinationPolicy.from_urls(DEFAULT_BUILD_NETWORK_DESTINATIONS)
+
+    assert policy.allows("https", "index.crates.io")
+    assert policy.allows("https", "static.crates.io")
+    assert not policy.allows("https", "crates.io")
+    assert not policy.allows("https", "example.com")
 
 
 class StagePackage:

@@ -96,6 +96,12 @@ The current policy grants canonical scheme, host, and port.
 URL paths do not participate in authorization.
 Denied authorities are rejected before DNS.
 
+Sandboxed builds temporarily grant HTTPS access to ``index.crates.io`` for Cargo sparse-registry metadata and ``static.crates.io`` for crate archives.
+The grant does not include ``crates.io`` API access, non-HTTPS ports, or other hosts.
+Redirects require separate authorization.
+Resolved addresses must still be globally routable.
+This compatibility exception supports build systems that download undeclared language dependencies such as ``async-stream``.
+
 The checksum integration permits arbitrary public source authorities.
 This mode centralizes DNS and outbound sockets in the proxy.
 It is not a destination whitelist.
@@ -153,6 +159,7 @@ For each valid notification, the supervisor connects the worker socket to the co
 Worker-controlled memory never selects an Internet destination.
 
 The supervisor duplicates the worker socket with ``pidfd_getfd``.
+For notifications from non-leader threads, it resolves the thread-group leader and opens that process pidfd.
 The duplicate refers to the same underlying socket.
 The supervisor connects it to the local proxy and returns ``0``.
 The original descriptor is connected without executing the original syscall.

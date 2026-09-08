@@ -542,6 +542,7 @@ class ConnectSupervisor:
         seccomp: Optional[SeccompSandbox] = None,
         duplicate_fd: Callable[[int, int], int] = pidfd_getfd,
         thread_group_id: Callable[[int, Callable[[], bool]], Optional[int]] = _thread_group_id,
+        task_process_id: Callable[[int, Callable[[], bool]], Optional[int]] = _thread_group_id,
         executable_logger: Optional[Callable[[str], None]] = None,
     ):
         self.listener_fd = listener_fd
@@ -552,6 +553,7 @@ class ConnectSupervisor:
         self.seccomp = seccomp or SeccompSandbox()
         self.duplicate_fd = duplicate_fd
         self.thread_group_id = thread_group_id
+        self.task_process_id = task_process_id
         self.executable_logger = executable_logger
         self._connect_syscall = self.seccomp._get_syscall_number("connect")
         self._socket_syscall = self.seccomp._get_syscall_number("socket")
@@ -619,7 +621,14 @@ class ConnectSupervisor:
         notification_pidfd = self.pidfd
         try:
             if notification.pid != self.worker_pid:
-                notification_pidfd = pidfd_open(notification.pid)
+                is_valid = lambda: self.seccomp.notification_is_valid(
+                    self.listener_fd, notification.id
+                )
+                process_id = self.task_process_id(notification.pid, is_valid)
+                if process_id is None:
+                    return errno.ESRCH
+                if process_id != self.worker_pid:
+                    notification_pidfd = pidfd_open(process_id)
             duplicated_fd = self.duplicate_fd(notification_pidfd, target_fd)
         except OSError as error:
             return error.errno or errno.EBADF
