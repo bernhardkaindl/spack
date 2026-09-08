@@ -48,6 +48,11 @@ LANDLOCK_RULE_PATH_BENEATH = 1
 LANDLOCK_ACCESS_NET_BIND_TCP = 1 << 0
 LANDLOCK_ACCESS_NET_CONNECT_TCP = 1 << 1
 LANDLOCK_RESTRICT_SELF_TSYNC = 1 << 3
+CLONE_NEWNS = 0x00020000
+CLONE_NEWUSER = 0x10000000
+MS_BIND = 0x00001000
+MS_PRIVATE = 0x00040000
+MS_REC = 0x00004000
 SECCOMP_RET_ALLOW = 0x7FFF0000
 SECCOMP_RET_ERRNO = 0x00050000
 SECCOMP_RET_USER_NOTIF = 0x7FC00000
@@ -267,6 +272,95 @@ def read_process_string(
     if terminator < 0:
         raise OSError(errno.ENAMETOOLONG, "remote string exceeds the byte limit")
     return value[:terminator]
+
+
+def _enter_private_user_mount_namespace(libc) -> None:
+    """Enter a user-owned mount namespace and make its mount propagation private."""
+    user_id, group_id = os.getuid(), os.getgid()
+    _check_syscall(
+        libc.unshare(ctypes.c_int(CLONE_NEWUSER | CLONE_NEWNS)),
+        "unshare(CLONE_NEWUSER | CLONE_NEWNS)",
+    )
+    try:
+        with open("/proc/self/setgroups", "w", encoding="ascii") as stream:
+            stream.write("deny")
+    except OSError as error:
+        if error.errno != errno.ENOENT:
+            raise
+    with open("/proc/self/uid_map", "w", encoding="ascii") as stream:
+        stream.write("0 {0} 1".format(user_id))
+    with open("/proc/self/gid_map", "w", encoding="ascii") as stream:
+        stream.write("0 {0} 1".format(group_id))
+
+    _check_syscall(
+        libc.mount(None, b"/", None, ctypes.c_ulong(MS_REC | MS_PRIVATE), None),
+        "mount(MS_PRIVATE)",
+    )
+
+
+def _private_user_mount_namespace_available(libc) -> bool:
+    """Probe namespace setup in a disposable child before changing the build worker."""
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            _enter_private_user_mount_namespace(libc)
+        except OSError:
+            result = b"0"
+        else:
+            result = b"1"
+        os.write(write_fd, result)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        result = os.read(read_fd, 1)
+        os.waitpid(pid, 0)
+        return result == b"1"
+    finally:
+        os.close(read_fd)
+
+
+def prepare_empty_directory_masking(paths: Iterable[str], libc=None) -> bool:
+    """Enter a private mount namespace before the calling process starts threads."""
+    if not list(paths):
+        return True
+    if platform.system() != "Linux":
+        raise SandboxError("Empty directory masking is only supported on Linux")
+
+    libc = libc if libc is not None else ctypes.CDLL(None, use_errno=True)
+    if not _private_user_mount_namespace_available(libc):
+        return False
+    _enter_private_user_mount_namespace(libc)
+    return True
+
+
+def hide_directories_as_empty(
+    paths: Iterable[str], stage_path: str, namespace_ready: bool = False, libc=None
+) -> bool:
+    """Mask each existing host directory with an empty directory in a private mount namespace."""
+    paths = list(paths)
+    if not paths:
+        return True
+    if not namespace_ready and not prepare_empty_directory_masking(paths, libc=libc):
+        return False
+    libc = libc if libc is not None else ctypes.CDLL(None, use_errno=True)
+    empty_root = os.path.join(stage_path, "spack-empty-host-dirs")
+    os.makedirs(empty_root, exist_ok=True)
+    for index, path in enumerate(paths):
+        if not os.path.isdir(path):
+            continue
+        empty_dir = os.path.join(empty_root, str(index))
+        os.mkdir(empty_dir)
+        _check_syscall(
+            libc.mount(
+                os.fsencode(empty_dir), os.fsencode(path), None, ctypes.c_ulong(MS_BIND), None
+            ),
+            "mount(MS_BIND)",
+        )
+    return True
 
 
 class Sandbox(ABC):

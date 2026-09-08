@@ -22,3 +22,20 @@ This does not grant addressable Unix or external network access: the worker clos
 A real-kernel regression creates an ``AF_UNIX`` ``SOCK_SEQPACKET`` pair, verifies a message round trip, and separately proves that ordinary Unix socket creation still fails.
 Unit tests also verify the exact seccomp comparison that denies every non-``AF_UNIX`` socket-pair domain.
 An isolated native Cargo replay subsequently completed the Rust bootstrap manifest build, confirming that ``rustc``, the generic ``cc`` wrapper, the selected compiler, ``collect2``, and ``rust-lld`` can all launch under the resulting policy.
+
+.. _sandbox-solved-empty-aclocal:
+
+Empty host Autoconf macro directory
+-----------------------------------
+
+``isa-l`` invoked ``aclocal`` with ``-I /usr/share/aclocal`` and failed with ``Permission denied`` because Landlock correctly denied the host directory.
+Returning ``ENOENT`` is not compatible with tools that expect an existing macro search directory.
+The build worker now enters a private user and mount namespace before starting worker threads, then bind-mounts an empty stage-owned directory over ``/usr/share/aclocal`` before Landlock is applied.
+The build observes an empty directory instead of a ``-EPERM`` failure and cannot use host Autoconf macros.
+The mask is skipped when the concrete DAG provides an external ``autoconf`` dependency, because a host Autoconf legitimately uses its own system macro directory.
+
+This Linux-specific workaround demonstrates masking selected host directories as empty without granting them access or returning ``-EPERM``.
+It requires unprivileged user and mount namespaces; when they are unavailable, Spack warns and preserves the existing Landlock behavior.
+A focused real-kernel test verifies that the bind mount appears empty, and ``isa-l`` completes with the mask enabled.
+
+The preferred solution is the package-level change in `spack/spack-packages#6277 <https://github.com/spack/spack-packages/pull/6277>`_, which avoids this host path and does not require Linux mount namespaces.

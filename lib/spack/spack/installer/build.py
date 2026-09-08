@@ -87,6 +87,19 @@ DEFAULT_BUILD_NETWORK_DESTINATIONS: Tuple[str, ...] = (
     "https://static.crates.io:443",
 )
 
+
+def default_hide_as_empty_dirs(spec: spack.spec.Spec) -> List[str]:
+    """Return host directories hidden as empty by default for this build.
+
+    Skipped when ``autoconf`` is an external dependency, since a host autoconf legitimately
+    relies on its own system macro directory.
+    """
+    for dep in spec.traverse(root=False):
+        if dep.name == "autoconf" and dep.external:
+            return []
+    return ["/usr/share/aclocal"]
+
+
 #: Host paths required by dynamically linked build tools at runtime.
 #: Package-specific provenance is documented in ``sandbox/install-worker.rst``.
 HOST_RUNTIME_READ_PATHS = (
@@ -697,6 +710,11 @@ def worker_function(
         return
 
     global_state.restore()
+    sandbox_config = spack.config.CONFIG.get("config:sandbox", {})
+    hidden_dirs = default_hide_as_empty_dirs(spec)
+    mount_namespace_ready = False
+    if sandbox_config.get("enable", False):
+        mount_namespace_ready = spack.sandbox.prepare_empty_directory_masking(hidden_dirs)
 
     if sys.platform != "win32":
         # Isolate the process group to shield against Ctrl+C and enable safe killpg() cleanup. In
@@ -755,7 +773,7 @@ def worker_function(
     exit_code = ExitCode.SUCCESS
 
     try:
-        _install(request, state_stream, spack.store.STORE, makeflags)
+        _install(request, state_stream, spack.store.STORE, makeflags, mount_namespace_ready)
     except spack.error.StopPhase:
         exit_code = ExitCode.STOPPED_AT_PHASE
     except ProcessError as e:
@@ -1006,11 +1024,25 @@ def _enable_sandbox(
     stage_path: str,
     proxy_url: Optional[str] = None,
     makeflags: Optional[Makeflags] = None,
+    mount_namespace_ready: bool = False,
 ) -> SandboxListeners:
     if not config.get("enable", False):
         return SandboxListeners(None, None)
 
     spack.sandbox.set_build_worker_rlimits()
+    hidden_dirs = default_hide_as_empty_dirs(spec)
+    try:
+        masked_dirs = spack.sandbox.hide_directories_as_empty(
+            hidden_dirs, stage_path, namespace_ready=mount_namespace_ready
+        )
+    except OSError as e:
+        raise spack.error.InstallError(
+            f"Cannot mask host directories in build sandbox: {e}"
+        ) from e
+    if hidden_dirs and not masked_dirs:
+        spack.util.tty.warn(
+            "Build sandbox could not mask host directories; kernel namespaces unavailable"
+        )
     try:
         sandbox = spack.sandbox.get_sandbox()
     except spack.sandbox.SandboxError as e:
@@ -1066,6 +1098,9 @@ def _enable_sandbox(
 
     for path in HOST_RUNTIME_READ_PATHS:
         sandbox.allow_read(path)
+    if masked_dirs:
+        for path in hidden_dirs:
+            sandbox.allow_read(path)
     sandbox.allow_read(Path("/bin/sh"))
     allow_compiler_paths(sandbox, spec)
     allow_git_support_paths(sandbox)
@@ -1127,6 +1162,7 @@ def _install(
     state_stream: io.TextIOWrapper,
     store: spack.store.Store,
     makeflags: Makeflags,
+    mount_namespace_ready: bool = False,
 ) -> None:
     """Install a spec from build cache or source."""
     spec, explicit, install_policy = request.spec, request.explicit, request.install_policy
@@ -1229,6 +1265,7 @@ def _install(
             stage.path,
             request.network_proxy_url,
             makeflags,
+            mount_namespace_ready,
         )
         if listeners.exec_fd is not None:
             send_exec_listener(listeners.exec_fd, state_stream)

@@ -33,6 +33,70 @@ from spack.util.executable import which_string
 from spack.util.sandbox import run_json_worker
 
 
+def test_default_hide_as_empty_dirs_skips_external_autoconf(monkeypatch):
+    external_autoconf = SimpleNamespace(name="autoconf", external=True)
+    spec = SimpleNamespace(traverse=lambda root=False: [external_autoconf])
+
+    assert spack.installer.build.default_hide_as_empty_dirs(spec) == []
+
+
+def test_default_hide_as_empty_dirs_masks_host_aclocal():
+    spec = SimpleNamespace(traverse=lambda root=False: [])
+
+    assert spack.installer.build.default_hide_as_empty_dirs(spec) == ["/usr/share/aclocal"]
+
+
+def test_hide_directories_as_empty_mounts_empty_directory(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "host-file").touch()
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            masked = spack.sandbox.hide_directories_as_empty([str(target)], str(stage))
+            result = b"1" if masked and list(target.iterdir()) == [] else b"0"
+        except OSError as error:
+            result = "E{0}".format(error.errno).encode("ascii")
+        os.write(write_fd, result)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        result = os.read(read_fd, 16)
+        _, status = os.waitpid(pid, 0)
+    finally:
+        os.close(read_fd)
+    assert os.WIFEXITED(status)
+    if result == b"0":
+        pytest.skip("unprivileged user and mount namespaces are unavailable")
+    assert not result.startswith(b"E")
+    assert result == b"1"
+
+
+def test_hide_directories_as_empty_uses_prepared_namespace(monkeypatch, tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    prepared = []
+    monkeypatch.setattr(
+        spack.sandbox,
+        "prepare_empty_directory_masking",
+        lambda paths, libc=None: prepared.append(list(paths)) or pytest.fail("must not prepare"),
+    )
+    libc = SimpleNamespace(mount=lambda *args: 0)
+
+    assert spack.sandbox.hide_directories_as_empty(
+        [str(target)], str(stage), namespace_ready=True, libc=libc
+    )
+    assert prepared == []
+
+
 def test_exec_notification_reports_path_and_continues():
     parent, child = socket.socketpair()
     executable = sys.executable
@@ -551,6 +615,12 @@ def test_enable_sandbox_paths(
         "allow_compiler_paths",
         lambda sandbox, spec: compiler_specs.append(spec),
     )
+    hidden_dirs = []
+    monkeypatch.setattr(
+        spack.sandbox,
+        "hide_directories_as_empty",
+        lambda paths, stage_path, namespace_ready=False: hidden_dirs.extend(paths) or True,
+    )
 
     spec = spack.concretize.concretize_one("dependent-install")
 
@@ -590,6 +660,8 @@ def test_enable_sandbox_paths(
     makeflags = spack.installer.posix.FifoMakeflags(str(jobserver_fifo), 4)
     monkeypatch.setenv("JAVA_TOOL_OPTIONS", "-Xmx2g")
     _enable_sandbox(config, spec, str(stage_path), makeflags=makeflags)
+
+    assert hidden_dirs == ["/usr/share/aclocal"]
 
     allow_read_resolved = [c[1] for c in mock_sandbox.read_calls]
     for dep in spec.traverse(root=False):
@@ -643,6 +715,7 @@ def test_enable_sandbox_proxy_uses_network_listener(
     mock_sandbox = MockSandbox()
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
     monkeypatch.setattr(spack.sandbox, "set_build_worker_rlimits", lambda: None)
+    monkeypatch.setattr(spack.sandbox, "hide_directories_as_empty", lambda *args, **kwargs: True)
     monkeypatch.setattr(spack.installer.build, "allow_compiler_paths", lambda sandbox, spec: None)
 
     class NetworkSeccomp:

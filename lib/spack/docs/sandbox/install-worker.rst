@@ -49,6 +49,12 @@ The user interface is a worker option for the existing installer, not a new comm
 Build-phase confinement is a later, separate milestone.
 Compiler selection and build-tool access are recorded now, but must not delay staging integration.
 
+When build-phase confinement is enabled, Spack enters a private user and mount namespace before applying Landlock.
+It bind-mounts an empty stage-owned directory over ``/usr/share/aclocal`` unless the concrete spec has an external ``autoconf`` dependency.
+This prevents sandboxed builds from scanning host Autoconf macros while preserving the host macro directory for a host-provided Autoconf.
+When unprivileged user and mount namespaces are unavailable, Spack warns and retains the existing Landlock behavior instead of failing unrelated builds.
+Other namespace or mount setup failures fail the build before recipe-controlled build phases run.
+
 Trust Boundary
 --------------
 
