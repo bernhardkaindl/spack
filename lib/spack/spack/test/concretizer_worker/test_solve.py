@@ -100,6 +100,21 @@ def test_repository_namespace_roots_include_only_spack_repositories(tmp_path, mo
     assert worker_solve._repository_namespace_roots() == [str(namespace_root)]
 
 
+def test_python_read_paths_include_user_site_packages(tmp_path, monkeypatch):
+    import spack.concretizer_worker.solve as worker_solve
+
+    system_site = tmp_path / "system-site"
+    user_site = tmp_path / "user-site"
+    system_site.mkdir()
+    user_site.mkdir()
+    monkeypatch.setattr(
+        worker_solve.sysconfig, "get_paths", lambda: {"purelib": str(system_site)}
+    )
+    monkeypatch.setattr(worker_solve.site, "getusersitepackages", lambda: str(user_site))
+
+    assert worker_solve._python_read_paths() == [str(system_site), str(user_site)]
+
+
 def test_worker_bootstraps_clingo_once_in_parent_before_launch(mock_packages, monkeypatch):
     import spack.bootstrap
 

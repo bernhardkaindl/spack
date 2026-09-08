@@ -7,6 +7,7 @@
 import functools
 import os
 import pathlib
+import site
 import sys
 import sysconfig
 import time
@@ -115,6 +116,13 @@ def _repository_namespace_roots() -> List[str]:
     return roots
 
 
+def _python_read_paths() -> List[str]:
+    """Return existing standard and user site-packages paths for the worker."""
+    paths = list(sysconfig.get_paths().values())
+    paths.append(site.getusersitepackages())
+    return [path for path in paths if path and os.path.exists(path)]
+
+
 def _worker_paths() -> Tuple[List[str], List[str]]:
     """Derive worker filesystem capabilities from trusted active Spack state."""
     from spack.solver.asp import ConcretizationCache
@@ -125,8 +133,7 @@ def _worker_paths() -> Tuple[List[str], List[str]]:
     concretization_cache.mkdir(parents=True, exist_ok=True)
 
     read_roots = [spack.paths.lib_path]
-    python_paths = list(sysconfig.get_paths().values())
-    read_roots.extend(path for path in python_paths if path and os.path.exists(path))
+    read_roots.extend(_python_read_paths())
     for repository in spack.repo.PATH.repos:
         read_roots.append(repository.root)
         if repository.python_path:
