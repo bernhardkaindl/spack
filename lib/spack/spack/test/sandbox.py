@@ -630,10 +630,62 @@ def test_enable_sandbox_paths(
     assert os.environ["TEMP"] == str(tmpdir)
     assert tempfile.gettempdir() == str(tmpdir)
     assert os.environ["XDG_CACHE_HOME"] == str(stage_path / ".cache")
-    assert os.environ["JAVA_TOOL_OPTIONS"] == f"-Xmx2g -Djava.io.tmpdir={tmpdir}"
+    assert os.environ["HOME"] == str(stage_path / "spack-build-home")
+    assert os.environ["JAVA_TOOL_OPTIONS"] == (
+        f"-Xmx2g -Djava.io.tmpdir={tmpdir}"
+        f" -Duser.home={stage_path / 'spack-build-home'}"
+        f" -Dmaven.repo.local={stage_path / 'spack-build-home' / '.m2'}"
+    )
 
     assert mock_sandbox.apply_calls == [(expected_block_network, False, False, False)]
     assert build_rlimits == [True]
+
+
+def test_configure_maven_proxy_sets_settings(monkeypatch, tmp_path):
+    monkeypatch.delenv("MAVEN_ARGS", raising=False)
+
+    spack.installer.build._configure_maven_proxy(
+        "http://spack:p%40ssword@127.0.0.1:12345", str(tmp_path)
+    )
+
+    assert os.environ["MAVEN_ARGS"] == (
+        f"-Daether.connector.basic.threads=1 --settings={tmp_path / '.m2' / 'settings.xml'}"
+    )
+    settings = (tmp_path / ".m2" / "settings.xml").read_text()
+    assert settings.count("<proxy>") == 1
+    assert "<protocol>http</protocol>" in settings
+    assert "<username>spack</username>" in settings
+    assert "<password>p@ssword</password>" in settings
+
+
+def test_configure_build_proxy_sets_java_proxy_properties(monkeypatch):
+    monkeypatch.setenv("JAVA_TOOL_OPTIONS", "-Xmx2g")
+
+    spack.installer.build._configure_build_proxy("http://user:secret@127.0.0.1:12345")
+
+    assert os.environ["JAVA_TOOL_OPTIONS"] == (
+        "-Xmx2g -Djdk.http.auth.tunneling.disabledSchemes="
+        " -Djdk.http.auth.proxying.disabledSchemes="
+        " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=12345"
+        " -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=12345"
+        " -Dhttp.proxyUser=user -Dhttp.proxyPassword=secret"
+        " -Dhttps.proxyUser=user -Dhttps.proxyPassword=secret"
+    )
+
+
+def test_configure_build_proxy_sets_maven_wrapper_options(monkeypatch):
+    monkeypatch.setenv("MAVEN_OPTS", "-Xmx2g")
+
+    spack.installer.build._configure_build_proxy("http://spack:secret@127.0.0.1:12345")
+
+    assert os.environ["MAVEN_OPTS"] == (
+        "-Xmx2g -Djdk.http.auth.tunneling.disabledSchemes="
+        " -Djdk.http.auth.proxying.disabledSchemes="
+        " -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=12345"
+        " -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=12345"
+        " -Dhttp.proxyUser=spack -Dhttp.proxyPassword=secret"
+        " -Dhttps.proxyUser=spack -Dhttps.proxyPassword=secret"
+    )
 
 
 def test_enable_sandbox_proxy_uses_network_listener(

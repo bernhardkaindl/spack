@@ -26,6 +26,8 @@ from gzip import GzipFile
 from multiprocessing import Process
 from pathlib import Path
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
+from urllib.parse import unquote, urlsplit
+from xml.sax.saxutils import escape
 
 from spack.vendor.typing_extensions import Protocol
 
@@ -82,6 +84,13 @@ OVERWRITE_BACKUP_SUFFIX = ".old"
 
 #: Suffix for temporary cleanup during failed install
 OVERWRITE_GARBAGE_SUFFIX = ".garbage"
+
+#: Temporary compatibility destinations required for Cargo dependency downloads.
+DEFAULT_BUILD_NETWORK_DESTINATIONS: Tuple[str, ...] = (
+    "https://repo.maven.apache.org:443",
+    "https://index.crates.io:443",
+    "https://static.crates.io:443",
+)
 
 LINUX_HEADER_POLICY_PATH = os.path.join(
     spack.paths.share_path, "sandbox", "linux-header-policy.yaml"
@@ -1157,6 +1166,67 @@ def _configure_build_proxy(proxy_url: str) -> None:
         os.environ[name.upper()] = proxy_url
     os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
     os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+    proxy = urlsplit(proxy_url)
+    if proxy.hostname is None or proxy.port is None:
+        raise spack.error.InstallError("Invalid build proxy URL")
+    inherited_java_options = os.environ.get("JAVA_TOOL_OPTIONS")
+    # Current JDKs disable Basic proxy authentication for HTTP tunnels by default.
+    java_auth_options = (
+        "-Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes="
+    )
+    java_proxy_options = (
+        f"-Dhttp.proxyHost={proxy.hostname} -Dhttp.proxyPort={proxy.port} "
+        f"-Dhttps.proxyHost={proxy.hostname} -Dhttps.proxyPort={proxy.port}"
+    )
+    if proxy.username is not None and proxy.password is not None:
+        java_proxy_options += (
+            f" -Dhttp.proxyUser={unquote(proxy.username)}"
+            f" -Dhttp.proxyPassword={unquote(proxy.password)}"
+            f" -Dhttps.proxyUser={unquote(proxy.username)}"
+            f" -Dhttps.proxyPassword={unquote(proxy.password)}"
+        )
+    inherited_maven_options = os.environ.get("MAVEN_OPTS")
+    # Maven Wrapper uses MAVEN_OPTS before Maven can read settings.xml.
+    os.environ["MAVEN_OPTS"] = " ".join(
+        option
+        for option in (inherited_maven_options, java_auth_options, java_proxy_options)
+        if option
+    )
+    os.environ["JAVA_TOOL_OPTIONS"] = " ".join(
+        option
+        for option in (inherited_java_options, java_auth_options, java_proxy_options)
+        if option
+    )
+
+
+def _configure_maven_proxy(proxy_url: str, build_home: str) -> None:
+    """Configure Maven's resolver to use the authenticated build proxy."""
+    proxy = urlsplit(proxy_url)
+    if proxy.hostname is None or proxy.port is None:
+        raise spack.error.InstallError("Invalid build proxy URL")
+    username = escape(unquote(proxy.username or ""))
+    password = escape(unquote(proxy.password or ""))
+    host = escape(proxy.hostname)
+    port = proxy.port
+    settings_dir = os.path.join(build_home, ".m2")
+    os.makedirs(settings_dir, exist_ok=True)
+    settings = os.path.join(settings_dir, "settings.xml")
+    with open(settings, "w", encoding="utf-8") as stream:
+        stream.write(
+            "<settings><proxies>"
+            f"<proxy><id>spack</id><active>true</active><protocol>http</protocol>"
+            f"<host>{host}</host><port>{port}</port><username>{username}</username>"
+            f"<password>{password}</password></proxy>"
+            "</proxies></settings>"
+        )
+    inherited_maven_args = os.environ.get("MAVEN_ARGS")
+    settings_arg = f"--settings={settings}"
+    # Resolver 1.x shares challenged proxy credentials, but parallel initial CONNECTs race before
+    # that cache is populated and fail with 407. Serialize downloads for authenticated builds.
+    resolver_threads_arg = "-Daether.connector.basic.threads=1"
+    os.environ["MAVEN_ARGS"] = " ".join(
+        option for option in (inherited_maven_args, resolver_threads_arg, settings_arg) if option
+    )
 
 
 def _enable_sandbox(
@@ -1186,15 +1256,22 @@ def _enable_sandbox(
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
     build_tmpdir = os.path.join(stage_path, "spack-build-tmp")
+    build_home = os.path.join(stage_path, "spack-build-home")
     os.makedirs(build_tmpdir, exist_ok=True)
+    os.makedirs(build_home, exist_ok=True)
+    os.environ["HOME"] = build_home
     os.environ["TMPDIR"] = build_tmpdir
     os.environ["TMP"] = build_tmpdir
     os.environ["TEMP"] = build_tmpdir
     tempfile.tempdir = build_tmpdir
     java_tmpdir = f"-Djava.io.tmpdir={build_tmpdir}"
+    java_home = f"-Duser.home={build_home}"
+    maven_repository = f"-Dmaven.repo.local={os.path.join(build_home, '.m2')}"
     inherited_java_options = os.environ.get("JAVA_TOOL_OPTIONS")
-    os.environ["JAVA_TOOL_OPTIONS"] = (
-        f"{inherited_java_options} {java_tmpdir}" if inherited_java_options else java_tmpdir
+    os.environ["JAVA_TOOL_OPTIONS"] = " ".join(
+        option
+        for option in (inherited_java_options, java_tmpdir, java_home, maven_repository)
+        if option
     )
     os.environ["XDG_CACHE_HOME"] = os.path.join(stage_path, ".cache")  # font-util
 
@@ -1248,6 +1325,7 @@ def _enable_sandbox(
             network_listener_fd = seccomp.network_listener(include_exec=learning)
             seccomp.deny_network_bypass()
             _configure_build_proxy(proxy_url)
+            _configure_maven_proxy(proxy_url, build_home)
         sandbox.apply(block_network=not config.get("allow_network", False) and proxy_url is None)
     except spack.sandbox.SandboxError as e:
         for listener_fd in (exec_listener_fd, network_listener_fd):
@@ -1455,7 +1533,10 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
     network_attempts: List[str] = []
     if config.get("enable", False) and not config.get("allow_network", False):
         learning = spack.install_worker.learning.enabled(config)
-        destinations = spack.install_worker.learning.matching_network_destinations(spec, config)
+        destinations = list(DEFAULT_BUILD_NETWORK_DESTINATIONS)
+        destinations.extend(
+            spack.install_worker.learning.matching_network_destinations(spec, config)
+        )
         if learning or destinations:
             policy = (
                 spack.util.proxy.DestinationPolicy.allow_any()

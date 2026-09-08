@@ -228,6 +228,11 @@ It permits public HTTP, HTTPS, and FTP destinations for discovery, warns immedia
 The parent records each destination in a reusable ``network-allow-<host>`` group and adds the package-name selector.
 Outside learning mode, only matching network groups may use the proxy; builds never receive direct socket access unless the explicit legacy ``allow_network`` option is enabled.
 
+The trusted installer parent supplies invocation-scoped proxy credentials to Maven Wrapper through ``MAVEN_OPTS`` and writes Maven Resolver settings below the isolated build home.
+Basic proxy authentication is enabled only for that build, and Resolver 1.x downloads are serialized because parallel initial CONNECT requests can race its shared authentication cache and fail with HTTP 407.
+The credential expires when the parent stops the proxy; destination filtering and direct-socket denial remain unchanged.
+Focused sandbox tests verify the generated environment and settings, while a confined ``ck`` source install exercises authenticated Maven Central downloads.
+
 Landlock does not report denied paths.
 Learning therefore combines three signals before granting an executable:
 
