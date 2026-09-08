@@ -7,6 +7,7 @@
 import functools
 import os
 import pathlib
+import site
 import sys
 import sysconfig
 import time
@@ -114,6 +115,13 @@ def _repository_namespace_roots() -> List[str]:
         if os.path.isdir(namespace_root):
             roots.append(namespace_root)
     return roots
+
+
+def _python_read_paths() -> List[str]:
+    """Return existing standard and user site-packages paths for the worker."""
+    paths = list(sysconfig.get_paths().values())
+    paths.append(site.getusersitepackages())
+    return [path for path in paths if path and os.path.exists(path)]
 
 
 def _worker_paths(context: spack.context.SpackContext) -> Tuple[List[str], List[str]]:
