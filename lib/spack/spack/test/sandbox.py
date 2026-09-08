@@ -619,6 +619,12 @@ def test_enable_sandbox_paths(
     assert tmpdir == (stage_path / "spack-build-tmp").resolve()
     assert tmpdir.is_dir()
     assert tmpdir.parent in allow_write_resolved
+    # glibc’s tmpfile() does not consult TMPDIR and does not have a runtime override.
+    # We may use LD_PRELOAD to entercept tmpfile() but bypassed by static binaries
+    # and direcy syscalls.
+    # We might use Seccomp user notification around openat(..., O_TMPFILE, ...):
+    # theoretically capable of emulation or FD injection, but complex.
+    assert pathlib.Path("/tmp").resolve() in allow_write_resolved
     assert os.environ["TMPDIR"] == str(tmpdir)
     assert os.environ["TMP"] == str(tmpdir)
     assert os.environ["TEMP"] == str(tmpdir)
