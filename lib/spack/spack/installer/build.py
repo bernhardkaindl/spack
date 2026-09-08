@@ -1029,6 +1029,15 @@ def _enable_sandbox(
     sandbox.allow_write(tempfile.gettempdir())
     sandbox.allow_write(os.devnull)
 
+    # Python multiprocessing requires /dev/shm for POSIX semaphore support.
+    # otherwise, Python builds fail with:
+    # raise ImportError("This platform lacks a functioning sem_open"
+    if sys.platform == "linux":
+        sandbox.allow_write("/dev/shm")
+    if makeflags is not None:
+        for path in makeflags.sandbox_paths():
+            sandbox.allow_write(path)
+
     # Allow read access to sbang, which might be needed to run build scripts.
     sandbox.allow_read(os.path.join(spack.store.STORE.unpadded_root, "bin", "sbang"))
     for upstream_db in spack.store.STORE.upstreams or []:
