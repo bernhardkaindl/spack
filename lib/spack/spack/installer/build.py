@@ -367,6 +367,7 @@ BUILD_UTILITIES_PROGRAMS = (
     "ldd",
     "tar",  # self-extracting installers such as CUDA
     "tbl",  # ncurses
+    "unzip",  # bazel
     "which",
     "xargs",  # diffutils
 )
