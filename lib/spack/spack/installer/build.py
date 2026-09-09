@@ -25,7 +25,7 @@ import traceback
 from gzip import GzipFile
 from multiprocessing import Process
 from pathlib import Path
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Set, Tuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 from spack.vendor.typing_extensions import Protocol
 
@@ -40,6 +40,7 @@ import spack.hooks
 import spack.install_worker
 import spack.install_worker.learning
 import spack.mirrors.mirror
+import spack.paths
 import spack.repo
 import spack.sandbox
 import spack.spec
@@ -49,6 +50,7 @@ import spack.util.environment
 import spack.util.filesystem as fs
 import spack.util.lock
 import spack.util.proxy
+import spack.util.spack_yaml as syaml
 import spack.util.timer
 import spack.util.tty
 from spack.installer.base import (
@@ -87,6 +89,226 @@ DEFAULT_BUILD_NETWORK_DESTINATIONS: Tuple[str, ...] = (
     "https://static.crates.io:443",
 )
 
+LINUX_HEADER_POLICY_PATH = os.path.join(
+    spack.paths.share_path, "sandbox", "linux-header-policy.yaml"
+)
+SYSTEM_GCC_INSTALL_ROOTS = ("/usr/lib/gcc", "/usr/lib64/gcc")
+
+
+def _versioned_directories_by_major(root: Path) -> dict:
+    """Return immediate child directories grouped by numeric major version."""
+    result = {}
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return result
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        try:
+            major = int(entry.name.split(".", 1)[0])
+        except ValueError:
+            continue
+        result.setdefault(major, []).append(entry)
+    return result
+
+
+def _load_linux_header_policy(path: str = LINUX_HEADER_POLICY_PATH) -> dict:
+    """Load and validate the shipped Linux system-header policy."""
+    try:
+        with open(path, encoding="utf-8") as stream:
+            policy = syaml.load(stream)
+    except (OSError, syaml.SpackYAMLError) as error:
+        raise spack.error.InstallError(
+            f"Cannot load Linux header policy {path}: {error}"
+        ) from error
+
+    if not isinstance(policy, dict) or policy.get("version") != 1:
+        raise spack.error.InstallError(f"Invalid Linux header policy version in {path}")
+    if not isinstance(policy.get("system_include_root"), str):
+        raise spack.error.InstallError(f"Invalid system include root in {path}")
+    for section in ("glibc", "linux"):
+        value = policy.get(section)
+        if not isinstance(value, dict):
+            raise spack.error.InstallError(f"Invalid {section} header policy in {path}")
+        for key in ("directories", "target_directories"):
+            if not isinstance(value.get(key), list):
+                raise spack.error.InstallError(f"Invalid {section} {key} in {path}")
+    if not isinstance(policy["glibc"].get("files"), list) or not isinstance(
+        policy["glibc"].get("target_files"), list
+    ):
+        raise spack.error.InstallError(f"Invalid glibc file policy in {path}")
+    maximum_major = policy.get("libstdcxx", {}).get("maximum_major_for_non_gcc")
+    if not isinstance(maximum_major, int):
+        raise spack.error.InstallError(f"Invalid libstdc++ policy in {path}")
+    return policy
+
+
+def _selected_compilers(spec: spack.spec.Spec) -> List[Tuple[str, str, spack.spec.Spec]]:
+    """Return selected language, driver path, and compiler spec tuples without duplicates."""
+    result = []
+    seen = set()
+    compiler_names = set(spack.compilers.config.supported_compilers())
+    for node in spec.traverse():
+        for edge in node.edges_to_dependencies():
+            selected_languages = set(edge.virtuals) & set(COMPILER_LANGUAGES)
+            configured = (edge.spec.extra_attributes or {}).get("compilers", {})
+            for language in selected_languages:
+                path = configured.get(language)
+                if path and (language, path) not in seen:
+                    seen.add((language, path))
+                    result.append((language, path, edge.spec))
+        if node.name not in compiler_names:
+            continue
+        configured = (node.extra_attributes or {}).get("compilers", {})
+        for language in COMPILER_LANGUAGES:
+            path = configured.get(language)
+            if path and (language, path) not in seen:
+                seen.add((language, path))
+                result.append((language, path, node))
+    return result
+
+
+def _gcc_installation(compiler_path: str) -> Optional[Path]:
+    """Return the system GCC installation directory reported by a compiler driver."""
+    try:
+        completed = subprocess.run(
+            [compiler_path, "-print-libgcc-file-name"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0 or not os.path.isabs(completed.stdout.strip()):
+        return None
+    installation = Path(completed.stdout.strip()).resolve().parent
+    roots = [Path(root).resolve() for root in SYSTEM_GCC_INSTALL_ROOTS]
+    return installation if installation.parent.parent in roots else None
+
+
+def _major_version(value) -> Optional[int]:
+    try:
+        return int(str(value).split(".", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _permitted_gcc_installation(compiler_path: str, compiler_spec, policy: dict) -> Optional[Path]:
+    """Select the one host GCC installation whose libstdc++ headers may be read."""
+    reported = _gcc_installation(compiler_path)
+    if reported is None:
+        return None
+    installations = _versioned_directories_by_major(reported.parent)
+    if compiler_spec.name == "gcc":
+        candidates = [reported]
+    else:
+        maximum_major = policy["libstdcxx"]["maximum_major_for_non_gcc"]
+        safe_majors = [major for major in installations if major <= maximum_major]
+        permitted_major = max(safe_majors) if safe_majors else _major_version(reported.name)
+        candidates = installations.get(permitted_major, [])
+    if not candidates:
+        return None
+    header_root = Path(policy["system_include_root"]) / "c++"
+    return next(
+        (path for path in reversed(candidates) if (header_root / path.name).is_dir()), None
+    )
+
+
+def _policy_paths(root: Path, values) -> List[str]:
+    """Resolve safe relative policy entries below a trusted root."""
+    result = []
+    for value in values:
+        if not isinstance(value, str) or os.path.isabs(value) or ".." in Path(value).parts:
+            raise spack.error.InstallError(f"Invalid relative Linux header policy path: {value!r}")
+        result.append(str(root / value))
+    return result
+
+
+def system_compiler_header_paths(
+    spec: spack.spec.Spec, policy: Optional[dict] = None
+) -> List[str]:
+    """Return explicit libc, Linux UAPI, and selected libstdc++ header paths."""
+    policy = policy if policy is not None else _load_linux_header_policy()
+    selected = _selected_compilers(spec)
+    system_selected = [
+        entry for entry in selected if str(Path(entry[1]).resolve()).startswith("/usr/")
+    ]
+    if not system_selected:
+        return []
+
+    include_root = Path(policy["system_include_root"])
+    paths = _policy_paths(
+        include_root,
+        policy["glibc"]["files"]
+        + policy["glibc"]["directories"]
+        + policy["glibc"]["target_files"]
+        + policy["glibc"]["target_directories"]
+        + policy["linux"]["directories"]
+        + policy["linux"]["target_directories"],
+    )
+    targets = set()
+    for _language, compiler_path, _compiler_spec in system_selected:
+        installation = _gcc_installation(compiler_path)
+        if installation is not None:
+            targets.add(installation.parent.name)
+    for target in targets:
+        target_root = include_root / target
+        paths.extend(
+            _policy_paths(
+                target_root,
+                policy["glibc"]["target_files"]
+                + policy["glibc"]["target_directories"]
+                + policy["linux"]["target_directories"],
+            )
+        )
+
+    for language, compiler_path, compiler_spec in system_selected:
+        if language != "cxx":
+            continue
+        installation = _permitted_gcc_installation(compiler_path, compiler_spec, policy)
+        if installation is None:
+            continue
+        version = installation.name
+        paths.extend(
+            [
+                str(include_root / "c++" / version),
+                str(include_root / installation.parent.name / "c++" / version),
+                str(include_root / "c++" / version / installation.parent.name),
+                str(installation / "include"),
+                str(installation / "include-fixed"),
+            ]
+        )
+    return list(dict.fromkeys(paths))
+
+
+def gcc_installation_dirs_to_mask(
+    spec: spack.spec.Spec, policy: Optional[dict] = None
+) -> List[str]:
+    """Hide system GCC installations other than the one permitted for selected C++."""
+    policy = policy if policy is not None else _load_linux_header_policy()
+    selected = _selected_compilers(spec)
+    required_installations = {
+        installation
+        for _language, compiler_path, compiler_spec in selected
+        for installation in [_gcc_installation(compiler_path)]
+        if compiler_spec.name == "gcc" and installation is not None
+    }
+    for language, compiler_path, compiler_spec in selected:
+        if language != "cxx" or not str(Path(compiler_path).resolve()).startswith("/usr/"):
+            continue
+        permitted = _permitted_gcc_installation(compiler_path, compiler_spec, policy)
+        if permitted is None:
+            return []
+        return [
+            str(path)
+            for paths in _versioned_directories_by_major(permitted.parent).values()
+            for path in paths
+            if path != permitted and path not in required_installations
+        ]
+    return []
+
 
 def default_hide_as_empty_dirs(spec: spack.spec.Spec) -> List[str]:
     """Return host directories hidden as empty by default for this build.
@@ -94,10 +316,11 @@ def default_hide_as_empty_dirs(spec: spack.spec.Spec) -> List[str]:
     Skipped when ``autoconf`` is an external dependency, since a host autoconf legitimately
     relies on its own system macro directory.
     """
-    for dep in spec.traverse(root=False):
-        if dep.name == "autoconf" and dep.external:
-            return []
-    return ["/usr/share/aclocal"]
+    hidden_dirs = []
+    if not any(dep.name == "autoconf" and dep.external for dep in spec.traverse(root=False)):
+        hidden_dirs.append("/usr/share/aclocal")
+    hidden_dirs.extend(gcc_installation_dirs_to_mask(spec))
+    return hidden_dirs
 
 
 #: Host paths required by dynamically linked build tools at runtime.
@@ -123,8 +346,6 @@ HOST_RUNTIME_READ_PATHS = (
 #: Support files required by pkgconf and berkeley-db
 FILE_RUNTIME_READ_PATHS = ("/etc/magic", "/usr/share/file/magic.mgc")
 
-#: Host paths required by selected system compilers.
-HOST_COMPILER_READ_PATHS = ("/usr/include",)
 #: Language virtuals whose concrete edges identify selected compiler drivers.
 COMPILER_LANGUAGES = ("c", "cxx", "fortran")
 #: Subordinate executables that compiler drivers may invoke.
@@ -711,9 +932,9 @@ def worker_function(
 
     global_state.restore()
     sandbox_config = spack.config.CONFIG.get("config:sandbox", {})
-    hidden_dirs = default_hide_as_empty_dirs(spec)
     mount_namespace_ready = False
     if sandbox_config.get("enable", False):
+        hidden_dirs = default_hide_as_empty_dirs(spec)
         mount_namespace_ready = spack.sandbox.prepare_empty_directory_masking(hidden_dirs)
 
     if sys.platform != "win32":
@@ -967,38 +1188,15 @@ def allow_git_support_paths(sandbox: spack.sandbox.Sandbox) -> None:
 
 def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) -> None:
     """Allow compiler drivers and their exact support paths selected by concrete language edges."""
-    compiler_paths: Set[str] = set()
-    compiler_names = set(spack.compilers.config.supported_compilers())
-    for node in spec.traverse():
-        if node.name in compiler_names:
-            configured_compilers = (node.extra_attributes or {}).get("compilers", {})
-            compiler_paths.update(
-                configured_compilers[language]
-                for language in COMPILER_LANGUAGES
-                if configured_compilers.get(language)
-            )
-        for edge in node.edges_to_dependencies():
-            selected_languages = set(edge.virtuals) & set(COMPILER_LANGUAGES)
-            if not selected_languages:
-                continue
-
-            configured_compilers = (edge.spec.extra_attributes or {}).get("compilers", {})
-            compiler_paths.update(
-                configured_compilers[language]
-                for language in selected_languages
-                if configured_compilers.get(language)
-            )
-
+    compiler_paths = {path for _language, path, _compiler_spec in _selected_compilers(spec)}
     for compiler_path in compiler_paths:
         sandbox.allow_read(compiler_path)
         for program_path in compiler_support_paths(compiler_path):
             sandbox.allow_read(program_path)
             for support_path in executable_support_paths(program_path):
                 sandbox.allow_read(support_path)
-        real_compiler_path = Path(compiler_path).resolve()
-        if real_compiler_path.exists() and str(real_compiler_path).startswith("/usr/"):
-            for path in HOST_COMPILER_READ_PATHS:
-                sandbox.allow_read(path)
+    for path in system_compiler_header_paths(spec):
+        sandbox.allow_read(path)
 
 
 class SandboxListeners(NamedTuple):

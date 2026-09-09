@@ -39,3 +39,32 @@ It requires unprivileged user and mount namespaces; when they are unavailable, S
 A focused real-kernel test verifies that the bind mount appears empty, and ``isa-l`` completes with the mask enabled.
 
 The preferred solution is the package-level change in `spack/spack-packages#6277 <https://github.com/spack/spack-packages/pull/6277>`_, which avoids this host path and does not require Linux mount namespaces.
+
+.. _sandbox-solved-gcc-16-headers:
+
+GCC 16 headers selected by older Clang
+--------------------------------------
+
+Clang selects the newest compatible host GCC installation when it needs the GNU C++ standard library.
+An older Clang can therefore select GCC 16 headers even when an older GCC installation and header tree are available, and some builds fail because that Clang cannot parse the newer headers.
+
+Landlock grants are additive below an allowed directory, so the build policy cannot grant ``/usr/include`` and then deny only ``/usr/include/c++/16``.
+The build policy no longer grants ``/usr/include``.
+It loads a versioned immutable policy from ``share/spack/sandbox/linux-header-policy.yaml`` and grants only named glibc files and subdirectories, named Linux UAPI subdirectories, target-specific equivalents, and one selected libstdc++ header tree.
+The runtime policy does not query ``dpkg``, RPM, APK, or another distribution package database.
+Missing policy paths are ignored, which lets one relative-path inventory cover glibc-based Linux distributions with different header layouts.
+
+The selected compiler reports its GCC installation through ``-print-libgcc-file-name``.
+GCC receives the matching libstdc++ version.
+Other C++ compilers receive the newest installed libstdc++ version no newer than the policy's compatibility ceiling, currently GCC 15.
+The worker masks competing host GCC installation candidates so Clang's GCC detector selects the same version that Landlock permits.
+Both target-first and version-first multiarch libstdc++ layouts are supported.
+It does not change compiler selection recorded in the concrete spec.
+
+This compatibility policy uses the private mount namespace prepared before worker threads start.
+If unprivileged user and mount namespaces are unavailable, Spack emits the existing masking warning.
+Landlock still denies non-allowlisted header paths, but Clang may select a masked-out GCC installation and fail instead of falling back.
+Other namespace and mount errors still fail before recipe-controlled build phases run.
+
+Focused policy tests prove that the ``/usr/include`` parent is absent, required libc and Linux roots are present, only the selected libstdc++ version is granted, GCC 16 receives its own headers, and competing GCC installations are selected for masking.
+The existing real-kernel masking test proves that every selected directory appears empty inside the private namespace.

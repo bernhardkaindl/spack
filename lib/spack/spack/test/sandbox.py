@@ -34,16 +34,195 @@ from spack.util.sandbox import run_json_worker
 
 
 def test_default_hide_as_empty_dirs_skips_external_autoconf(monkeypatch):
-    external_autoconf = SimpleNamespace(name="autoconf", external=True)
-    spec = SimpleNamespace(traverse=lambda root=False: [external_autoconf])
+    external_autoconf = SimpleNamespace(
+        name="autoconf", external=True, edges_to_dependencies=lambda: [], extra_attributes={}
+    )
+    spec = SimpleNamespace(
+        traverse=lambda root=False: [external_autoconf] if not root else [],
+        edges_to_dependencies=lambda: [],
+    )
 
     assert spack.installer.build.default_hide_as_empty_dirs(spec) == []
 
 
 def test_default_hide_as_empty_dirs_masks_host_aclocal():
-    spec = SimpleNamespace(traverse=lambda root=False: [])
+    spec = SimpleNamespace(traverse=lambda root=False: [], edges_to_dependencies=lambda: [])
 
     assert spack.installer.build.default_hide_as_empty_dirs(spec) == ["/usr/share/aclocal"]
+
+
+def system_gcc_layout(tmp_path, *, older_headers=True):
+    install_root = tmp_path / "lib" / "gcc"
+    target = install_root / "test-linux-gnu"
+    if older_headers:
+        (target / "15").mkdir(parents=True)
+    (target / "16").mkdir(parents=True)
+    include_root = tmp_path / "include"
+    header_root = include_root / "c++"
+    if older_headers:
+        (header_root / "15").mkdir(parents=True)
+    (header_root / "16").mkdir(parents=True)
+    for version in ["15", "16"] if older_headers else ["16"]:
+        (include_root / target.name / "c++" / version).mkdir(parents=True)
+    return install_root, target, include_root
+
+
+def compiler_spec(name, version, compilers, additional_compilers=()):
+    compiler = SimpleNamespace(
+        name=name, version=version, extra_attributes={"compilers": compilers}
+    )
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    additional_edges = [
+        SimpleNamespace(spec=spec, virtuals=(language,)) for language, spec in additional_compilers
+    ]
+    root = SimpleNamespace(
+        name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge] + additional_edges
+    )
+    return SimpleNamespace(traverse=lambda: [root])
+
+
+def linux_header_policy(include_root):
+    return {
+        "version": 1,
+        "system_include_root": str(include_root),
+        "glibc": {
+            "files": ["stdio.h"],
+            "directories": ["arpa"],
+            "target_files": ["fpu_control.h"],
+            "target_directories": ["bits", "sys"],
+        },
+        "linux": {"directories": ["linux"], "target_directories": ["asm"]},
+        "libstdcxx": {"maximum_major_for_non_gcc": 15},
+    }
+
+
+def test_system_compiler_headers_allow_only_safe_libstdcxx(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/clang++-18"})
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    allowed = spack.installer.build.system_compiler_header_paths(spec, policy)
+
+    assert str(include_root) not in allowed
+    assert str(include_root / "stdio.h") in allowed
+    assert str(include_root / "arpa") in allowed
+    assert str(include_root / "linux") in allowed
+    assert str(include_root / "bits") in allowed
+    assert str(include_root / "asm") in allowed
+    assert str(include_root / target.name / "bits") in allowed
+    assert str(include_root / target.name / "asm") in allowed
+    assert str(include_root / "c++" / "15") in allowed
+    assert str(include_root / target.name / "c++" / "15") in allowed
+    assert str(include_root / "c++" / "15" / target.name) in allowed
+    assert str(include_root / "c++" / "16") not in allowed
+    assert str(include_root / target.name / "c++" / "16") not in allowed
+
+
+def test_gcc_installations_other_than_permitted_libstdcxx_are_masked(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/clang++-18"})
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    assert spack.installer.build.gcc_installation_dirs_to_mask(
+        spec, linux_header_policy(include_root)
+    ) == [str(target / "16")]
+
+
+def test_mask_preserves_gcc_installation_selected_for_fortran(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    gcc = SimpleNamespace(
+        name="gcc",
+        version="16",
+        extra_attributes={"compilers": {"fortran": "/usr/bin/gfortran-16"}},
+    )
+    spec = compiler_spec(
+        "llvm", "18", {"cxx": "/usr/bin/clang++-18"}, additional_compilers=(("fortran", gcc),)
+    )
+    monkeypatch.setattr(
+        spack.installer.build,
+        "_gcc_installation",
+        lambda compiler_path: target / ("16" if compiler_path.endswith("16") else "16"),
+    )
+
+    assert (
+        spack.installer.build.gcc_installation_dirs_to_mask(
+            spec, linux_header_policy(include_root)
+        )
+        == []
+    )
+
+
+def test_gcc_16_compiler_gets_gcc_16_libstdcxx(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    spec = compiler_spec("gcc", "16.1", {"cxx": "/usr/bin/g++-16"})
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    allowed = spack.installer.build.system_compiler_header_paths(spec, policy)
+
+    assert str(include_root / "c++" / "16") in allowed
+    assert str(include_root / "c++" / "15") not in allowed
+    assert spack.installer.build.gcc_installation_dirs_to_mask(spec, policy) == [
+        str(target / "15")
+    ]
+
+
+def test_newest_libstdcxx_used_when_no_older_headers_exist(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path, older_headers=False)
+    spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/clang++-18"})
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    allowed = spack.installer.build.system_compiler_header_paths(spec, policy)
+
+    assert str(include_root / "c++" / "16") in allowed
+    assert spack.installer.build.gcc_installation_dirs_to_mask(spec, policy) == []
+
+
+def test_system_header_policy_denies_unselected_libstdcxx(tmp_path, monkeypatch):
+    try:
+        sandbox = spack.sandbox.get_sandbox()
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    permitted_header = include_root / "c++" / "15" / "vector"
+    denied_header = include_root / "c++" / "16" / "vector"
+    permitted_header.touch()
+    denied_header.touch()
+    spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/sh"})
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    def setup():
+        for path in spack.installer.build.system_compiler_header_paths(spec, policy):
+            sandbox.allow_read(path)
+        sandbox.apply()
+
+    def worker(request):
+        permitted = permitted_header.read_text() == ""
+        try:
+            denied_header.read_text()
+        except OSError as error:
+            denied_errno = error.errno
+        else:
+            denied_errno = None
+        return {"denied_errno": denied_errno, "permitted": permitted}
+
+    result = run_json_worker({}, worker, setup=setup)
+
+    assert result == {"denied_errno": errno.EACCES, "permitted": True}
 
 
 def test_hide_directories_as_empty_mounts_empty_directory(tmp_path):
