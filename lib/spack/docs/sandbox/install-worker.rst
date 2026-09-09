@@ -220,6 +220,14 @@ The listed glibc-compatible files include ``crypt.h`` because Perl requires the 
 It never grants the ``/usr/include`` parent.
 The runtime policy uses compiler-reported paths and filesystem presence checks without querying a distribution package manager.
 For non-GCC C++ compilers, the policy selects the newest installed libstdc++ version at or below its compatibility ceiling and masks competing GCC installation candidates in the existing private mount namespace.
+
+The build worker prepends a dedicated directory of static compatibility commands from ``share/spack/sandbox/commands`` to ``PATH``.
+Only command names registered by trusted Spack code are granted read and execute access.
+The initial ``df`` command accepts only ``df -P -B1 .`` and returns a fixed synthetic filesystem row with one pebibyte available.
+It does not read or reveal host mount metadata or capacity.
+Absolute invocations such as ``/usr/bin/df`` bypass this compatibility layer and remain subject to the normal executable policy.
+The fixed result intentionally disables the installer's real free-space check, so the build can still exhaust its writable filesystem.
+The sandbox tests execute the accepted and rejected forms under real Landlock and verify the exact fixed output.
 Every added tool or path requires a focused test demonstrating why it is needed.
 
 * [ ] Review why the generic compiler-wrapper ``cpp`` alias dispatches to the host-default preprocessor instead of the compiler selected by ``SPACK_CC``.
@@ -404,6 +412,11 @@ Keep this evidence when moving capabilities into package-scoped YAML whitelists 
      - configure
      - ``split``, ``realpath``, ``egrep``, ``tail``, ``arch``, ``comm``, ``/etc/hosts``,
        and locale data
+   * - ``intel-oneapi-mkl``
+     - self-extracting installer setup
+     - the static PATH-selected ``df`` compatibility command for the exact ``df -P -B1 .`` form;
+       host ``df`` and procfs mount tables remain inaccessible; the Qt MIME database files
+       ``mime.cache`` and ``types`` validate the signed manifest's PNG assets
    * - stage archive expansion
      - fetch and expand
      - ``tar``, ``unzip``, ``gzip``, ``gunzip``, ``bunzip2``, ``xz``, ``7z``, ``patch``,

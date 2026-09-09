@@ -15,6 +15,7 @@ import errno
 import os
 import pathlib
 import socket
+import subprocess
 import tempfile
 from types import SimpleNamespace
 from typing import List, Tuple, cast
@@ -223,6 +224,61 @@ def test_system_header_policy_denies_unselected_libstdcxx(tmp_path, monkeypatch)
     result = run_json_worker({}, worker, setup=setup)
 
     assert result == {"denied_errno": errno.EACCES, "permitted": True}
+
+
+def test_sandbox_df_command_has_fixed_output(tmp_path):
+    try:
+        sandbox = spack.sandbox.get_sandbox()
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    stage = tmp_path / "stage"
+    stage.mkdir()
+
+    def setup():
+        sandbox.allow_write(stage)
+        sandbox.allow_read("/bin/sh")
+        for path in spack.installer.build.HOST_RUNTIME_READ_PATHS:
+            sandbox.allow_read(path)
+        spack.installer.build.allow_sandbox_commands(sandbox, str(stage))
+        os.chdir(str(stage))
+        sandbox.apply()
+
+    def worker(request):
+        accepted = subprocess.run(
+            ["df", "-P", "-B1", "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        rejected = subprocess.run(
+            ["df", "-h", "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        return {
+            "accepted_returncode": accepted.returncode,
+            "accepted_stdout": accepted.stdout,
+            "command": spack.installer.build.shutil.which("df"),
+            "rejected_returncode": rejected.returncode,
+            "rejected_stderr": rejected.stderr,
+        }
+
+    result = run_json_worker({}, worker, setup=setup)
+
+    assert result["command"] == os.path.join(str(stage), "spack-sandbox-bin", "df")
+    assert result["command"] != os.path.join(spack.installer.build.SANDBOX_COMMAND_DIR, "df")
+    assert result == {
+        "accepted_returncode": 0,
+        "accepted_stdout": (
+            "Filesystem         1-blocks Used        Available Capacity Mounted on\n"
+            "spack-sandbox 1125899906842624    0 1125899906842624       0% /\n"
+        ),
+        "command": os.path.join(str(stage), "spack-sandbox-bin", "df"),
+        "rejected_returncode": 64,
+        "rejected_stderr": "spack sandbox df: unsupported arguments\n",
+    }
 
 
 def test_hide_directories_as_empty_mounts_empty_directory(tmp_path):
@@ -860,6 +916,10 @@ def test_enable_sandbox_paths(
     # Verify sbang read
     assert sbang_file.resolve() in allow_read_resolved
     assert pathlib.Path(which_string("true")).resolve() in allow_read_resolved
+    assert (
+        pathlib.Path(spack.installer.build.SANDBOX_COMMAND_DIR, "df").resolve()
+        in allow_read_resolved
+    )
     for path in spack.installer.build.HOST_RUNTIME_READ_PATHS:
         assert pathlib.Path(path).resolve() in allow_read_resolved
     assert pathlib.Path("/bin/sh").resolve() in allow_read_resolved
@@ -1029,6 +1089,76 @@ def test_compiler_support_paths_queries_all_build_tools(monkeypatch):
         for prefix in ("/wrapper/", "/host/")
     }
     assert "tar" in spack.installer.build.BUILD_PROGRAMS
+    assert "make" in spack.installer.build.BUILD_PROGRAMS
+
+
+def test_allow_sandbox_commands_stages_real_compiler_binutils(tmp_path, monkeypatch):
+    allowed = []
+    compiler = tmp_path / "gcc"
+    assembler = tmp_path / "host" / "bin" / "as"
+    wrapper = tmp_path / "libexec" / "spack" / "as"
+    compiler.touch()
+    assembler.parent.mkdir(parents=True)
+    wrapper.parent.mkdir(parents=True)
+    assembler.touch()
+    wrapper.touch()
+
+    class Sandbox:
+        def allow_read(self, path):
+            allowed.append(path)
+
+    monkeypatch.setattr(
+        spack.installer.build, "_selected_compilers", lambda spec: [("c", str(compiler), spec)]
+    )
+    monkeypatch.setattr(
+        spack.installer.build,
+        "compiler_support_paths",
+        lambda path: [str(wrapper), str(assembler)],
+    )
+    monkeypatch.setattr(
+        spack.installer.build.shutil,
+        "which",
+        lambda program: str(wrapper) if program == "as" else None,
+    )
+
+    stage_bin = tmp_path / "stage" / "spack-sandbox-bin"
+    stage_bin.mkdir(parents=True)
+    (stage_bin / "as").symlink_to(wrapper)
+    spack.installer.build.allow_sandbox_commands(Sandbox(), str(tmp_path / "stage"), spec=object())
+
+    assert (stage_bin / "as").is_symlink()
+    assert (stage_bin / "as").resolve() == assembler
+    assert str(wrapper) not in allowed
+
+
+def test_allow_sandbox_commands_stages_build_environment_bin_paths(tmp_path, monkeypatch):
+    dependency_bin = tmp_path / "dependency" / "bin"
+    ambient_bin = tmp_path / "ambient" / "bin"
+    dependency_bin.mkdir(parents=True)
+    ambient_bin.mkdir(parents=True)
+    dependency_tool = dependency_bin / "dependency-tool"
+    ambient_tool = ambient_bin / "ambient-tool"
+    for executable in (dependency_tool, ambient_tool):
+        executable.touch()
+        executable.chmod(0o755)
+
+    class Sandbox:
+        def allow_read(self, path):
+            pass
+
+    monkeypatch.setattr(spack.installer.build.shutil, "which", lambda program: None)
+
+    env_mods = spack.util.environment.EnvironmentModifications()
+    env_mods.prepend_path("PATH", dependency_bin)
+    build_environment_paths = spack.installer.build.build_environment_bin_paths(env_mods)
+
+    stage_bin = tmp_path / "stage" / "spack-sandbox-bin"
+    spack.installer.build.allow_sandbox_commands(
+        Sandbox(), str(tmp_path / "stage"), build_environment_paths=build_environment_paths
+    )
+
+    assert (stage_bin / "dependency-tool").resolve() == dependency_tool
+    assert not (stage_bin / "ambient-tool").exists()
 
 
 def test_file_executable_support_paths(monkeypatch):

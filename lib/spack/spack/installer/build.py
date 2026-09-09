@@ -88,6 +88,7 @@ OVERWRITE_GARBAGE_SUFFIX = ".garbage"
 #: Temporary compatibility destinations required for Cargo dependency downloads.
 DEFAULT_BUILD_NETWORK_DESTINATIONS: Tuple[str, ...] = (
     "https://repo.maven.apache.org:443",
+    "https://github.com:443",
     "https://index.crates.io:443",
     "https://static.crates.io:443",
 )
@@ -96,6 +97,8 @@ LINUX_HEADER_POLICY_PATH = os.path.join(
     spack.paths.share_path, "sandbox", "linux-header-policy.yaml"
 )
 SYSTEM_GCC_INSTALL_ROOTS = ("/usr/lib/gcc", "/usr/lib64/gcc")
+SANDBOX_COMMAND_DIR = os.path.join(spack.paths.share_path, "sandbox", "commands")
+SANDBOX_COMMANDS = ("df",)
 
 
 def _versioned_directories_by_major(root: Path) -> dict:
@@ -343,6 +346,8 @@ HOST_RUNTIME_READ_PATHS = (
     "/etc/hosts",  # perl
     "/etc/passwd",  # ncurses
     "/etc/mime.types",
+    "/usr/share/mime/mime.cache",  # intel-oneapi-mkl bootstrapper
+    "/usr/share/mime/types",  # intel-oneapi-mkl bootstrapper
     "/etc/ssl/certs",
     "/dev/urandom",  # vc
 )
@@ -358,6 +363,8 @@ COMPILER_PROGRAMS = ("cc1", "cc1plus", "f951", "collect2", "lto1", "lto-wrapper"
 BINUTILS_PROGRAMS = (
     "as",
     "ld",
+    "ld.bfd",
+    "ld.gold",
     "ar",
     "nm",
     "objcopy",  # glib
@@ -419,7 +426,10 @@ BUILD_UTILITIES_PROGRAMS = (
     "grep",
     "hexdump",
     "md5sum",  # bazel
+    "sha384sum",  # intel-oneapi-mkl
     "ldd",
+    "make",
+    "sh",
     "tar",  # self-extracting installers such as CUDA
     "tbl",  # ncurses
     "unzip",  # bazel
@@ -1202,6 +1212,74 @@ def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) 
         sandbox.allow_read(path)
 
 
+def build_environment_bin_paths(
+    env_mods: spack.util.environment.EnvironmentModifications,
+) -> List[str]:
+    """Return dependency bin directories contributed by the build environment setup."""
+    return [
+        str(modification.value)
+        for modification in env_mods.group_by_name().get("PATH", [])
+        if isinstance(modification, spack.util.environment.PrependPath)
+        and os.path.basename(os.path.normpath(str(modification.value))) in ("bin", "bin64")
+    ]
+
+
+def allow_sandbox_commands(
+    sandbox: spack.sandbox.Sandbox,
+    stage_path: str,
+    spec: Optional[spack.spec.Spec] = None,
+    build_environment_paths: Optional[List[str]] = None,
+) -> None:
+    """Allow fixed compatibility commands through a staging-local ``PATH``."""
+    sandbox_bin = os.path.join(stage_path, "spack-sandbox-bin")
+    os.makedirs(sandbox_bin, exist_ok=True)
+
+    def stage_command(source: str, name: str) -> None:
+        sandbox.allow_read(source)
+        link = os.path.join(sandbox_bin, name)
+        if os.path.lexists(link):
+            if os.path.realpath(link) == os.path.realpath(source):
+                return
+            os.unlink(link)
+        os.symlink(source, link)
+
+    for name in SANDBOX_COMMANDS:
+        source = os.path.join(SANDBOX_COMMAND_DIR, name)
+        if not os.path.isfile(source):
+            raise spack.error.InstallError(f"Missing sandbox command: {source}")
+        stage_command(source, name)
+    for name in BUILD_PROGRAMS:
+        if name in COMPILER_PROGRAMS or name in BINUTILS_PROGRAMS:
+            continue
+        source = shutil.which(name)
+        if source:
+            stage_command(source, name)
+    for bin_dir in build_environment_paths or []:
+        if not os.path.isdir(bin_dir):
+            continue
+        for name in os.listdir(bin_dir):
+            source = os.path.join(bin_dir, name)
+            if os.path.isfile(source) and os.access(source, os.X_OK):
+                stage_command(source, name)
+    if spec is not None:
+        for _language, compiler_path, _compiler_spec in _selected_compilers(spec):
+            for source in compiler_support_paths(compiler_path):
+                name = os.path.basename(source)
+                resolved_source = os.path.realpath(source)
+                if (
+                    name not in BINUTILS_PROGRAMS
+                    or not os.path.isfile(source)
+                    or (
+                        os.path.basename(os.path.dirname(resolved_source)) == "spack"
+                        and os.path.basename(os.path.dirname(os.path.dirname(resolved_source)))
+                        == "libexec"
+                    )
+                ):
+                    continue
+                stage_command(source, name)
+    os.environ["PATH"] = sandbox_bin
+
+
 class SandboxListeners(NamedTuple):
     exec_fd: Optional[int]
     network_fd: Optional[int]
@@ -1287,6 +1365,7 @@ def _enable_sandbox(
     proxy_url: Optional[str] = None,
     makeflags: Optional[Makeflags] = None,
     mount_namespace_ready: bool = False,
+    build_environment_paths: Optional[List[str]] = None,
 ) -> SandboxListeners:
     if not config.get("enable", False):
         return SandboxListeners(None, None)
@@ -1309,6 +1388,8 @@ def _enable_sandbox(
         sandbox = spack.sandbox.get_sandbox()
     except spack.sandbox.SandboxError as e:
         raise spack.error.InstallError(f"Cannot enable build sandbox: {e}") from e
+
+    allow_sandbox_commands(sandbox, stage_path, spec, build_environment_paths)
 
     for dep in spec.traverse(root=False):
         if not dep.external:
@@ -1536,6 +1617,7 @@ def _install(
             request.network_proxy_url,
             makeflags,
             mount_namespace_ready,
+            build_environment_bin_paths(env_mods),
         )
         if listeners.exec_fd is not None:
             send_exec_listener(listeners.exec_fd, state_stream)
