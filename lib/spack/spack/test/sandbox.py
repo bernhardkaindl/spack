@@ -15,6 +15,7 @@ import errno
 import os
 import pathlib
 import socket
+import subprocess
 import tempfile
 from types import SimpleNamespace
 from typing import List, Tuple, cast
@@ -234,6 +235,61 @@ def test_system_header_policy_denies_unselected_libstdcxx(tmp_path, monkeypatch)
     result = run_json_worker({}, worker, setup=setup)
 
     assert result == {"denied_errno": errno.EACCES, "permitted": True}
+
+
+def test_sandbox_df_command_has_fixed_output(tmp_path):
+    try:
+        sandbox = spack.sandbox.get_sandbox()
+    except spack.sandbox.SandboxError as error:
+        pytest.skip(str(error))
+
+    stage = tmp_path / "stage"
+    stage.mkdir()
+
+    def setup():
+        sandbox.allow_write(stage)
+        sandbox.allow_read("/bin/sh")
+        for path in spack.installer.build.HOST_RUNTIME_READ_PATHS:
+            sandbox.allow_read(path)
+        spack.installer.build.allow_sandbox_commands(sandbox, str(stage))
+        os.chdir(str(stage))
+        sandbox.apply()
+
+    def worker(request):
+        accepted = subprocess.run(
+            ["df", "-P", "-B1", "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        rejected = subprocess.run(
+            ["df", "-h", "."],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        return {
+            "accepted_returncode": accepted.returncode,
+            "accepted_stdout": accepted.stdout,
+            "command": spack.installer.build.shutil.which("df"),
+            "rejected_returncode": rejected.returncode,
+            "rejected_stderr": rejected.stderr,
+        }
+
+    result = run_json_worker({}, worker, setup=setup)
+
+    assert result["command"] == os.path.join(str(stage), "spack-sandbox-bin", "df")
+    assert result["command"] != os.path.join(spack.installer.build.SANDBOX_COMMAND_DIR, "df")
+    assert result == {
+        "accepted_returncode": 0,
+        "accepted_stdout": (
+            "Filesystem         1-blocks Used        Available Capacity Mounted on\n"
+            "spack-sandbox 1125899906842624    0 1125899906842624       0% /\n"
+        ),
+        "command": os.path.join(str(stage), "spack-sandbox-bin", "df"),
+        "rejected_returncode": 64,
+        "rejected_stderr": "spack sandbox df: unsupported arguments\n",
+    }
 
 
 def test_hide_directories_as_empty_mounts_empty_directory(tmp_path):
@@ -1173,6 +1229,10 @@ def test_enable_sandbox_paths(
     # Verify sbang read
     assert sbang_file.resolve() in allow_read_resolved
     assert pathlib.Path(which_string("true")).resolve() in allow_read_resolved
+    assert (
+        pathlib.Path(spack.installer.build.SANDBOX_COMMAND_DIR, "df").resolve()
+        in allow_read_resolved
+    )
     for path in spack.installer.build.HOST_RUNTIME_READ_PATHS:
         assert pathlib.Path(path).resolve() in allow_read_resolved
     assert pathlib.Path("/bin/sh").resolve() in allow_read_resolved

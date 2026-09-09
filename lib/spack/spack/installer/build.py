@@ -88,6 +88,7 @@ OVERWRITE_GARBAGE_SUFFIX = ".garbage"
 #: Temporary compatibility destinations required for Cargo dependency downloads.
 DEFAULT_BUILD_NETWORK_DESTINATIONS: Tuple[str, ...] = (
     "https://repo.maven.apache.org:443",
+    "https://github.com:443",
     "https://index.crates.io:443",
     "https://static.crates.io:443",
 )
@@ -97,6 +98,7 @@ LINUX_HEADER_POLICY_PATH = os.path.join(
 )
 SANDBOX_POLICY_PATH = os.path.join(spack.paths.share_path, "sandbox", "sandbox.yaml")
 SYSTEM_GCC_INSTALL_ROOTS = ("/usr/lib/gcc", "/usr/lib64/gcc")
+SANDBOX_COMMAND_DIR = os.path.join(spack.paths.share_path, "sandbox", "commands")
 
 
 def _load_sandbox_policy(path: str = SANDBOX_POLICY_PATH) -> dict:
@@ -1313,6 +1315,7 @@ def _enable_sandbox(
     proxy_url: Optional[str] = None,
     makeflags: Optional[Makeflags] = None,
     mount_namespace_ready: bool = False,
+    build_environment_paths: Optional[List[str]] = None,
 ) -> SandboxListeners:
     if not config.get("enable", False):
         return SandboxListeners(None, None)
@@ -1335,6 +1338,8 @@ def _enable_sandbox(
         sandbox = spack.sandbox.get_sandbox()
     except spack.sandbox.SandboxError as e:
         raise spack.error.InstallError(f"Cannot enable build sandbox: {e}") from e
+
+    allow_sandbox_commands(sandbox, stage_path, spec, build_environment_paths)
 
     for dep in spec.traverse(root=False):
         if not dep.external:
@@ -1562,6 +1567,7 @@ def _install(
             request.network_proxy_url,
             makeflags,
             mount_namespace_ready,
+            build_environment_bin_paths(env_mods),
         )
         if listeners.exec_fd is not None:
             send_exec_listener(listeners.exec_fd, state_stream)
