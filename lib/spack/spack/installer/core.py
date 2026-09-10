@@ -607,6 +607,18 @@ class PackageInstaller:
         self._drain_child_output(build, selector)
         self._drain_child_state(build, selector)
         exitcode = build.close(selector)
+        if build.network_denials:
+            counts = {}
+            for denial in build.network_denials:
+                counts[denial] = counts.get(denial, 0) + 1
+            lines = ["Sandbox denied operations:"]
+            for denial, count in counts.items():
+                suffix = " ({0} attempts)".format(count) if count > 1 else ""
+                lines.append("  {0}{1}".format(denial, suffix))
+            summary = "\n".join(lines) + "\n"
+            with open(build.log_path, "a", encoding="utf-8") as stream:
+                stream.write(summary)
+            spack.util.tty.warn(summary.rstrip())
         self.report_data.finish_record(build.spec, exitcode, build.log_path)
 
         if build.network_supervisor_errors:
@@ -1047,6 +1059,9 @@ class PackageInstaller:
                     executable_logger=(
                         record_executable if spack.install_worker.learning.enabled() else None
                     ),
+                    denial_logger=lambda message: child_info.network_denials.append(
+                        "seccomp " + message
+                    ),
                 )
 
                 def supervise() -> None:
@@ -1054,6 +1069,7 @@ class PackageInstaller:
                         supervisor.serve(child_info.network_supervisor_stop)
                     except BaseException as error:
                         child_info.network_supervisor_errors.append(error)
+                        child_info.close_network_listener()
                         child_info.proc.terminate()
 
                 thread = threading.Thread(target=supervise)

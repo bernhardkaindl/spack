@@ -8,6 +8,7 @@ import os
 import socket
 import subprocess
 import tarfile
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -111,10 +112,11 @@ def archive_server(mock_archive, monkeypatch, tmp_path):
         monkeypatch.setattr(
             spack.util.proxy,
             "LocalHTTPProxy",
-            lambda policy, credential, timeout: proxy_type(
+            lambda policy, credential, timeout, denial_logger: proxy_type(
                 policy,
                 credential=credential,
                 timeout=timeout,
+                denial_logger=denial_logger,
                 address_allowed=lambda address: True,
             ),
         )
@@ -205,11 +207,13 @@ def test_stage_package_grants_lock_write_only_when_acquired(
     package = _package_for_url(mock_archive.url, monkeypatch, tmp_path)
     captured_read_roots = []
     captured_write_roots = []
+    captured_temporary_dirs = []
     captured_timeout = []
 
-    def capture_setup(read_roots, write_roots):
+    def capture_setup(read_roots, write_roots, temporary_dir):
         captured_read_roots.extend(read_roots)
         captured_write_roots.extend(write_roots)
+        captured_temporary_dirs.append(temporary_dir)
 
     def run_worker(request, worker, proxy_policy, setup, timeout):
         setup()
@@ -225,6 +229,9 @@ def test_stage_package_grants_lock_write_only_when_acquired(
     assert set(_store_database_read_roots()).issubset(captured_read_roots)
     assert set(_dependency_read_roots(package.spec)).issubset(captured_read_roots)
     assert (stage_lock in captured_write_roots) is acquire_lock
+    package_path = package.path
+    assert package_path is not None
+    assert captured_temporary_dirs == [os.path.join(package_path, "spack-stage-tmp")]
     assert captured_timeout == [3600]
 
 
@@ -325,16 +332,67 @@ def test_stage_policy_limits_process_network_ipc_and_writes(tmp_path):
     assert not (sibling / "denied").exists()
 
 
+def test_stage_policy_allows_git_version(tmp_path):
+    if not spack.sandbox.network_supervision_available():
+        pytest.skip("seccomp network supervision is unavailable")
+
+    read_roots = _expansion_read_roots()
+    git = next((path for path in read_roots if os.path.basename(path) == "git"), None)
+    if git is None:
+        pytest.skip("git is unavailable")
+    stage_tmpdir = str(tmp_path / "spack-stage-tmp")
+    os.makedirs(stage_tmpdir)
+
+    def worker(request):
+        temporary_dir = tempfile.mkdtemp()
+        with open("/dev/urandom", "rb") as stream:
+            random_bytes = stream.read(16)
+        completed = subprocess.run(
+            [request["git"], "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        return {
+            "returncode": completed.returncode,
+            "random_bytes": len(random_bytes),
+            "stderr": completed.stderr,
+            "temporary_dir": temporary_dir,
+        }
+
+    result = spack.util.sandbox.run_json_worker_with_network(
+        {"git": git},
+        worker,
+        DestinationPolicy.allow_any(),
+        setup=lambda: _stage_setup(read_roots, [os.devnull, stage_tmpdir], stage_tmpdir),
+        timeout=10,
+    )
+
+    assert result["returncode"] == 0
+    assert result["random_bytes"] == 16
+    assert result["stderr"] == ""
+    assert os.path.dirname(result["temporary_dir"]) == stage_tmpdir
+
+
 def test_expansion_roots_include_gzip_helper_chain(monkeypatch):
     tools = {name: "/tools/{0}".format(name) for name in spack.install_worker.stage._STAGE_TOOLS}
     monkeypatch.setattr(spack.install_worker.stage, "which_string", tools.get)
     monkeypatch.setattr(spack.install_worker.stage, "host_dynamic_linker_search_paths", lambda: [])
+    monkeypatch.setattr(
+        spack.install_worker.stage.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="/tools/git-core\n"),
+    )
 
     read_roots = _expansion_read_roots()
 
     assert "/tools/gzip" in read_roots
     assert "/tools/gunzip" in read_roots
     assert "/tools/sh" in read_roots
+    assert "/tools/git" in read_roots
+    assert "/tools/git-core" in read_roots
+    assert "/dev/urandom" in read_roots
 
 
 def test_tool_runtime_roots_include_selected_tool_and_dependency_closure(tmp_path):
@@ -365,12 +423,15 @@ def test_stage_setup_failure_names_operation(monkeypatch):
         ),
     ):
         spack.util.sandbox.run_json_worker(
-            {}, lambda request: {}, setup=lambda: _stage_setup([], [])
+            {}, lambda request: {}, setup=lambda: _stage_setup([], [], os.devnull)
         )
 
 
 def test_stage_setup_reinitializes_store_before_confinement(monkeypatch):
     events = []
+    monkeypatch.setattr(tempfile, "tempdir", tempfile.tempdir)
+    for name in ("TMPDIR", "TMP", "TEMP", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+        monkeypatch.setitem(os.environ, name, os.environ.get(name, ""))
     monkeypatch.setattr(
         spack.install_worker.stage.FILE_TRACKER,
         "discard_after_fork",
@@ -385,7 +446,7 @@ def test_stage_setup_reinitializes_store_before_confinement(monkeypatch):
         lambda read_roots, write_roots: events.append("confine"),
     )
 
-    _stage_setup([], [])
+    _stage_setup([], [], os.devnull)
 
     assert events == ["locks", "store", "confine"]
 

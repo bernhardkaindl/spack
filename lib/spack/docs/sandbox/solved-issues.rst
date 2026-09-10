@@ -68,3 +68,34 @@ Other namespace and mount errors still fail before recipe-controlled build phase
 
 Focused policy tests prove that the ``/usr/include`` parent is absent, required libc and Linux roots are present, only the selected libstdc++ version is granted, GCC 16 receives its own headers, and competing GCC installations are selected for masking.
 The existing real-kernel masking test proves that every selected directory appears empty inside the private namespace.
+
+.. _sandbox-solved-stage-git-mirror-fallback:
+
+Git source fallback after a mirror miss
+---------------------------------------
+
+Git-based packages such as ``cpuinfo``, ``fxdiv``, ``psimd``, ``fp16``, and ``pthreadpool`` first tried the source mirror and received ``404 Not Found``.
+Their fallback to the upstream Git repository then failed while running ``/usr/bin/git --version``.
+Adding GitHub to the build-phase destination policy did not affect these failures because source fetching occurs earlier in the dedicated stage worker.
+That worker already routes arbitrary fetch destinations through its supervised proxy, but its filesystem policy omitted the selected Git executable, Git's helper directory, readable access to ``/dev/urandom``, and writable access to ``/dev/null``.
+
+The stage parent now resolves ``git`` and runs ``git --exec-path`` before confinement.
+It grants the worker read and execute access to that exact Git executable and absolute helper directory, which contains transports such as ``git-remote-https``.
+It also grants writable access to ``/dev/null``, which Git opens during startup.
+It grants read access to ``/dev/urandom``, which Git uses when creating temporary pack files.
+The worker redirects Git's global configuration to ``/dev/null`` and disables system configuration so staging does not depend on denied host configuration files.
+Git checkout subsequently exposed a second staging assumption when ``tempfile.mkdtemp()`` tried to create a directory directly below denied host ``/tmp``.
+The parent now creates ``spack-stage-tmp`` below the selected writable stage root.
+Worker setup points ``TMPDIR``, ``TMP``, ``TEMP``, and Python's cached ``tempfile.tempdir`` at that directory before applying confinement.
+This does not grant direct network access or widen the later build-phase destination policy.
+The stage worker still sends connections through the authenticated local proxy, and its seccomp policy continues to deny direct network, DNS, UDP, and Unix-socket access.
+The trusted supervisor verifies the parent-process chain of helper processes before connecting their inherited TCP sockets to that proxy.
+
+A focused policy test verifies that both the selected Git executable and its helper directory are included in the stage worker's read roots.
+A real confined-worker regression verifies that ``git --version`` succeeds, ``/dev/urandom`` is readable, and Python temporary directories are created below ``spack-stage-tmp``.
+Quiet Git commands now capture standard error and include it in ``ProcessError`` when they fail, so stage and install logs retain Git's fatal diagnostic instead of only its exit status and command line.
+
+The network-worker parent collects proxy policy denials and rejected seccomp socket or connection operations.
+It writes a deduplicated summary after each task that encountered a denial, including failed tasks.
+Landlock does not expose denied filesystem paths through a notification API.
+Those paths can therefore be reported only when the affected application includes them in standard error, as Git did for ``/dev/urandom``.

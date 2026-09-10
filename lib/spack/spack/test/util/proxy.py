@@ -505,6 +505,36 @@ def test_connect_supervisor_duplicates_descendant_socket(monkeypatch):
     assert seccomp.responses == [(99, 0, 0)]
 
 
+def test_connect_supervisor_accepts_descendant_process(monkeypatch):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    worker_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    seccomp = _FakeSeccomp(_notification(pid=457, target_fd=worker_socket.fileno()))
+    parents = {457: 456, 456: 123}
+    monkeypatch.setattr(proxy_util, "pidfd_open", lambda pid: os.open(os.devnull, os.O_RDONLY))
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=listener.getsockname(),
+        seccomp=cast(Any, seccomp),
+        duplicate_fd=lambda pidfd, target_fd: os.dup(target_fd),
+        thread_group_id=lambda thread_id, is_valid: thread_id,
+        task_process_id=lambda thread_id, is_valid: thread_id,
+        parent_process_id=lambda process_id, is_valid: parents.get(process_id),
+    )
+    try:
+        supervisor.handle_once()
+        accepted, _address = listener.accept()
+        accepted.close()
+        assert worker_socket.getpeername() == listener.getsockname()
+        assert seccomp.responses == [(99, 0, 0)]
+    finally:
+        worker_socket.close()
+        listener.close()
+
+
 def test_connect_supervisor_records_and_continues_exec():
     seccomp = _FakeSeccomp(_notification(syscall=59))
     executables = []
@@ -566,6 +596,163 @@ def test_connect_supervisor_injects_tcp_socket():
     assert not seccomp.responses
 
 
+def test_connect_supervisor_ignores_stale_socket_notification():
+    notification = _notification(syscall=41)
+    notification.data.args[0] = socket.AF_UNIX
+    notification.data.args[1] = socket.SOCK_STREAM
+    notification.data.args[2] = 0
+    seccomp = _FakeSeccomp(notification)
+
+    def stale_response(*args, **kwargs):
+        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
+
+    seccomp.respond_to_notification = stale_response
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=("127.0.0.1", 1),
+        seccomp=cast(Any, seccomp),
+        thread_group_id=lambda thread_id, is_valid: 123,
+    )
+
+    supervisor.handle_once()
+
+
+def test_connect_supervisor_continues_unix_socket():
+    notification = _notification(syscall=41)
+    notification.data.args[0] = socket.AF_UNIX
+    notification.data.args[1] = socket.SOCK_STREAM | socket.SOCK_CLOEXEC
+    notification.data.args[2] = 0
+    seccomp = _FakeSeccomp(notification)
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=("127.0.0.1", 1),
+        seccomp=cast(Any, seccomp),
+        thread_group_id=lambda thread_id, is_valid: 123,
+    )
+
+    supervisor.handle_once()
+
+    assert seccomp.continued == [99]
+    assert not seccomp.responses
+    assert not seccomp.added_fds
+
+
+def test_connect_supervisor_continues_unix_connect(tmp_path):
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    socket_path = str(tmp_path / "socket")
+    server.bind(socket_path)
+    server.listen()
+    notification = _notification(syscall=42, target_fd=client.fileno())
+    seccomp = _FakeSeccomp(notification)
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=("127.0.0.1", 1),
+        seccomp=cast(Any, seccomp),
+        duplicate_fd=lambda pidfd, target_fd: os.dup(target_fd),
+        thread_group_id=lambda thread_id, is_valid: 123,
+    )
+
+    try:
+        supervisor.handle_once()
+    finally:
+        client.close()
+        server.close()
+        os.unlink(socket_path)
+
+    assert seccomp.continued == [99]
+    assert not seccomp.responses
+
+
+def test_connect_supervisor_ignores_stale_tcp_socket_injection():
+    notification = _notification(syscall=41)
+    notification.data.args[0] = socket.AF_INET
+    notification.data.args[1] = socket.SOCK_STREAM
+    notification.data.args[2] = 0
+    seccomp = _FakeSeccomp(notification)
+
+    def stale_addfd(*args, **kwargs):
+        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
+
+    seccomp.addfd_to_notification = stale_addfd
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=("127.0.0.1", 1),
+        seccomp=cast(Any, seccomp),
+        thread_group_id=lambda thread_id, is_valid: 123,
+    )
+
+    supervisor.handle_once()
+
+
+def test_connect_supervisor_ignores_stale_notification_receive(monkeypatch):
+    seccomp = _FakeSeccomp(_notification())
+
+    def stale_receive(listener_fd):
+        raise OSError(errno.ENOENT, os.strerror(errno.ENOENT))
+
+    stopped = threading.Event()
+
+    def readable_listener(readers, writers, exceptional, timeout):
+        stopped.set()
+        return readers, [], []
+
+    seccomp.receive_notification = stale_receive
+    monkeypatch.setattr(proxy_util.select, "select", readable_listener)
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=("127.0.0.1", 1),
+        seccomp=cast(Any, seccomp),
+    )
+
+    supervisor.serve(stopped)
+
+
+def test_connect_supervisor_continues_after_canceled_notification(monkeypatch):
+    seccomp = _FakeSeccomp(_notification(pid=123))
+    receive_attempts = []
+
+    def canceled_then_valid(listener_fd):
+        receive_attempts.append(listener_fd)
+        if len(receive_attempts) == 1:
+            raise OSError(errno.ECANCELED, os.strerror(errno.ECANCELED))
+        return seccomp.notification
+
+    stopped = threading.Event()
+
+    def readable_listener(readers, writers, exceptional, timeout):
+        if len(receive_attempts) == 1:
+            stopped.set()
+        return readers, [], []
+
+    seccomp.receive_notification = canceled_then_valid
+    monkeypatch.setattr(proxy_util.select, "select", readable_listener)
+    supervisor = ConnectSupervisor(
+        listener_fd=10,
+        worker_pid=123,
+        pidfd=11,
+        proxy_address=("127.0.0.1", 1),
+        seccomp=cast(Any, seccomp),
+        duplicate_fd=lambda pidfd, target_fd: pytest.fail("socket must not be duplicated"),
+        thread_group_id=lambda thread_id, is_valid: 456,
+    )
+
+    supervisor.serve(stopped)
+
+    assert receive_attempts == [10, 10]
+    assert seccomp.responses == [(99, 0, errno.EPERM)]
+
+
 @pytest.mark.parametrize(
     "domain,socket_type,protocol",
     [
@@ -580,6 +767,7 @@ def test_connect_supervisor_denies_unsupported_socket(domain, socket_type, proto
     notification.data.args[1] = socket_type
     notification.data.args[2] = protocol
     seccomp = _FakeSeccomp(notification)
+    denials = []
     supervisor = ConnectSupervisor(
         listener_fd=10,
         worker_pid=123,
@@ -587,9 +775,13 @@ def test_connect_supervisor_denies_unsupported_socket(domain, socket_type, proto
         proxy_address=("127.0.0.1", 1),
         seccomp=cast(Any, seccomp),
         thread_group_id=lambda thread_id, is_valid: 123,
+        denial_logger=denials.append,
     )
 
     supervisor.handle_once()
 
     assert seccomp.responses == [(99, 0, errno.EPROTONOSUPPORT)]
     assert not seccomp.added_fds
+    assert denials == [
+        "socket family={0} type={1} protocol={2}".format(domain, socket_type, protocol)
+    ]

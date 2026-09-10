@@ -7,7 +7,9 @@
 import mimetypes
 import os
 import ssl
+import subprocess
 import sysconfig
+import tempfile
 from typing import Any, Dict, List, Optional, cast
 
 import spack.caches
@@ -29,7 +31,8 @@ from spack.util.proxy import DestinationPolicy
 
 _STAGE_REQUEST_KEYS = {"acquire_lock", "patch", "path", "request"}
 _STAGE_RESPONSE_KEYS = {"dag_hash", "path"}
-_STAGE_TOOLS = ("tar", "unzip", "gzip", "gunzip", "bunzip2", "xz", "7z", "patch", "sh")
+_STAGE_TOOLS = ("tar", "unzip", "gzip", "gunzip", "bunzip2", "xz", "7z", "patch", "sh", "git")
+_STAGE_RUNTIME_READ_PATHS = ("/dev/urandom",)
 _STAGE_WORKER_TIMEOUT_SECONDS = 3600
 
 
@@ -106,12 +109,26 @@ def _tool_runtime_roots(spec: spack.spec.Spec, tool_paths: List[str]) -> List[st
 
 
 def _expansion_read_roots(spec: Optional[spack.spec.Spec] = None) -> List[str]:
-    roots = list(host_dynamic_linker_search_paths())
+    roots = list(host_dynamic_linker_search_paths()) + list(_STAGE_RUNTIME_READ_PATHS)
     tool_paths = []
     for name in _STAGE_TOOLS:
         path = which_string(name)
         if path:
             tool_paths.append(path)
+            if name == "git":
+                try:
+                    completed = subprocess.run(
+                        [path, "--exec-path"],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        universal_newlines=True,
+                    )
+                except OSError:
+                    continue
+                exec_path = completed.stdout.strip()
+                if completed.returncode == 0 and os.path.isabs(exec_path):
+                    roots.append(exec_path)
     roots.extend(tool_paths)
     if spec is not None:
         roots.extend(_tool_runtime_roots(spec, tool_paths))
@@ -143,9 +160,14 @@ def _dependency_read_roots(spec: spack.spec.Spec) -> List[str]:
     return [str(node.prefix) for node in spec.traverse(root=False) if not node.external]
 
 
-def _stage_setup(read_roots: List[str], write_roots: List[str]) -> None:
+def _stage_setup(read_roots: List[str], write_roots: List[str], temporary_dir: str) -> None:
     FILE_TRACKER.discard_after_fork()
     spack.store.reinitialize()
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        os.environ[name] = temporary_dir
+    tempfile.tempdir = temporary_dir
+    os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+    os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
     try:
         from spack.oci import opener
         from spack.util import web
@@ -198,7 +220,8 @@ def stage_package(
     expected_stage_path = package.stage.path
     stage_lock = os.path.join(global_stage_root, ".lock")
     fetch_cache = spack.caches.fetch_cache_location()
-    for root in (global_stage_root, stage_root, fetch_cache):
+    stage_tmpdir = os.path.join(stage_root, "spack-stage-tmp")
+    for root in (global_stage_root, stage_root, fetch_cache, stage_tmpdir):
         fs.mkdirp(root)
     fs.touch(stage_lock)
     read_roots = (
@@ -208,14 +231,14 @@ def stage_package(
         + _store_database_read_roots()
         + _dependency_read_roots(package.spec)
     )
-    write_roots = [stage_root, fetch_cache]
+    write_roots = [stage_root, fetch_cache, os.devnull]
     if acquire_lock and stage_root != global_stage_root:
         write_roots.append(stage_lock)
     response = spack.util.sandbox.run_json_worker_with_network(
         request,
         _stage_worker,
         DestinationPolicy.allow_any(),
-        setup=lambda: _stage_setup(read_roots, write_roots),
+        setup=lambda: _stage_setup(read_roots, write_roots, stage_tmpdir),
         timeout=_STAGE_WORKER_TIMEOUT_SECONDS,
     )
     return _validate_stage_response(response, package.spec.dag_hash(), expected_stage_path)

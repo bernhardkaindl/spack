@@ -6,6 +6,8 @@ import base64
 import os
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -352,6 +354,47 @@ def test_network_worker_connects_only_to_local_proxy():
     assert result["response"].startswith("HTTP/1.1 502")
 
 
+def test_network_worker_supervises_descendant_nonblocking_socket():
+    if not spack.sandbox.network_supervision_available():
+        pytest.skip("seccomp network supervision is unavailable")
+
+    code = "".join(
+        (
+            "import errno\n",
+            "import socket\n",
+            "import threading\n",
+            "for _ in range(4):\n",
+            "    try:\n",
+            "        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)\n",
+            "    except OSError as error:\n",
+            "        if error.errno != errno.EPROTONOSUPPORT:\n",
+            "            raise\n",
+            "errors = []\n",
+            "def create_socket():\n",
+            "    try:\n",
+            "        socket.socket(socket.AF_INET, socket.SOCK_STREAM | socket.SOCK_NONBLOCK | ",
+            "socket.SOCK_CLOEXEC).close()\n",
+            "    except BaseException as error:\n",
+            "        errors.append(error)\n",
+            "threads = [threading.Thread(target=create_socket) for _ in range(8)]\n",
+            "for thread in threads:\n",
+            "    thread.start()\n",
+            "for thread in threads:\n",
+            "    thread.join()\n",
+            "if errors:\n",
+            "    raise errors[0]\n",
+        )
+    )
+
+    def worker(request):
+        subprocess.check_call([sys.executable, "-c", code])
+        return {"ok": True}
+
+    assert spack.util.sandbox.run_json_worker_with_network(
+        {}, worker, DestinationPolicy.allow_any(), timeout=10
+    ) == {"ok": True}
+
+
 def test_network_worker_injects_authenticated_proxy_environment(monkeypatch):
     if not spack.sandbox.network_supervision_available():
         pytest.skip("seccomp network supervision is unavailable")
@@ -371,3 +414,36 @@ def test_network_worker_injects_authenticated_proxy_environment(monkeypatch):
     assert parsed.username == "spack"
     assert parsed.password
     assert parsed.hostname == "127.0.0.1"
+
+
+def test_network_worker_reports_denials_at_completion(monkeypatch):
+    if not spack.sandbox.network_supervision_available():
+        pytest.skip("seccomp network supervision is unavailable")
+    warnings = []
+    monkeypatch.setattr(spack.util.sandbox.tty, "warn", warnings.append)
+
+    def worker(request):
+        proxy = urllib.parse.urlsplit(os.environ["HTTP_PROXY"])
+        connection = socket.create_connection((proxy.hostname, proxy.port), timeout=5)
+        try:
+            credential = "{0}:{1}".format(proxy.username, proxy.password).encode("utf-8")
+            authorization = base64.b64encode(credential).decode("ascii")
+            request = (
+                "GET http://example.com/denied HTTP/1.1\r\n"
+                "Proxy-Authorization: Basic {0}\r\n"
+                "Connection: close\r\n\r\n"
+            ).format(authorization)
+            connection.sendall(request.encode("ascii"))
+            return connection.recv(1024).decode("ascii", "replace")
+        finally:
+            connection.close()
+
+    response = spack.util.sandbox.run_json_worker_with_network(
+        {}, worker, DestinationPolicy.from_urls(()), timeout=10
+    )
+
+    assert response.startswith("HTTP/1.1 403")
+    assert warnings == [
+        "Sandbox denied operations:",
+        "  proxy http://example.com:80: destination is not authorized",
+    ]

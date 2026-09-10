@@ -147,9 +147,15 @@ Use ``run_json_worker_with_network`` or a narrow evolution of that mechanism.
 Do not recreate proxy or fetch logic.
 The stage worker uses a bounded one-hour deadline so multi-gigabyte installers can finish downloading and expanding.
 
-Normal staging may invoke only individually resolved ``tar``, ``unzip``, ``patch``, compression fallback tools, and subordinate helpers such as GNU tar's ``gunzip`` and its shell interpreter.
+Normal staging may invoke only individually resolved ``tar``, ``unzip``, ``patch``, ``git``, compression fallback tools, and subordinate helpers such as GNU tar's ``gunzip``, its shell interpreter, and Git's transport helpers.
 Their loader/library paths are readable.
 For a tool selected from the concrete DAG, only that tool's link/run dependency closure is added; an unselected executable remains inaccessible.
+The stage parent creates ``spack-stage-tmp`` below the selected stage and points ``TMPDIR``, ``TMP``, ``TEMP``, and Python's cached temporary directory at it before confinement.
+Git receives readable ``/dev/urandom``, writable ``/dev/null``, and isolated global and system configuration.
+The network supervisor accepts inherited TCP sockets only from a process whose verified parent chain reaches the worker.
+Quiet Git failures preserve standard error in the worker error response and package log.
+After staging and build tasks, proxy and seccomp denials are deduplicated and reported in the retained log.
+Landlock does not provide denied-path notifications, so a filesystem path appears only when the affected application reports it in standard error.
 Stage and build workers currently impose no installer memory ceiling because package builds can legitimately require most of a large host.
 They retain limits inherited from the invoking process or service.
 Future adaptive admission and throttling have a dedicated planning page in the sandbox documentation.

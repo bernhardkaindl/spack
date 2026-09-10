@@ -19,6 +19,8 @@ import time
 import traceback
 from typing import Any, Callable, Dict, Generator, Iterable, Optional, Set, Tuple
 
+import spack.util.tty as tty
+
 MAX_MESSAGE_BYTES = 4 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_STREAM_RESPONSE_BYTES = 1024 * 1024 * 1024
@@ -582,8 +584,25 @@ def run_json_worker_with_network(
     import spack.sandbox
     from spack.util.proxy import ConnectSupervisor, LocalHTTPProxy
 
+    denial_counts: Dict[str, int] = {}
+    denial_lock = threading.Lock()
+
+    def record_denial(message: str) -> None:
+        with denial_lock:
+            denial_counts[message] = denial_counts.get(message, 0) + 1
+
+    def record_proxy_denial(destination, reason: str) -> None:
+        record_denial(
+            "proxy {0}://{1}:{2}: {3}".format(
+                destination.scheme, destination.host, destination.port, reason
+            )
+        )
+
     local_proxy = LocalHTTPProxy(
-        proxy_policy, credential=secrets.token_urlsafe(32), timeout=timeout
+        proxy_policy,
+        credential=secrets.token_urlsafe(32),
+        timeout=timeout,
+        denial_logger=record_proxy_denial,
     )
     local_proxy.bind()
     proxy_url = local_proxy.authenticated_url
@@ -642,7 +661,14 @@ def run_json_worker_with_network(
         child_listener_fd = _receive_listener_fd_number(control_parent, _remaining_time(deadline))
         listener_fd = spack.sandbox.pidfd_getfd(pidfd, child_listener_fd)
         control_parent.sendall(b"1")
-        supervisor = ConnectSupervisor(listener_fd, pid, pidfd, proxy_address, timeout=timeout)
+        supervisor = ConnectSupervisor(
+            listener_fd,
+            pid,
+            pidfd,
+            proxy_address,
+            timeout=timeout,
+            denial_logger=lambda message: record_denial("seccomp " + message),
+        )
 
         def supervise() -> None:
             try:
@@ -680,6 +706,11 @@ def run_json_worker_with_network(
         if pidfd >= 0:
             os.close(pidfd)
         local_proxy.stop()
+        if denial_counts:
+            tty.warn("Sandbox denied operations:")
+            for message, count in denial_counts.items():
+                suffix = " ({0} attempts)".format(count) if count > 1 else ""
+                tty.warn("  {0}{1}".format(message, suffix))
 
     if supervisor_errors:
         raise JsonWorkerError("network supervisor failed: {0}".format(supervisor_errors[0]))

@@ -137,7 +137,17 @@ def test_build_failure_reported_through_event_loop(temporary_store, mock_package
     """A build exiting with an error yields exactly one failed event, an InstallError naming the
     log file, and no database record -- without forking any build process."""
     spec = _make_concrete("trivial-install-test-package")
-    launcher = ScriptedLauncher({spec.name: Script(exitcode=ExitCode.BUILD_ERROR)})
+    launcher = ScriptedLauncher(
+        {
+            spec.name: Script(
+                exitcode=ExitCode.BUILD_ERROR,
+                network_denials=(
+                    "proxy https://example.com:443: destination is not authorized",
+                    "proxy https://example.com:443: destination is not authorized",
+                ),
+            )
+        }
+    )
     ui = RecordingUI()
     installer = PackageInstaller([spec.package], explicit=True, ui=ui, launcher=launcher)
 
@@ -146,6 +156,10 @@ def test_build_failure_reported_through_event_loop(temporary_store, mock_package
 
     dag_hash = spec.dag_hash()
     assert installer.log_paths[dag_hash] in str(exc_info.value)
+    with open(installer.log_paths[dag_hash], encoding="utf-8") as stream:
+        log = stream.read()
+    assert "Sandbox denied operations:" in log
+    assert "proxy https://example.com:443: destination is not authorized (2 attempts)" in log
     failed = [e for e in ui.events if e[0] == "state_changed" and e[2] == "failed"]
     assert failed == [("state_changed", dag_hash, "failed")]
     assert _record(temporary_store, spec) is None
