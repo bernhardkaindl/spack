@@ -124,6 +124,15 @@ def test_mock_git_exe(mock_util_executable):
     assert "status" in "\n".join(log)
 
 
+def test_exec_git_commands_preserves_failure_stderr():
+    shell = exe.Executable("/bin/sh")
+
+    with pytest.raises(exe.ProcessError, match="stage git failure"):
+        spack.util.git._exec_git_commands(
+            shell, [["-c", "echo stage git failure >&2; exit 1"]], debug=False
+        )
+
+
 @pytest.mark.parametrize("git_version", ("1.5.0", "1.3.0"))
 def test_git_exe_conditional_option(mock_util_executable, git_version):
     log, _, registered_responses = mock_util_executable

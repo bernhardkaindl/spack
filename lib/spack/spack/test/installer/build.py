@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Tests for the installer.build module (PrefixPivoter and prefix management)."""
 
+import os
 import pathlib
 from types import SimpleNamespace
 from typing import Any
@@ -24,12 +25,15 @@ from spack.installer.build import (
 from spack.util.proxy import DestinationPolicy
 
 
-def test_default_build_network_destinations_only_allow_cargo_downloads():
+def test_default_build_network_destinations_allow_supported_dependency_downloads():
     policy = DestinationPolicy.from_urls(DEFAULT_BUILD_NETWORK_DESTINATIONS)
 
+    assert policy.allows("https", "repo.maven.apache.org")
     assert policy.allows("https", "index.crates.io")
     assert policy.allows("https", "static.crates.io")
+    assert policy.allows("https", "proxy.golang.org")
     assert not policy.allows("https", "crates.io")
+    assert not policy.allows("https", "sum.golang.org")
     assert not policy.allows("https", "example.com")
 
 
@@ -265,6 +269,19 @@ def test_child_info_commits_prefix_after_successful_worker(existing_prefix: path
     assert (existing_prefix / "new_file").read_text() == "new content"
     assert not (existing_prefix / "old_file").exists()
     assert child.prefix_pivoter is None
+
+
+def test_child_info_closes_network_listener():
+    listener_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    child = object.__new__(ChildInfo)
+    child.network_listener_fd = listener_fd
+
+    child.close_network_listener()
+
+    assert child.network_listener_fd == -1
+    with pytest.raises(OSError):
+        os.fstat(listener_fd)
 
 
 class FailingPrefixPivoter(PrefixPivoter):

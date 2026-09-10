@@ -62,7 +62,7 @@ def apply_patch(
     # flag is passed.
     patch = which("patch", required=True, path=git_utils_path)
     with spack.util.filesystem.working_dir(source_path):
-        patch(*args)
+        patch(*args, output=str, error=str)
 
 
 PatchPackageType = Union["spack.package_base.PackageBase", Type["spack.package_base.PackageBase"]]

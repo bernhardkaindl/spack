@@ -92,6 +92,29 @@ def _thread_group_id(thread_id: int, is_valid: Callable[[], bool]) -> Optional[i
     return None
 
 
+def _parent_process_id(process_id: int, is_valid: Callable[[], bool]) -> Optional[int]:
+    """Return a blocked process's parent ID without trusting a reusable PID."""
+    try:
+        status_fd = os.open("/proc/{0}/status".format(process_id), os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if not is_valid():
+            return None
+        status = os.read(status_fd, 64 * 1024).decode("ascii", errors="replace")
+        if not is_valid():
+            return None
+    finally:
+        os.close(status_fd)
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            try:
+                return int(line.split(":", 1)[1].strip())
+            except ValueError:
+                return None
+    return None
+
+
 def destination_from_url(url: str) -> Destination:
     """Return the canonical destination named by an absolute fetch URL."""
     if not isinstance(url, str):
@@ -543,7 +566,9 @@ class ConnectSupervisor:
         duplicate_fd: Callable[[int, int], int] = pidfd_getfd,
         thread_group_id: Callable[[int, Callable[[], bool]], Optional[int]] = _thread_group_id,
         task_process_id: Callable[[int, Callable[[], bool]], Optional[int]] = _thread_group_id,
+        parent_process_id: Callable[[int, Callable[[], bool]], Optional[int]] = _parent_process_id,
         executable_logger: Optional[Callable[[str], None]] = None,
+        denial_logger: Optional[Callable[[str], None]] = None,
     ):
         self.listener_fd = listener_fd
         self.worker_pid = worker_pid
@@ -554,7 +579,9 @@ class ConnectSupervisor:
         self.duplicate_fd = duplicate_fd
         self.thread_group_id = thread_group_id
         self.task_process_id = task_process_id
+        self.parent_process_id = parent_process_id
         self.executable_logger = executable_logger
+        self.denial_logger = denial_logger
         self._connect_syscall = self.seccomp._get_syscall_number("connect")
         self._socket_syscall = self.seccomp._get_syscall_number("socket")
         self._exec_syscalls = (
@@ -576,11 +603,11 @@ class ConnectSupervisor:
             self._handle_exec(notification)
             return
         error = self._handle(notification)
-        try:
-            self.seccomp.respond_to_notification(self.listener_fd, notification.id, error=error)
-        except OSError as response_error:
-            if response_error.errno != errno.ENOENT:
-                raise
+        if error is None:
+            return
+        if error:
+            self._log_denial("connect: {0}".format(os.strerror(error)))
+        self._respond(notification.id, error=error)
 
     def serve(self, stopped: threading.Event) -> None:
         """Handle notifications until ``stopped`` is set."""
@@ -592,8 +619,8 @@ class ConnectSupervisor:
                 try:
                     self.handle_once()
                 except OSError as error:
-                    if error.errno == errno.ECANCELED:
-                        return
+                    if error.errno in (errno.ECANCELED, errno.ENOENT):
+                        continue
                     raise
 
     def _handle_exec(self, notification: SeccompNotification) -> None:
@@ -609,7 +636,7 @@ class ConnectSupervisor:
             except OSError:
                 pass
 
-    def _handle(self, notification: SeccompNotification) -> int:
+    def _handle(self, notification: SeccompNotification) -> Optional[int]:
         if not self._notification_is_from_worker(notification):
             return errno.EPERM
         if notification.data.nr != self._connect_syscall:
@@ -636,18 +663,32 @@ class ConnectSupervisor:
             if notification_pidfd != self.pidfd:
                 os.close(notification_pidfd)
         try:
+            if self._socket_family(duplicated_fd) == socket.AF_UNIX:
+                self.seccomp.continue_notification(self.listener_fd, notification.id)
+                return None
             return self._connect_to_proxy(duplicated_fd, notification.id)
         finally:
             os.close(duplicated_fd)
 
+    @staticmethod
+    def _socket_family(socket_fd: int) -> int:
+        """Return the address family of an existing socket descriptor."""
+        connection = socket.socket(fileno=socket_fd)
+        try:
+            return connection.family
+        finally:
+            connection.detach()
+
     def _handle_socket(self, notification: SeccompNotification) -> None:
         if not self._notification_is_from_worker(notification):
-            self.seccomp.respond_to_notification(
-                self.listener_fd, notification.id, error=errno.EPERM
-            )
+            self._log_denial("socket from a process outside the supervised worker")
+            self._respond(notification.id, error=errno.EPERM)
             return
 
         domain, socket_type, protocol = notification.data.args[:3]
+        if domain == socket.AF_UNIX:
+            self.seccomp.continue_notification(self.listener_fd, notification.id)
+            return
         allowed_type_flags = socket.SOCK_STREAM | socket.SOCK_NONBLOCK | socket.SOCK_CLOEXEC
         if (
             domain != socket.AF_INET
@@ -655,27 +696,51 @@ class ConnectSupervisor:
             or socket_type & 0xF != socket.SOCK_STREAM
             or protocol not in (0, socket.IPPROTO_TCP)
         ):
-            self.seccomp.respond_to_notification(
-                self.listener_fd, notification.id, error=errno.EPROTONOSUPPORT
+            self._log_denial(
+                "socket family={0} type={1} protocol={2}".format(domain, socket_type, protocol)
             )
+            self._respond(notification.id, error=errno.EPROTONOSUPPORT)
             return
 
         created = socket.socket(domain, socket_type, protocol)
         try:
             newfd_flags = os.O_CLOEXEC if socket_type & socket.SOCK_CLOEXEC else 0
-            self.seccomp.addfd_to_notification(
-                self.listener_fd,
-                notification.id,
-                created.fileno(),
-                flags=SECCOMP_ADDFD_FLAG_SEND,
-                newfd_flags=newfd_flags,
-            )
+            try:
+                self.seccomp.addfd_to_notification(
+                    self.listener_fd,
+                    notification.id,
+                    created.fileno(),
+                    flags=SECCOMP_ADDFD_FLAG_SEND,
+                    newfd_flags=newfd_flags,
+                )
+            except OSError as error:
+                if error.errno != errno.ENOENT:
+                    raise
         finally:
             created.close()
 
+    def _respond(self, notification_id: int, error: int = 0) -> None:
+        """Answer a notification unless its task exited before the response."""
+        try:
+            self.seccomp.respond_to_notification(self.listener_fd, notification_id, error=error)
+        except OSError as response_error:
+            if response_error.errno != errno.ENOENT:
+                raise
+
     def _notification_is_from_worker(self, notification: SeccompNotification) -> bool:
         is_valid = lambda: self.seccomp.notification_is_valid(self.listener_fd, notification.id)
-        return self.thread_group_id(notification.pid, is_valid) == self.worker_pid
+        process_id = self.thread_group_id(notification.pid, is_valid)
+        visited = set()
+        while process_id is not None and process_id not in visited:
+            if process_id == self.worker_pid:
+                return True
+            visited.add(process_id)
+            process_id = self.parent_process_id(process_id, is_valid)
+        return False
+
+    def _log_denial(self, message: str) -> None:
+        if self.denial_logger is not None:
+            self.denial_logger(message)
 
     def _connect_to_proxy(self, duplicated_fd: int, notification_id: int) -> int:
         original_flags = fcntl.fcntl(duplicated_fd, fcntl.F_GETFL)

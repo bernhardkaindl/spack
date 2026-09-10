@@ -6,6 +6,8 @@ import array
 import contextlib
 import errno
 import os
+import select
+import signal
 import socket
 import sys
 
@@ -216,6 +218,65 @@ def test_seccomp_connect_notification_round_trip():
     finally:
         control_parent.close()
         _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status)
+    assert os.WEXITSTATUS(status) == 0
+
+
+def test_seccomp_network_notification_round_trip_after_pidfd_duplication():
+    if not spack.sandbox.network_supervision_available():
+        pytest.skip("seccomp network supervision is unavailable")
+
+    listener_read_fd, listener_write_fd = os.pipe()
+    acknowledge_read_fd, acknowledge_write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(listener_read_fd)
+        os.close(acknowledge_write_fd)
+        try:
+            seccomp = spack.sandbox.SeccompSandbox()
+            listener_fd = seccomp.network_listener()
+            os.write(listener_write_fd, str(listener_fd).encode("ascii"))
+            os.read(acknowledge_read_fd, 1)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM):
+                pass
+            os._exit(3)
+        except OSError as error:
+            os._exit(0 if error.errno == errno.ECONNREFUSED else 2)
+
+    os.close(listener_write_fd)
+    os.close(acknowledge_read_fd)
+    listener_fd = -1
+    pidfd = -1
+    status = None
+    try:
+        child_listener_fd = int(os.read(listener_read_fd, 32).decode("ascii"))
+        pidfd = spack.sandbox.pidfd_open(pid)
+        listener_fd = spack.sandbox.pidfd_getfd(pidfd, child_listener_fd)
+        os.write(acknowledge_write_fd, b"1")
+        readable, _writable, _exceptional = select.select([listener_fd], [], [], 2)
+        assert readable == [listener_fd]
+        seccomp = spack.sandbox.SeccompSandbox()
+        notification = seccomp.receive_notification(listener_fd)
+        assert notification.pid == pid
+        assert notification.data.nr == seccomp._get_syscall_number("socket")
+        seccomp.respond_to_notification(listener_fd, notification.id, error=errno.ECONNREFUSED)
+        _, status = os.waitpid(pid, 0)
+        pid = -1
+    finally:
+        os.close(listener_read_fd)
+        os.close(acknowledge_write_fd)
+        if listener_fd >= 0:
+            os.close(listener_fd)
+        if pidfd >= 0:
+            os.close(pidfd)
+        if pid >= 0:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            _, status = os.waitpid(pid, 0)
+
+    assert status is not None
     assert os.WIFEXITED(status)
     assert os.WEXITSTATUS(status) == 0
 

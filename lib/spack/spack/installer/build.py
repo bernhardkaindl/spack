@@ -52,6 +52,7 @@ import spack.util.environment
 import spack.util.filesystem as fs
 import spack.util.lock
 import spack.util.proxy
+import spack.util.sandbox
 import spack.util.spack_yaml as syaml
 import spack.util.timer
 import spack.util.tty
@@ -85,12 +86,13 @@ OVERWRITE_BACKUP_SUFFIX = ".old"
 #: Suffix for temporary cleanup during failed install
 OVERWRITE_GARBAGE_SUFFIX = ".garbage"
 
-#: Temporary compatibility destinations required for Cargo dependency downloads.
+#: Temporary compatibility destinations required for language-package dependency downloads.
 DEFAULT_BUILD_NETWORK_DESTINATIONS: Tuple[str, ...] = (
     "https://repo.maven.apache.org:443",
     "https://github.com:443",
     "https://index.crates.io:443",
     "https://static.crates.io:443",
+    "https://proxy.golang.org:443",
 )
 
 LINUX_HEADER_POLICY_PATH = os.path.join(
@@ -442,6 +444,7 @@ class ChildInfo:
         "network_proxy",
         "network_proxy_address",
         "network_attempts",
+        "network_denials",
         "network_supervisor_stop",
         "network_supervisor_thread",
         "network_supervisor_errors",
@@ -459,6 +462,7 @@ class ChildInfo:
         network_proxy: Optional[spack.util.proxy.LocalHTTPProxy] = None,
         network_proxy_address: Optional[Tuple[str, int]] = None,
         network_attempts: Optional[List[str]] = None,
+        network_denials: Optional[List[str]] = None,
         prefix_pivoter: Optional["PrefixPivoter"] = None,
     ) -> None:
         self.proc = proc
@@ -481,6 +485,7 @@ class ChildInfo:
         self.network_proxy = network_proxy
         self.network_proxy_address = network_proxy_address
         self.network_attempts = network_attempts if network_attempts is not None else []
+        self.network_denials = network_denials if network_denials is not None else []
         self.network_supervisor_stop = threading.Event()
         self.network_supervisor_thread: Optional[threading.Thread] = None
         self.network_supervisor_errors: List[BaseException] = []
@@ -492,6 +497,15 @@ class ChildInfo:
             except Exception:
                 pass
         self.prefix_lock = None
+
+    def close_network_listener(self) -> None:
+        """Close the network listener, releasing tasks blocked on its notifications."""
+        listener_fd, self.network_listener_fd = self.network_listener_fd, -1
+        if listener_fd >= 0:
+            try:
+                os.close(listener_fd)
+            except OSError:
+                pass
 
     def commit_prefix(self) -> None:
         """Commit a successful build by discarding its saved original prefix."""
@@ -544,9 +558,7 @@ class ChildInfo:
         if self.network_supervisor_thread is not None:
             self.network_supervisor_thread.join(timeout=1)
             self.network_supervisor_thread = None
-        if self.network_listener_fd >= 0:
-            os.close(self.network_listener_fd)
-            self.network_listener_fd = -1
+        self.close_network_listener()
         if self.network_pidfd >= 0:
             os.close(self.network_pidfd)
             self.network_pidfd = -1
@@ -955,6 +967,9 @@ def worker_function(
     except spack.error.StopPhase:
         exit_code = ExitCode.STOPPED_AT_PHASE
     except ProcessError as e:
+        print(e, file=sys.stderr)
+        exit_code = ExitCode.BUILD_ERROR
+    except spack.util.sandbox.JsonWorkerError as e:
         print(e, file=sys.stderr)
         exit_code = ExitCode.BUILD_ERROR
     except BinaryCacheMiss:
@@ -1633,6 +1648,7 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
     config = spack.config.CONFIG.get("config:sandbox", {})
     network_proxy = None
     network_attempts: List[str] = []
+    network_denials: List[str] = []
     if config.get("enable", False) and not config.get("allow_network", False):
         learning = spack.install_worker.learning.enabled(config)
         destinations = list(DEFAULT_BUILD_NETWORK_DESTINATIONS)
@@ -1661,8 +1677,18 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
                         )
                     )
 
+            def report_denial(destination, reason):
+                network_denials.append(
+                    "proxy {0}://{1}:{2}: {3}".format(
+                        destination.scheme, destination.host, destination.port, reason
+                    )
+                )
+
             network_proxy = spack.util.proxy.LocalHTTPProxy(
-                policy, credential=secrets.token_urlsafe(32), request_logger=report_attempt
+                policy,
+                credential=secrets.token_urlsafe(32),
+                request_logger=report_attempt,
+                denial_logger=report_denial,
             )
             network_proxy.bind()
             network_proxy.start()
@@ -1717,6 +1743,7 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
         network_proxy,
         request.network_proxy_address,
         network_attempts,
+        network_denials,
         prefix_pivoter,
     )
 

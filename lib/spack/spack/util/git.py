@@ -279,7 +279,7 @@ def get_commit_sha(path: str, ref: str) -> Optional[str]:
 
 def _exec_git_commands(git_exe, cmds, debug, dest=None):
     dest_args = ["-C", dest] if dest else []
-    error_stream = sys.stdout if debug else os.devnull  # swallow extra output for non-debug
+    error_stream = sys.stdout if debug else str
     for cmd in cmds:
         git_exe(*dest_args, *cmd, error=error_stream)
 

@@ -99,6 +99,7 @@ class Script(NamedTuple):
     hang: bool = False
     exec_candidates: Tuple[str, ...] = ()
     network_attempts: Tuple[str, ...] = ()
+    network_denials: Tuple[str, ...] = ()
 
 
 class FakeBuild(ProcessExitNotifier):
@@ -193,6 +194,7 @@ class ScriptedLauncher:
         )
         child_info.exec_candidates.extend(script.exec_candidates)
         child_info.network_attempts.extend(script.network_attempts)
+        child_info.network_denials.extend(script.network_denials)
         return child_info
 
 

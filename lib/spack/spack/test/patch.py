@@ -24,7 +24,7 @@ import spack.util.url as url_util
 from spack.repo import RepoPath
 from spack.spec import Spec
 from spack.stage import Stage
-from spack.util.executable import Executable
+from spack.util.executable import Executable, ProcessError
 from spack.util.filesystem import mkdirp, touch, working_dir
 
 # various sha256 sums (using variables for legibility)
@@ -75,6 +75,29 @@ def mock_patch_stage(tmp_path_factory: pytest.TempPathFactory, monkeypatch):
 
 
 data_path = os.path.join(spack.paths.test_path, "data", "patch")
+
+
+@pytest.mark.not_on_windows("Requires the patch executable")
+def test_apply_patch_reports_patch_failure(tmp_path):
+    source_path = tmp_path / "source"
+    source_path.mkdir()
+    (source_path / "file.txt").write_text("original\n", encoding="utf-8")
+    patch_path = tmp_path / "failure.patch"
+    patch_path.write_text(
+        """diff --git a/file.txt b/file.txt
+--- a/file.txt
++++ b/file.txt
+@@ -1 +1 @@
+-missing
++replacement
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProcessError) as error:
+        spack.patch.apply_patch(str(source_path), str(patch_path))
+
+    assert "1 out of 1 hunk FAILED" in error.value.long_message
 
 
 @pytest.mark.not_on_windows("Line ending conflict on Windows")
