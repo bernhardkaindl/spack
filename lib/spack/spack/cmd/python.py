@@ -127,7 +127,7 @@ def python_interpreter(args):
     else:
         # Fake a main python shell by setting __name__ to __main__.
         console = code.InteractiveConsole({"__name__": "__main__", "spack": spack})
-        if "PYTHONSTARTUP" in os.environ:
+        if not args.python_command and "PYTHONSTARTUP" in os.environ:
             startup_file = os.environ["PYTHONSTARTUP"]
             if os.path.isfile(startup_file):
                 with open(startup_file, encoding="utf-8") as startup:

@@ -3,16 +3,25 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Tests for the installer.core module: the PackageInstaller event loop."""
 
+import errno
 import os
 import sys
 
 import pytest
 
 import spack.error
+import spack.install_worker.learning
+import spack.sandbox
 import spack.spec
 from spack.config import Configuration
 from spack.installer.base import ExitCode
-from spack.installer.core import PackageInstaller, read_connection, write_connection
+from spack.installer.core import (
+    PackageInstaller,
+    _build_process_group_id,
+    _duplicate_child_fd,
+    read_connection,
+    write_connection,
+)
 from spack.installer.ui import ChangeJobs, SetEcho
 from spack.store import Store
 from spack.test.installer.conftest import (
@@ -75,12 +84,70 @@ class TestPackageInstallerConstructor:
         assert installer.dependencies_policy == "cache_only"
 
 
+def test_build_process_group_identity(monkeypatch):
+    monkeypatch.setattr(os, "getpgid", lambda pid: 1234)
+
+    assert _build_process_group_id(5678, lambda: True) == 1234
+    assert _build_process_group_id(5678, lambda: False) is None
+
+
+@pytest.mark.parametrize("exit_during", ["open", "duplicate"])
+def test_duplicate_child_fd_tolerates_exited_child(monkeypatch, exit_during):
+    pidfd_read, pidfd_write = os.pipe()
+
+    def pidfd_open(pid):
+        if exit_during == "open":
+            raise OSError(errno.ESRCH, "No such process")
+        return pidfd_read
+
+    def pidfd_getfd(pidfd, target_fd):
+        raise OSError(errno.ESRCH, "No such process")
+
+    monkeypatch.setattr(spack.sandbox, "pidfd_open", pidfd_open)
+    monkeypatch.setattr(spack.sandbox, "pidfd_getfd", pidfd_getfd)
+
+    assert _duplicate_child_fd(1234, 7) is None
+    if exit_during == "duplicate":
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(pidfd_read)
+    else:
+        os.close(pidfd_read)
+    os.close(pidfd_write)
+
+
+def test_duplicate_child_fd_propagates_other_errors(monkeypatch):
+    closed = []
+    monkeypatch.setattr(spack.sandbox, "pidfd_open", lambda pid: 11)
+    monkeypatch.setattr(
+        spack.sandbox,
+        "pidfd_getfd",
+        lambda pidfd, target_fd: (_ for _ in ()).throw(OSError(errno.EPERM, "Not permitted")),
+    )
+    monkeypatch.setattr(os, "close", closed.append)
+
+    with pytest.raises(OSError) as exc_info:
+        _duplicate_child_fd(1234, 7)
+
+    assert exc_info.value.errno == errno.EPERM
+    assert closed == [11]
+
+
 @pytest.mark.disable_clean_stage_check  # failed builds keep their log file in the stage root
 def test_build_failure_reported_through_event_loop(temporary_store, mock_packages):
     """A build exiting with an error yields exactly one failed event, an InstallError naming the
     log file, and no database record -- without forking any build process."""
     spec = _make_concrete("trivial-install-test-package")
-    launcher = ScriptedLauncher({spec.name: Script(exitcode=ExitCode.BUILD_ERROR)})
+    launcher = ScriptedLauncher(
+        {
+            spec.name: Script(
+                exitcode=ExitCode.BUILD_ERROR,
+                network_denials=(
+                    "proxy https://example.com:443: destination is not authorized",
+                    "proxy https://example.com:443: destination is not authorized",
+                ),
+            )
+        }
+    )
     ui = RecordingUI()
     installer = PackageInstaller([spec.package], explicit=True, ui=ui, launcher=launcher)
 
@@ -89,6 +156,10 @@ def test_build_failure_reported_through_event_loop(temporary_store, mock_package
 
     dag_hash = spec.dag_hash()
     assert installer.log_paths[dag_hash] in str(exc_info.value)
+    with open(installer.log_paths[dag_hash], encoding="utf-8") as stream:
+        log = stream.read()
+    assert "Sandbox denied operations:" in log
+    assert "proxy https://example.com:443: destination is not authorized (2 attempts)" in log
     failed = [e for e in ui.events if e[0] == "state_changed" and e[2] == "failed"]
     assert failed == [("state_changed", dag_hash, "failed")]
     assert _record(temporary_store, spec) is None
@@ -116,6 +187,76 @@ def test_cache_miss_falls_back_to_source_build(
     assert ("state_changed", dag_hash, "finished") in ui.events
     record = _record(temporary_store, spec)
     assert record is not None and record.explicit
+
+
+def test_learning_grants_and_retries_build(
+    temporary_store, mock_packages, mutable_config, monkeypatch
+):
+    mutable_config.set("config:sandbox:learning:enabled", True)
+    spec = _make_concrete("trivial-install-test-package")
+    executable = "/usr/bin/true"
+    denial = (executable + ": Permission denied\n").encode()
+    launcher = ScriptedLauncher(
+        {
+            spec.name: [
+                Script(
+                    exitcode=ExitCode.BUILD_ERROR, output=denial, exec_candidates=(executable,)
+                ),
+                Script(),
+            ]
+        }
+    )
+    learned = []
+    monkeypatch.setattr(
+        spack.install_worker.learning,
+        "learn_executable",
+        lambda learned_spec, path: learned.append((learned_spec, path)) or path,
+    )
+
+    ui = _install(launcher, spec)
+
+    assert learned == [(spec, executable)]
+    assert len(launcher.requests) == 2
+    assert ("build_removed", spec.dag_hash()) in ui.events
+
+
+def test_learning_persists_unique_network_destinations(
+    temporary_store, mock_packages, mutable_config, monkeypatch
+):
+    mutable_config.set("config:sandbox:learning:enabled", True)
+    spec = _make_concrete("trivial-install-test-package")
+    destination = "https://github.com:443"
+    launcher = ScriptedLauncher({spec.name: Script(network_attempts=(destination, destination))})
+    learned = []
+    monkeypatch.setattr(
+        spack.install_worker.learning,
+        "learn_network_destination",
+        lambda learned_spec, url: learned.append((learned_spec, url)),
+    )
+
+    _install(launcher, spec)
+
+    assert learned == [(spec, destination)]
+
+
+@pytest.mark.disable_clean_stage_check
+def test_learning_stops_on_repeated_denial(
+    temporary_store, mock_packages, mutable_config, monkeypatch
+):
+    mutable_config.set("config:sandbox:learning:enabled", True)
+    spec = _make_concrete("trivial-install-test-package")
+    executable = "/usr/bin/true"
+    denial = (executable + ": Permission denied\n").encode()
+    failure = Script(exitcode=ExitCode.BUILD_ERROR, output=denial, exec_candidates=(executable,))
+    launcher = ScriptedLauncher({spec.name: [failure, failure]})
+    monkeypatch.setattr(
+        spack.install_worker.learning, "learn_executable", lambda learned_spec, path: path
+    )
+
+    with pytest.raises(spack.error.InstallError):
+        _install(launcher, spec)
+
+    assert len(launcher.requests) == 2
 
 
 def test_build_output_streams_to_frontend(temporary_store, mock_packages):

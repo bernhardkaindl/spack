@@ -1,0 +1,10 @@
+#!/bin/sh
+
+if [ "$#" -ne 3 ] || [ "$1" != "-P" ] || [ "$2" != "-B1" ] || [ "$3" != "." ]; then
+    echo "spack sandbox df: unsupported arguments" >&2
+    exit 64
+fi
+
+printf '%s\n' \
+    'Filesystem         1-blocks Used        Available Capacity Mounted on' \
+    'spack-sandbox 1125899906842624    0 1125899906842624       0% /'

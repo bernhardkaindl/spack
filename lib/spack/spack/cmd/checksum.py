@@ -3,14 +3,23 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
 import argparse
+import functools
 import re
+import ssl
 import sys
-from typing import Dict, Optional, Tuple
+import sysconfig
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional, Tuple
 
+import spack.config
+import spack.paths
 import spack.repo
+import spack.sandbox
 import spack.spec
 import spack.stage
 import spack.util.lang
+import spack.util.parallel
+import spack.util.sandbox
 import spack.util.string
 import spack.util.web as web_util
 from spack.cmd.common import arguments
@@ -23,6 +32,7 @@ from spack.package_base import (
 from spack.util import tty
 from spack.util.editor import editor
 from spack.util.format import get_version_lines
+from spack.util.proxy import DestinationPolicy
 from spack.version import StandardVersion, Version
 
 description = "checksum available versions of a package"
@@ -83,7 +93,276 @@ def setup_parser(subparser: argparse.ArgumentParser) -> None:
     )
 
 
+def _checksum_direct_url_discovery(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Import a recipe and return direct URL candidates without network access."""
+    spec = spack.spec.Spec(request["package"])
+    pkg: PackageBase = spack.repo.PATH.get_pkg_class(spec.name)(spec)
+    versions = [StandardVersion.from_string(version) for version in request["versions"]]
+    if request["preferred"]:
+        versions.append(preferred_version(pkg))
+
+    return {
+        "deprecated": [str(version) for version in versions if deprecated_version(pkg, version)],
+        "download_instr": pkg.download_instr,
+        "fetch_options": pkg.fetch_options,
+        "manual_download": pkg.manual_download,
+        "name": pkg.name,
+        "urls": {str(version): pkg.all_urls_for_version(version) for version in versions},
+        "versions": {
+            str(version): attributes.get("sha256") for version, attributes in pkg.versions.items()
+        },
+    }
+
+
+def _checksum_network_discovery(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Discover checksum URLs sequentially inside a network-supervised worker."""
+    spec = spack.spec.Spec(request["package"])
+    pkg: PackageBase = spack.repo.PATH.get_pkg_class(spec.name)(spec)
+    spack.util.parallel.ENABLE_PARALLELISM = False
+
+    versions = [StandardVersion.from_string(version) for version in request["versions"]]
+    remote_versions = None
+    with spack.config.CONFIG.override("config:url_fetch_method", "urllib"):
+        if request["latest"]:
+            remote_versions = pkg.fetch_remote_versions(concurrency=1)
+            if remote_versions:
+                versions.append(max(remote_versions))
+        if request["preferred"]:
+            versions.append(preferred_version(pkg))
+
+        urls = {}
+        deprecated = []
+        for version in versions:
+            if deprecated_version(pkg, version):
+                deprecated.append(str(version))
+            url = pkg.find_valid_url_for_version(version)
+            if url is None:
+                if remote_versions is None:
+                    remote_versions = pkg.fetch_remote_versions(concurrency=1)
+                url = remote_versions.get(version)
+            if url is not None:
+                urls[str(version)] = url
+
+        if not versions:
+            if remote_versions is None:
+                remote_versions = pkg.fetch_remote_versions(concurrency=1)
+            urls = {str(version): url for version, url in remote_versions.items()}
+
+        changed = []
+        for version_string, url in list(urls.items()):
+            version = StandardVersion.from_string(version_string)
+            possible_urls = pkg.all_urls_for_version(version)
+            if url not in possible_urls:
+                for possible_url in possible_urls:
+                    if web_util.url_exists(possible_url):
+                        urls[version_string] = possible_url
+                        break
+                else:
+                    changed.append(version_string)
+
+    return {
+        "deprecated": deprecated,
+        "download_instr": pkg.download_instr,
+        "fetch_options": pkg.fetch_options,
+        "manual_download": pkg.manual_download,
+        "name": pkg.name,
+        "url_changed": changed,
+        "urls": urls,
+        "versions": {
+            str(version): attributes.get("sha256") for version, attributes in pkg.versions.items()
+        },
+    }
+
+
+def _checksum_network_fetch(request: Dict[str, Any]) -> Dict[str, str]:
+    """Fetch and checksum archives sequentially inside a network-supervised worker."""
+    urls = {StandardVersion.from_string(version): url for version, url in request["urls"].items()}
+    spack.util.parallel.ENABLE_PARALLELISM = False
+    with spack.config.CONFIG.override("config:url_fetch_method", "urllib"):
+        hashes = spack.stage.get_checksums_for_versions(
+            urls,
+            request["name"],
+            keep_stage=request["keep_stage"],
+            fetch_options=request["fetch_options"],
+            concurrency=1,
+        )
+    return {str(version): checksum for version, checksum in hashes.items()}
+
+
+def _recipe_import_read_roots() -> List[str]:
+    roots = []
+    for repo in spack.repo.PATH.repos:
+        roots.append(repo.root)
+        if repo.python_path:
+            roots.append(repo.python_path)
+    return roots + [
+        spack.paths.etc_path,
+        spack.paths.lib_path,
+        spack.paths.system_config_path,
+        spack.paths.user_config_path,
+    ]
+
+
+def _network_worker_setup():
+    verify_paths = ssl.get_default_verify_paths()
+    read_roots = _recipe_import_read_roots()
+    for path in (verify_paths.cafile, verify_paths.capath):
+        if path:
+            read_roots.append(path)
+    stdlib_path = sysconfig.get_path("stdlib")
+    if stdlib_path:
+        read_roots.append(stdlib_path)
+    spack.sandbox.restrict_network_worker(read_roots, write_roots=[spack.stage.get_stage_root()])
+
+
+def _network_checksum_package(args):
+    request = {
+        "latest": args.latest,
+        "package": args.package,
+        "preferred": args.preferred,
+        "versions": args.versions,
+    }
+    response = spack.util.sandbox.run_json_worker_with_network(
+        request,
+        _checksum_network_discovery,
+        DestinationPolicy.allow_any(),
+        setup=_network_worker_setup,
+    )
+    if not isinstance(response, dict) or set(response) != {
+        "deprecated",
+        "download_instr",
+        "fetch_options",
+        "manual_download",
+        "name",
+        "url_changed",
+        "urls",
+        "versions",
+    }:
+        raise ValueError("checksum network worker returned an invalid response")
+    if (
+        not isinstance(response["name"], str)
+        or response["name"] != spack.spec.Spec(args.package).name
+        or not isinstance(response["manual_download"], bool)
+    ):
+        raise ValueError("checksum network worker returned an invalid response")
+    if response["manual_download"]:
+        raise ManualDownloadRequiredError(response["download_instr"])
+    for key in ("deprecated", "url_changed"):
+        if not isinstance(response[key], list) or not all(
+            isinstance(version, str) for version in response[key]
+        ):
+            raise ValueError("checksum network worker returned an invalid response")
+    if not isinstance(response["fetch_options"], dict) or not isinstance(response["urls"], dict):
+        raise ValueError("checksum network worker returned an invalid response")
+
+    urls = {}
+    for version, url in response["urls"].items():
+        if not isinstance(version, str) or not isinstance(url, str):
+            raise ValueError("checksum network worker returned an invalid response")
+        urls[StandardVersion.from_string(version)] = url
+    versions = {}
+    if not isinstance(response["versions"], dict):
+        raise ValueError("checksum network worker returned an invalid response")
+    for version, sha256 in response["versions"].items():
+        if not isinstance(version, str) or sha256 is not None and not isinstance(sha256, str):
+            raise ValueError("checksum network worker returned an invalid response")
+        versions[StandardVersion.from_string(version)] = {"sha256": sha256}
+    for version in response["deprecated"]:
+        tty.warn(f"Version {version} is deprecated")
+    package = SimpleNamespace(
+        fetch_options=response["fetch_options"], name=response["name"], versions=versions
+    )
+    changed = {StandardVersion.from_string(version) for version in response["url_changed"]}
+    return package, urls, changed
+
+
+def _direct_checksum_package(args) -> Optional[Tuple[SimpleNamespace, Dict[StandardVersion, str]]]:
+    """Return worker-derived direct URLs, or ``None`` for the existing command path."""
+    if args.latest or (not args.versions and not args.preferred):
+        return None
+    if not spack.sandbox.recipe_import_sandbox_available():
+        return None
+
+    request = {"package": args.package, "preferred": args.preferred, "versions": args.versions}
+    response = spack.util.sandbox.run_json_worker(
+        request,
+        _checksum_direct_url_discovery,
+        setup=functools.partial(
+            spack.sandbox.restrict_recipe_import, repository_roots=_recipe_import_read_roots()
+        ),
+    )
+    if not isinstance(response, dict) or set(response) != {
+        "deprecated",
+        "download_instr",
+        "fetch_options",
+        "manual_download",
+        "name",
+        "urls",
+        "versions",
+    }:
+        raise ValueError("checksum worker returned an invalid response")
+    if (
+        not isinstance(response["name"], str)
+        or response["name"] != spack.spec.Spec(args.package).name
+        or not isinstance(response["manual_download"], bool)
+        or not isinstance(response["urls"], dict)
+    ):
+        raise ValueError("checksum worker returned an invalid response")
+    if response["manual_download"]:
+        raise ManualDownloadRequiredError(response["download_instr"])
+
+    for version in response["deprecated"]:
+        if not isinstance(version, str):
+            raise ValueError("checksum worker returned an invalid response")
+        tty.warn(f"Version {version} is deprecated")
+
+    url_dict = {}
+    for version, urls in response["urls"].items():
+        if (
+            not isinstance(version, str)
+            or not isinstance(urls, list)
+            or not all(isinstance(url, str) for url in urls)
+        ):
+            raise ValueError("checksum worker returned an invalid response")
+        for url in urls:
+            if web_util.url_exists(url):
+                url_dict[StandardVersion.from_string(version)] = url
+                break
+        else:
+            return None
+
+    versions = {}
+    if not isinstance(response["versions"], dict) or not isinstance(
+        response["fetch_options"], dict
+    ):
+        raise ValueError("checksum worker returned an invalid response")
+    for version, sha256 in response["versions"].items():
+        if not isinstance(version, str) or sha256 is not None and not isinstance(sha256, str):
+            raise ValueError("checksum worker returned an invalid response")
+        versions[StandardVersion.from_string(version)] = {"sha256": sha256}
+    package = SimpleNamespace(
+        fetch_options=response["fetch_options"], name=response["name"], versions=versions
+    )
+    return package, url_dict
+
+
 def checksum(parser, args):
+    spec = spack.spec.Spec(args.package)
+    if spack.sandbox.network_supervision_available():
+        pkg, url_dict, changed = _network_checksum_package(args)
+        return _checksum_urls(pkg, spec, args, url_dict, changed, network_worker=True)
+    if not spack.sandbox.sandbox_fallback_allowed():
+        raise spack.sandbox.SandboxError(
+            "Checksum network supervision is unavailable and sandbox fallback is disabled"
+        )
+    direct = _direct_checksum_package(args)
+    if direct is not None:
+        pkg, url_dict = direct
+        return _checksum_urls(pkg, spec, args, url_dict, set())
+    return _checksum_in_process(args)
+
+
+def _checksum_in_process(args):
     spec = spack.spec.Spec(args.package)
 
     # Get the package we're going to generate checksums for
@@ -150,6 +429,10 @@ def checksum(parser, args):
             else:
                 url_changed_for_version.add(version)
 
+    return _checksum_urls(pkg, spec, args, url_dict, url_changed_for_version)
+
+
+def _checksum_urls(pkg, spec, args, url_dict, url_changed_for_version, network_worker=False):
     if not url_dict:
         tty.die(f"Could not find any remote versions for {pkg.name}")
     elif len(url_dict) > 1 and not args.batch and sys.stdin.isatty():
@@ -165,9 +448,31 @@ def checksum(parser, args):
     else:
         tty.info(f"Found {spack.util.string.plural(len(url_dict), 'version')} of {pkg.name}")
 
-    version_hashes = spack.stage.get_checksums_for_versions(
-        url_dict, pkg.name, keep_stage=args.keep_stage, fetch_options=pkg.fetch_options
-    )
+    if network_worker:
+        response = spack.util.sandbox.run_json_worker_with_network(
+            {
+                "fetch_options": pkg.fetch_options,
+                "keep_stage": args.keep_stage,
+                "name": pkg.name,
+                "urls": {str(version): url for version, url in url_dict.items()},
+            },
+            _checksum_network_fetch,
+            DestinationPolicy.allow_any(),
+            setup=_network_worker_setup,
+        )
+        if not isinstance(response, dict) or not all(
+            isinstance(version, str) and isinstance(checksum, str)
+            for version, checksum in response.items()
+        ):
+            raise ValueError("checksum network worker returned an invalid response")
+        version_hashes = {
+            StandardVersion.from_string(version): checksum
+            for version, checksum in response.items()
+        }
+    else:
+        version_hashes = spack.stage.get_checksums_for_versions(
+            url_dict, pkg.name, keep_stage=args.keep_stage, fetch_options=pkg.fetch_options
+        )
 
     if args.verify:
         print_checksum_status(pkg, version_hashes)

@@ -3,11 +3,84 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Tests for the installer.build module (PrefixPivoter and prefix management)."""
 
+import os
 import pathlib
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from spack.installer.build import OVERWRITE_GARBAGE_SUFFIX, BinaryCacheMiss, PrefixPivoter
+import spack.install_worker
+import spack.spec
+from spack.installer.base import ExitCode
+from spack.installer.build import (
+    DEFAULT_BUILD_NETWORK_DESTINATIONS,
+    OVERWRITE_GARBAGE_SUFFIX,
+    BinaryCacheMiss,
+    ChildInfo,
+    PrefixPivoter,
+    _prefix_pivoter_for_spec,
+    _stage_source,
+)
+from spack.util.proxy import DestinationPolicy
+
+
+def test_default_build_network_destinations_allow_supported_dependency_downloads():
+    policy = DestinationPolicy.from_urls(DEFAULT_BUILD_NETWORK_DESTINATIONS)
+
+    assert policy.allows("https", "repo.maven.apache.org")
+    assert policy.allows("https", "index.crates.io")
+    assert policy.allows("https", "static.crates.io")
+    assert policy.allows("https", "proxy.golang.org")
+    assert not policy.allows("https", "crates.io")
+    assert not policy.allows("https", "sum.golang.org")
+    assert not policy.allows("https", "example.com")
+
+
+class StagePackage:
+    def __init__(self):
+        self.calls = []
+
+    def do_patch(self):
+        self.calls.append("patch")
+
+    def do_stage(self):
+        self.calls.append("stage")
+
+
+@pytest.mark.parametrize("skip_patch,expected_patch", [(False, True), (True, False)])
+def test_stage_source_uses_worker(monkeypatch, skip_patch, expected_patch):
+    package: Any = StagePackage()
+    worker_calls = []
+    monkeypatch.setattr(
+        spack.install_worker,
+        "select_execution",
+        lambda: SimpleNamespace(mode=spack.install_worker.WORKER),
+    )
+    monkeypatch.setattr(
+        spack.install_worker,
+        "stage_package",
+        lambda pkg, **kwargs: worker_calls.append((pkg, kwargs)),
+    )
+
+    _stage_source(package, skip_patch)
+
+    assert worker_calls == [(package, {"patch": expected_patch, "acquire_lock": False})]
+    assert package.calls == []
+
+
+@pytest.mark.parametrize("skip_patch,expected", [(False, ["patch"]), (True, ["stage"])])
+def test_stage_source_uses_configured_fallback(monkeypatch, skip_patch, expected):
+    package: Any = StagePackage()
+    monkeypatch.setattr(
+        spack.install_worker,
+        "select_execution",
+        lambda: SimpleNamespace(mode=spack.install_worker.FALLBACK),
+    )
+
+    _stage_source(package, skip_patch)
+
+    assert package.calls == expected
 
 
 @pytest.fixture
@@ -47,6 +120,12 @@ class TestPrefixPivoter:
         assert not (existing_prefix / "old_file").exists()
         # Only the existing_prefix directory should remain
         assert len(list(tmp_path.iterdir())) == 1
+
+    def test_external_spec_does_not_pivot_prefix(self):
+        spec = spack.spec.Spec("external@=1.0", external_path="/")
+        spec._mark_concrete()
+
+        assert _prefix_pivoter_for_spec(spec, keep_prefix=False) is None
 
     def test_existing_prefix_failure_restores_original_prefix(
         self, tmp_path: pathlib.Path, existing_prefix: pathlib.Path
@@ -160,6 +239,49 @@ class TestPrefixPivoter:
         assert (existing_prefix / "old_file").read_text() == "old content"
         assert not (existing_prefix / "partial_file").exists()
         assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_child_info_rolls_back_prefix_after_failed_worker(existing_prefix: pathlib.Path):
+    prefix_pivoter = PrefixPivoter(str(existing_prefix))
+    prefix_pivoter.__enter__()
+    existing_prefix.mkdir()
+    (existing_prefix / "partial_file").write_text("partial content")
+
+    child = object.__new__(ChildInfo)
+    child.prefix_pivoter = prefix_pivoter
+    child.rollback_prefix(ExitCode.BUILD_ERROR)
+
+    assert (existing_prefix / "old_file").read_text() == "old content"
+    assert not (existing_prefix / "partial_file").exists()
+    assert child.prefix_pivoter is None
+
+
+def test_child_info_commits_prefix_after_successful_worker(existing_prefix: pathlib.Path):
+    prefix_pivoter = PrefixPivoter(str(existing_prefix))
+    prefix_pivoter.__enter__()
+    existing_prefix.mkdir()
+    (existing_prefix / "new_file").write_text("new content")
+
+    child = object.__new__(ChildInfo)
+    child.prefix_pivoter = prefix_pivoter
+    child.commit_prefix()
+
+    assert (existing_prefix / "new_file").read_text() == "new content"
+    assert not (existing_prefix / "old_file").exists()
+    assert child.prefix_pivoter is None
+
+
+def test_child_info_closes_network_listener():
+    listener_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    child = object.__new__(ChildInfo)
+    child.network_listener_fd = listener_fd
+
+    child.close_network_listener()
+
+    assert child.network_listener_fd == -1
+    with pytest.raises(OSError):
+        os.fstat(listener_fd)
 
 
 class FailingPrefixPivoter(PrefixPivoter):

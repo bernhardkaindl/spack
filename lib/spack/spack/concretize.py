@@ -6,16 +6,17 @@
 import importlib
 import sys
 import time
+import warnings
 from collections import Counter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import spack.compilers
 import spack.compilers.config
+import spack.concretizer_worker
 import spack.config
 import spack.error
 import spack.hash_lookup
 import spack.repo
-import spack.solver.core
 import spack.traverse
 import spack.util.parallel
 from spack.concretize_ui import ConcretizerUI, HeadlessUI, SolveKind
@@ -44,9 +45,18 @@ def _concretize_specs_together(
             will have test dependencies. If False, test dependencies will be disregarded.
         factory: optional factory to produce a list of specs to be reused
     """
+    allow_deprecated = spack.config.CONFIG.get("config:deprecated", False)
+    selection = spack.concretizer_worker.select_execution()
+    if selection.mode == spack.concretizer_worker.WORKER:
+        response = spack.concretizer_worker.solve_in_worker(
+            abstract_specs, tests=tests, allow_deprecated=allow_deprecated, factory=factory
+        )
+        for message in response.warnings:
+            warnings.warn(message)
+        return [spec.copy() for spec in response.specs]
+
     from spack.solver.asp import Solver
 
-    allow_deprecated = spack.config.CONFIG.get("config:deprecated", False)
     result = Solver(specs_factory=factory).solve(
         abstract_specs, tests=tests, allow_deprecated=allow_deprecated
     )
@@ -108,8 +118,6 @@ def concretize_together_when_possible(
         factory: optional factory to produce a list of specs to be reused
         ui: frontend to report progress to. Defaults to a headless frontend.
     """
-    from spack.solver.asp import Solver
-
     ui = ui or HeadlessUI()
 
     to_concretize = [concrete if concrete else abstract for abstract, concrete in spec_list]
@@ -124,6 +132,29 @@ def concretize_together_when_possible(
         kind=SolveKind.WHEN_POSSIBLE, total=len(to_concretize), processes=1
     )
     start = time.monotonic()
+    selection = spack.concretizer_worker.select_execution()
+    if selection.mode == spack.concretizer_worker.WORKER:
+        response = spack.concretizer_worker.solve_in_worker(
+            to_concretize,
+            tests=tests,
+            allow_deprecated=allow_deprecated,
+            factory=factory,
+            strategy=spack.concretizer_worker.WHEN_POSSIBLE,
+        )
+        for message in response.warnings:
+            warnings.warn(message)
+        for j, (abstract, concrete, duration) in enumerate(
+            zip(to_concretize, response.specs, response.durations), start=1
+        ):
+            ui.on_spec_concretized(abstract, concrete=concrete, count=j, duration=duration)
+            result_by_user_spec[abstract] = concrete
+        return [
+            (old_concrete_to_abstract.get(abstract, abstract), concrete)
+            for abstract, concrete in sorted(result_by_user_spec.items())
+        ]
+
+    from spack.solver.asp import Solver
+
     for result in Solver(specs_factory=factory).solve_in_rounds(
         to_concretize, tests=tests, allow_deprecated=allow_deprecated
     ):
@@ -211,17 +242,35 @@ def concretize_separately(
             (abstract, concrete) for abstract, concrete in spec_list if concrete
         ]
 
-    for j, (i, concrete, duration) in enumerate(
-        spack.util.parallel.imap_unordered(
-            _concretize_task,
-            args,
-            processes=num_procs,
-            debug=tty.is_debug(),
-            maxtaskperchild=1,
-            serialize_env=True,
-        ),
-        start=1,
-    ):
+    selection = spack.concretizer_worker.select_execution()
+    if selection.mode == spack.concretizer_worker.WORKER:
+        allow_deprecated = spack.config.CONFIG.get("config:deprecated", False)
+        worker_results = (
+            (args[worker_index][0], response.specs[0], response.durations[0], response.warnings)
+            for worker_index, response in spack.concretizer_worker.solve_separately_in_workers(
+                [to_concretize[i] for i, _, _, _ in args],
+                processes=num_procs,
+                tests=tests,
+                allow_deprecated=allow_deprecated,
+                factory=factory,
+            )
+        )
+    else:
+        worker_results = (
+            (i, concrete, duration, [])
+            for i, concrete, duration in spack.util.parallel.imap_unordered(
+                _concretize_task,
+                args,
+                processes=num_procs,
+                debug=tty.is_debug(),
+                maxtaskperchild=1,
+                serialize_env=True,
+            )
+        )
+
+    for j, (i, concrete, duration, worker_warnings) in enumerate(worker_results, start=1):
+        for message in worker_warnings:
+            warnings.warn(message)
         ret.append((i, concrete))
         ui.on_spec_concretized(to_concretize[i], concrete=concrete, count=j, duration=duration)
 
@@ -255,8 +304,6 @@ def concretize_one(
         tests: if False disregard test dependencies, if a list of names activate them for
             the packages in the list, if True activate test dependencies for all packages.
     """
-    from spack.solver.asp import Solver
-
     if isinstance(spec, str):
         spec = Spec(spec)
     spec = spack.hash_lookup.lookup_hash(spec)
@@ -270,26 +317,7 @@ def concretize_one(
                 f"Spec {node} has no name; cannot concretize an anonymous spec"
             )
 
-    allow_deprecated = spack.config.CONFIG.get("config:deprecated", False)
-    result = Solver(specs_factory=factory).solve(
-        [spec], tests=tests, allow_deprecated=allow_deprecated
-    )
-
-    # take the best answer
-    opt, i, answer = min(result.answers)
-    name = spec.name
-    # TODO: Consolidate this code with similar code in solve.py
-    if spack.repo.PATH.is_virtual(spec.name):
-        providers = [s.name for s in answer.values() if s.package.provides(name)]
-        name = providers[0]
-
-    node = spack.solver.core.min_dupe_node(pkg=name)
-    assert node in answer, (
-        f"cannot find {name} in the list of specs {','.join([n.pkg for n in answer.keys()])}"
-    )
-
-    concretized = answer[node]
-    return concretized
+    return _concretize_specs_together([spec], tests=tests, factory=factory)[0]
 
 
 def solve_kind(unify: Any) -> SolveKind:

@@ -12,26 +12,37 @@ import glob
 import io
 import json
 import os
+import secrets
 import selectors
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
+import threading
 import traceback
 from gzip import GzipFile
 from multiprocessing import Process
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
+from urllib.parse import unquote, urlsplit
+from xml.sax.saxutils import escape
 
 from spack.vendor.typing_extensions import Protocol
 
 import spack.binary_distribution
 import spack.build_environment
 import spack.builder
+import spack.caches
+import spack.compilers.config
 import spack.config
 import spack.error
 import spack.hooks
+import spack.install_worker
+import spack.install_worker.learning
 import spack.mirrors.mirror
+import spack.paths
 import spack.repo
 import spack.sandbox
 import spack.spec
@@ -40,6 +51,8 @@ import spack.url_buildcache
 import spack.util.environment
 import spack.util.filesystem as fs
 import spack.util.lock
+import spack.util.proxy
+import spack.util.spack_yaml as syaml
 import spack.util.timer
 import spack.util.tty
 from spack.installer.base import (
@@ -71,6 +84,377 @@ OVERWRITE_BACKUP_SUFFIX = ".old"
 
 #: Suffix for temporary cleanup during failed install
 OVERWRITE_GARBAGE_SUFFIX = ".garbage"
+
+#: Temporary compatibility destinations required for language-package dependency downloads.
+DEFAULT_BUILD_NETWORK_DESTINATIONS: Tuple[str, ...] = (
+    "https://repo.maven.apache.org:443",
+    "https://github.com:443",
+    "https://index.crates.io:443",
+    "https://static.crates.io:443",
+    "https://proxy.golang.org:443",
+)
+
+LINUX_HEADER_POLICY_PATH = os.path.join(
+    spack.paths.share_path, "sandbox", "linux-header-policy.yaml"
+)
+SYSTEM_GCC_INSTALL_ROOTS = ("/usr/lib/gcc", "/usr/lib64/gcc")
+SANDBOX_COMMAND_DIR = os.path.join(spack.paths.share_path, "sandbox", "commands")
+SANDBOX_COMMANDS = ("df",)
+
+
+def _versioned_directories_by_major(root: Path) -> dict:
+    """Return immediate child directories grouped by numeric major version."""
+    result = {}
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return result
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        try:
+            major = int(entry.name.split(".", 1)[0])
+        except ValueError:
+            continue
+        result.setdefault(major, []).append(entry)
+    return result
+
+
+def _load_linux_header_policy(path: str = LINUX_HEADER_POLICY_PATH) -> dict:
+    """Load and validate the shipped Linux system-header policy."""
+    try:
+        with open(path, encoding="utf-8") as stream:
+            policy = syaml.load(stream)
+    except (OSError, syaml.SpackYAMLError) as error:
+        raise spack.error.InstallError(
+            f"Cannot load Linux header policy {path}: {error}"
+        ) from error
+
+    if not isinstance(policy, dict) or policy.get("version") != 1:
+        raise spack.error.InstallError(f"Invalid Linux header policy version in {path}")
+    if not isinstance(policy.get("system_include_root"), str):
+        raise spack.error.InstallError(f"Invalid system include root in {path}")
+    for section in ("glibc", "linux"):
+        value = policy.get(section)
+        if not isinstance(value, dict):
+            raise spack.error.InstallError(f"Invalid {section} header policy in {path}")
+        for key in ("directories", "target_directories"):
+            if not isinstance(value.get(key), list):
+                raise spack.error.InstallError(f"Invalid {section} {key} in {path}")
+    if not isinstance(policy["glibc"].get("files"), list) or not isinstance(
+        policy["glibc"].get("target_files"), list
+    ):
+        raise spack.error.InstallError(f"Invalid glibc file policy in {path}")
+    maximum_major = policy.get("libstdcxx", {}).get("maximum_major_for_non_gcc")
+    if not isinstance(maximum_major, int):
+        raise spack.error.InstallError(f"Invalid libstdc++ policy in {path}")
+    return policy
+
+
+def _selected_compilers(spec: spack.spec.Spec) -> List[Tuple[str, str, spack.spec.Spec]]:
+    """Return selected language, driver path, and compiler spec tuples without duplicates."""
+    result = []
+    seen = set()
+    compiler_names = set(spack.compilers.config.supported_compilers())
+    for node in spec.traverse():
+        for edge in node.edges_to_dependencies():
+            selected_languages = set(edge.virtuals) & set(COMPILER_LANGUAGES)
+            configured = (edge.spec.extra_attributes or {}).get("compilers", {})
+            for language in selected_languages:
+                path = configured.get(language)
+                if path and (language, path) not in seen:
+                    seen.add((language, path))
+                    result.append((language, path, edge.spec))
+        if node.name not in compiler_names:
+            continue
+        configured = (node.extra_attributes or {}).get("compilers", {})
+        for language in COMPILER_LANGUAGES:
+            path = configured.get(language)
+            if path and (language, path) not in seen:
+                seen.add((language, path))
+                result.append((language, path, node))
+    return result
+
+
+def _gcc_installation(compiler_path: str) -> Optional[Path]:
+    """Return the system GCC installation directory reported by a compiler driver."""
+    try:
+        completed = subprocess.run(
+            [compiler_path, "-print-libgcc-file-name"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0 or not os.path.isabs(completed.stdout.strip()):
+        return None
+    installation = Path(completed.stdout.strip()).resolve().parent
+    roots = [Path(root).resolve() for root in SYSTEM_GCC_INSTALL_ROOTS]
+    return installation if installation.parent.parent in roots else None
+
+
+def _major_version(value) -> Optional[int]:
+    try:
+        return int(str(value).split(".", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _permitted_gcc_installation(compiler_path: str, compiler_spec, policy: dict) -> Optional[Path]:
+    """Select the one host GCC installation whose libstdc++ headers may be read."""
+    reported = _gcc_installation(compiler_path)
+    if reported is None:
+        return None
+    installations = _versioned_directories_by_major(reported.parent)
+    if compiler_spec.name == "gcc":
+        candidates = [reported]
+    else:
+        maximum_major = policy["libstdcxx"]["maximum_major_for_non_gcc"]
+        safe_majors = [major for major in installations if major <= maximum_major]
+        permitted_major = max(safe_majors) if safe_majors else _major_version(reported.name)
+        candidates = installations.get(permitted_major, [])
+    if not candidates:
+        return None
+    header_root = Path(policy["system_include_root"]) / "c++"
+    return next(
+        (path for path in reversed(candidates) if (header_root / path.name).is_dir()), None
+    )
+
+
+def _policy_paths(root: Path, values) -> List[str]:
+    """Resolve safe relative policy entries below a trusted root."""
+    result = []
+    for value in values:
+        if not isinstance(value, str) or os.path.isabs(value) or ".." in Path(value).parts:
+            raise spack.error.InstallError(f"Invalid relative Linux header policy path: {value!r}")
+        result.append(str(root / value))
+    return result
+
+
+def system_compiler_header_paths(
+    spec: spack.spec.Spec, policy: Optional[dict] = None
+) -> List[str]:
+    """Return explicit libc, Linux UAPI, and selected libstdc++ header paths."""
+    policy = policy if policy is not None else _load_linux_header_policy()
+    selected = _selected_compilers(spec)
+    system_selected = [
+        entry for entry in selected if str(Path(entry[1]).resolve()).startswith("/usr/")
+    ]
+    if not system_selected:
+        return []
+
+    include_root = Path(policy["system_include_root"])
+    paths = _policy_paths(
+        include_root,
+        policy["glibc"]["files"]
+        + policy["glibc"]["directories"]
+        + policy["glibc"]["target_files"]
+        + policy["glibc"]["target_directories"]
+        + policy["linux"]["directories"]
+        + policy["linux"]["target_directories"],
+    )
+    targets = set()
+    for _language, compiler_path, _compiler_spec in system_selected:
+        installation = _gcc_installation(compiler_path)
+        if installation is not None:
+            targets.add(installation.parent.name)
+    for target in targets:
+        target_root = include_root / target
+        paths.extend(
+            _policy_paths(
+                target_root,
+                policy["glibc"]["target_files"]
+                + policy["glibc"]["target_directories"]
+                + policy["linux"]["target_directories"],
+            )
+        )
+
+    for language, compiler_path, compiler_spec in system_selected:
+        if language != "cxx":
+            continue
+        installation = _permitted_gcc_installation(compiler_path, compiler_spec, policy)
+        if installation is None:
+            continue
+        version = installation.name
+        paths.extend(
+            [
+                str(include_root / "c++" / version),
+                str(include_root / installation.parent.name / "c++" / version),
+                str(include_root / "c++" / version / installation.parent.name),
+                str(installation / "include"),
+                str(installation / "include-fixed"),
+            ]
+        )
+    return list(dict.fromkeys(paths))
+
+
+def gcc_installation_dirs_to_mask(
+    spec: spack.spec.Spec, policy: Optional[dict] = None
+) -> List[str]:
+    """Hide system GCC installations other than the one permitted for selected C++."""
+    policy = policy if policy is not None else _load_linux_header_policy()
+    selected = _selected_compilers(spec)
+    required_installations = {
+        installation
+        for _language, compiler_path, compiler_spec in selected
+        for installation in [_gcc_installation(compiler_path)]
+        if compiler_spec.name == "gcc" and installation is not None
+    }
+    for language, compiler_path, compiler_spec in selected:
+        if language != "cxx" or not str(Path(compiler_path).resolve()).startswith("/usr/"):
+            continue
+        permitted = _permitted_gcc_installation(compiler_path, compiler_spec, policy)
+        if permitted is None:
+            return []
+        return [
+            str(path)
+            for paths in _versioned_directories_by_major(permitted.parent).values()
+            for path in paths
+            if path != permitted and path not in required_installations
+        ]
+    return []
+
+
+def default_hide_as_empty_dirs(spec: spack.spec.Spec) -> List[str]:
+    """Return host directories hidden as empty by default for this build.
+
+    Skipped when ``autoconf`` is an external dependency, since a host autoconf legitimately
+    relies on its own system macro directory.
+    """
+    hidden_dirs = []
+    if not any(dep.name == "autoconf" and dep.external for dep in spec.traverse(root=False)):
+        hidden_dirs.append("/usr/share/aclocal")
+    hidden_dirs.extend(gcc_installation_dirs_to_mask(spec))
+    return hidden_dirs
+
+
+#: Host paths required by dynamically linked build tools at runtime.
+#: Package-specific provenance is documented in ``sandbox/install-worker.rst``.
+HOST_RUNTIME_READ_PATHS = (
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/lib/locale",  # perl
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+    "/proc/cpuinfo",
+    "/etc/debian_version",
+    "/etc/fonts",  # font-util
+    "/etc/hosts",  # perl
+    "/etc/passwd",  # ncurses
+    "/etc/mime.types",
+    "/usr/share/mime/mime.cache",  # intel-oneapi-mkl bootstrapper
+    "/usr/share/mime/types",  # intel-oneapi-mkl bootstrapper
+    "/etc/ssl/certs",
+    "/dev/urandom",  # vc
+)
+#: Support files required by pkgconf and berkeley-db
+FILE_RUNTIME_READ_PATHS = ("/etc/magic", "/usr/share/file/magic.mgc")
+
+#: Language virtuals whose concrete edges identify selected compiler drivers.
+COMPILER_LANGUAGES = ("c", "cxx", "fortran")
+#: Subordinate executables that compiler drivers may invoke.
+COMPILER_PROGRAMS = ("cc1", "cc1plus", "f951", "collect2", "lto1", "lto-wrapper", "cpp")
+# Keep these grouped by tool family so they can move to package-scoped policy later.
+# Observed package/phase provenance is documented in ``sandbox/install-worker.rst``.
+BINUTILS_PROGRAMS = (
+    "as",
+    "ld",
+    "ld.bfd",
+    "ld.gold",
+    "ar",
+    "nm",
+    "objcopy",  # glib
+    "ranlib",
+    "strip",
+)
+COREUTILS_INSTALL_PROGRAMS = (
+    "chmod",
+    "cp",
+    "install",
+    "ln",
+    "mkdir",
+    "mv",
+    "rm",
+    "rmdir",  # pkgconf, berkeley-db
+)
+COREUTILS_FILE_PROGRAMS = (
+    "cat",
+    "cmp",  # diffutils
+    "comm",  # perl
+    "cut",
+    "date",  # diffutils, libevent
+    "echo",  # diffutils, pkgconf
+    "head",  # ncurses
+    "ls",
+    "od",  # ninja
+    "paste",  # ncurses
+    "realpath",  # perl
+    "sleep",  # ncurses
+    "split",  # perl
+    "tail",  # perl
+    "touch",
+    "true",  # pkgconf, berkeley-db
+    "wc",
+)
+COREUTILS_UTIL_PROGRAMS = (
+    "basename",
+    "arch",  # perl
+    "dirname",
+    "env",
+    "expr",
+    "id",  # font-util
+    "mktemp",  # seen in openblas build log (build completes without it)
+    "pwd",
+    "sort",  # pkgconf, berkeley-db
+    "tr",
+    "uname",
+    "uniq",  # pkgconf, berkeley-db, diffutils
+)
+BUILD_UTILITIES_PROGRAMS = (
+    "diff",  # pkgconf, berkeley-db
+    "egrep",  # perl
+    "fc-cache",  # font-util
+    "fgrep",  # bazel
+    "file",  # pkgconf, berkeley-db
+    "find",
+    "git",
+    "gzip",  # font-util, git
+    "grep",
+    "hexdump",
+    "md5sum",  # bazel
+    "sha384sum",  # intel-oneapi-mkl
+    "ldd",
+    "make",
+    "sh",
+    "tar",  # self-extracting installers such as CUDA
+    "tbl",  # ncurses
+    "unzip",  # bazel
+    "which",
+    "xargs",  # diffutils
+)
+SCRIPT_INTERPRETER_PROGRAMS = (
+    "awk",
+    "bash",
+    "mawk",  # ncurses
+    "perl",
+    "sed",
+)
+BUILD_PROGRAMS = (
+    COMPILER_PROGRAMS
+    + BINUTILS_PROGRAMS
+    + COREUTILS_INSTALL_PROGRAMS
+    + COREUTILS_FILE_PROGRAMS
+    + COREUTILS_UTIL_PROGRAMS
+    + BUILD_UTILITIES_PROGRAMS
+    + SCRIPT_INTERPRETER_PROGRAMS
+)
+#: Support files that compiler drivers may pass to subordinate tools.
+COMPILER_FILES = ("liblto_plugin.so",)
 
 
 class ProcessLike(Protocol):
@@ -106,7 +490,19 @@ class ChildInfo:
         "notifier",
         "log_path",
         "prefix_lock",
+        "prefix_pivoter",
         "state_buffer",
+        "exec_listener_fd",
+        "exec_candidates",
+        "network_listener_fd",
+        "network_pidfd",
+        "network_proxy",
+        "network_proxy_address",
+        "network_attempts",
+        "network_denials",
+        "network_supervisor_stop",
+        "network_supervisor_thread",
+        "network_supervisor_errors",
     )
 
     def __init__(
@@ -118,6 +514,11 @@ class ChildInfo:
         control_w_conn: IpcChannel,
         notifier: ProcessExitNotifier,
         log_path: str,
+        network_proxy: Optional[spack.util.proxy.LocalHTTPProxy] = None,
+        network_proxy_address: Optional[Tuple[str, int]] = None,
+        network_attempts: Optional[List[str]] = None,
+        network_denials: Optional[List[str]] = None,
+        prefix_pivoter: Optional["PrefixPivoter"] = None,
     ) -> None:
         self.proc = proc
         self.spec = spec
@@ -127,10 +528,22 @@ class ChildInfo:
         self.notifier = notifier
         self.log_path = log_path
         self.prefix_lock: Optional[spack.util.lock.Lock] = None
+        self.prefix_pivoter = prefix_pivoter
         # Buffer for partially received state data from this child. Kept as raw bytes and split on
         # b"\n": the newline byte cannot occur inside a multi-byte UTF-8 sequence, so framing is
         # safe without decoding partial reads.
         self.state_buffer = b""
+        self.exec_listener_fd = -1
+        self.exec_candidates: List[str] = []
+        self.network_listener_fd = -1
+        self.network_pidfd = -1
+        self.network_proxy = network_proxy
+        self.network_proxy_address = network_proxy_address
+        self.network_attempts = network_attempts if network_attempts is not None else []
+        self.network_denials = network_denials if network_denials is not None else []
+        self.network_supervisor_stop = threading.Event()
+        self.network_supervisor_thread: Optional[threading.Thread] = None
+        self.network_supervisor_errors: List[BaseException] = []
 
     def release_prefix_lock(self) -> None:
         if self.prefix_lock is not None:
@@ -139,6 +552,32 @@ class ChildInfo:
             except Exception:
                 pass
         self.prefix_lock = None
+
+    def close_network_listener(self) -> None:
+        """Close the network listener, releasing tasks blocked on its notifications."""
+        listener_fd, self.network_listener_fd = self.network_listener_fd, -1
+        if listener_fd >= 0:
+            try:
+                os.close(listener_fd)
+            except OSError:
+                pass
+
+    def commit_prefix(self) -> None:
+        """Commit a successful build by discarding its saved original prefix."""
+        if self.prefix_pivoter is None:
+            return
+
+        prefix_pivoter, self.prefix_pivoter = self.prefix_pivoter, None
+        prefix_pivoter.commit()
+
+    def rollback_prefix(self, exit_code: int) -> None:
+        """Roll back a failed build and release ownership of its prefix pivot."""
+        if self.prefix_pivoter is None:
+            return
+
+        prefix_pivoter, self.prefix_pivoter = self.prefix_pivoter, None
+        error_type = BinaryCacheMiss if exit_code == ExitCode.BUILD_CACHE_MISS else RuntimeError
+        prefix_pivoter.rollback(error_type)
 
     def register_with_selector(self, selector: selectors.BaseSelector, build_id: str) -> None:
         """Register output, state, and sentinel channels with the selector."""
@@ -163,6 +602,24 @@ class ChildInfo:
             selector.unregister(self.notifier.fileobj)
         except (KeyError, ValueError, OSError):
             pass
+        if self.exec_listener_fd >= 0:
+            try:
+                selector.unregister(self.exec_listener_fd)
+            except (KeyError, ValueError, OSError):
+                pass
+            os.close(self.exec_listener_fd)
+            self.exec_listener_fd = -1
+        self.network_supervisor_stop.set()
+        if self.network_supervisor_thread is not None:
+            self.network_supervisor_thread.join(timeout=1)
+            self.network_supervisor_thread = None
+        self.close_network_listener()
+        if self.network_pidfd >= 0:
+            os.close(self.network_pidfd)
+            self.network_pidfd = -1
+        if self.network_proxy is not None:
+            self.network_proxy.stop()
+            self.network_proxy = None
         self.output_r_conn.close()
         self.state_r_conn.close()
         self.control_w_conn.close()
@@ -170,6 +627,10 @@ class ChildInfo:
         self.proc.join()
         exit_code = self.proc.exitcode
         assert exit_code is not None, "Finished build should have exit code set"
+        if exit_code == ExitCode.SUCCESS:
+            self.commit_prefix()
+        else:
+            self.rollback_prefix(exit_code)
         if hasattr(self.proc, "close"):  # No known equivalent in Python 3.6
             self.proc.close()
         return exit_code
@@ -299,6 +760,18 @@ def send_installed_from_binary_cache(state_pipe: io.TextIOWrapper) -> None:
     state_pipe.write("\n")
 
 
+def send_exec_listener(listener_fd: int, state_pipe: io.TextIOWrapper) -> None:
+    """Send the child-local exec-notification listener descriptor number."""
+    json.dump({"exec_listener": listener_fd}, state_pipe, separators=(",", ":"))
+    state_pipe.write("\n")
+
+
+def send_network_listener(listener_fd: int, state_pipe: io.TextIOWrapper) -> None:
+    """Send the child-local network-notification listener descriptor number."""
+    json.dump({"network_listener": listener_fd}, state_pipe, separators=(",", ":"))
+    state_pipe.write("\n")
+
+
 def install_from_buildcache(
     mirrors: List[spack.url_buildcache.MirrorMetadata],
     spec: spack.spec.Spec,
@@ -343,7 +816,7 @@ def install_from_buildcache(
 
 
 class PrefixPivoter:
-    """Manages the installation prefix of a build."""
+    """Save an existing install prefix and either commit or roll back its replacement."""
 
     def __init__(self, prefix: str, keep_prefix: bool = False) -> None:
         """Initialize the prefix pivoter.
@@ -375,17 +848,25 @@ class PrefixPivoter:
     ) -> None:
         """Exit the context: cleanup on success, restore on failure."""
         if exc_type is None:
-            # Success: remove the backup
-            if self.tmp_prefix is not None:
-                self._rmtree_ignore_errors(self.tmp_prefix)
+            self.commit()
             return
 
-        # Failure handling:
-        if self.keep_prefix and not issubclass(exc_type, BinaryCacheMiss):
+        self.rollback(exc_type)
+
+    def commit(self) -> None:
+        """Keep the replacement prefix and discard the saved original prefix."""
+        if self.tmp_prefix is not None:
+            self._rmtree_ignore_errors(self.tmp_prefix)
+            self.tmp_prefix = None
+
+    def rollback(self, error_type: type) -> None:
+        """Apply failed-install policy and restore the saved prefix when required."""
+        if self.keep_prefix and not issubclass(error_type, BinaryCacheMiss):
             # Leave the failed prefix in place, discard the backup. Except for binary cache misses,
             # which is a scheduling failure and not a build failure.
             if self.tmp_prefix is not None:
                 self._rmtree_ignore_errors(self.tmp_prefix)
+                self.tmp_prefix = None
         elif self.tmp_prefix is not None:
             # There was a pre-existing prefix: pivot back to it and discard the failed build
             garbage = self._mkdtemp(dir=self.parent, prefix=".", suffix=OVERWRITE_GARBAGE_SUFFIX)
@@ -395,6 +876,7 @@ class PrefixPivoter:
             except FileNotFoundError:  # build never created the prefix dir
                 has_failed_prefix = False
             self._rename(self.tmp_prefix, self.prefix)
+            self.tmp_prefix = None
             if has_failed_prefix:
                 self._rmtree_ignore_errors(garbage)
         elif self._lexists(self.prefix):
@@ -416,6 +898,11 @@ class PrefixPivoter:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _prefix_pivoter_for_spec(spec: spack.spec.Spec, keep_prefix: bool) -> Optional[PrefixPivoter]:
+    """Return prefix protection for locally installed specs only."""
+    return None if spec.external else PrefixPivoter(spec.prefix, keep_prefix)
+
+
 class BuildRequest(NamedTuple):
     """Plain data describing a single build to be launched: the input of a build launcher."""
 
@@ -435,6 +922,8 @@ class BuildRequest(NamedTuple):
     log_path: str
     stop_before: Optional[str]
     stop_at: Optional[str]
+    network_proxy_url: Optional[str]
+    network_proxy_address: Optional[Tuple[str, int]]
 
 
 def worker_function(
@@ -466,6 +955,11 @@ def worker_function(
         return
 
     global_state.restore()
+    sandbox_config = spack.config.CONFIG.get("config:sandbox", {})
+    mount_namespace_ready = False
+    if sandbox_config.get("enable", False):
+        hidden_dirs = default_hide_as_empty_dirs(spec)
+        mount_namespace_ready = spack.sandbox.prepare_empty_directory_masking(hidden_dirs)
 
     if sys.platform != "win32":
         # Isolate the process group to shield against Ctrl+C and enable safe killpg() cleanup. In
@@ -524,8 +1018,7 @@ def worker_function(
     exit_code = ExitCode.SUCCESS
 
     try:
-        with PrefixPivoter(spec.prefix, request.keep_prefix):
-            _install(request, state_stream, spack.store.STORE)
+        _install(request, state_stream, spack.store.STORE, makeflags, mount_namespace_ready)
     except spack.error.StopPhase:
         exit_code = ExitCode.STOPPED_AT_PHASE
     except ProcessError as e:
@@ -624,42 +1117,387 @@ def _archive_build_metadata(pkg: "spack.package_base.PackageBase") -> None:
         spack.util.tty.debug(e)
 
 
-def _enable_sandbox(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
-    if not config.get("enable", False):
-        return
+def compiler_support_paths(compiler_path: str) -> List[str]:
+    """Return support programs and files reported by a selected compiler driver."""
+    result = []
+    for program in BUILD_PROGRAMS:
+        try:
+            completed = subprocess.run(
+                [compiler_path, "-print-prog-name={0}".format(program)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                universal_newlines=True,
+            )
+        except OSError:
+            continue
 
+        if completed.returncode != 0:
+            continue
+        reported_path = completed.stdout.strip()
+        if not reported_path or reported_path == program:
+            for search_path in (None, os.defpath):
+                resolved = shutil.which(program, path=search_path)
+                if resolved:
+                    result.append(resolved)
+            continue
+        if os.path.isabs(reported_path):
+            result.append(reported_path)
+
+    for filename in COMPILER_FILES:
+        try:
+            completed = subprocess.run(
+                [compiler_path, "-print-file-name={0}".format(filename)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                universal_newlines=True,
+            )
+        except OSError:
+            continue
+
+        reported_path = completed.stdout.strip()
+        if (
+            completed.returncode == 0
+            and reported_path != filename
+            and os.path.isabs(reported_path)
+        ):
+            result.append(reported_path)
+    return result
+
+
+def executable_support_paths(executable: str) -> List[str]:
+    """Return existing data files required by an individually selected executable."""
+    name = os.path.basename(executable)
+    if name == "file":
+        return [path for path in FILE_RUNTIME_READ_PATHS if os.path.exists(path)]
+    if name != "cpp":
+        return []
+    # The generic compiler-wrapper ``cpp`` alias currently preserves host-default ``cpp``
+    # dispatch instead of selecting SPACK_CC. Follow that behavior narrowly until the wrapper can
+    # bind ``cpp`` to the selected compiler without breaking compatibility.
+    try:
+        completed = subprocess.run(
+            [executable, "-print-prog-name=cc1"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+    except OSError:
+        return []
+    cc1 = completed.stdout.strip()
+    return [cc1] if completed.returncode == 0 and os.path.isabs(cc1) else []
+
+
+def allow_git_support_paths(sandbox: spack.sandbox.Sandbox) -> None:
+    """Allow the helper directory selected by the host Git executable."""
+    git = shutil.which("git")
+    if not git:
+        return
+    try:
+        completed = subprocess.run(
+            [git, "--exec-path"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+    except OSError:
+        return
+    exec_path = completed.stdout.strip()
+    if completed.returncode == 0 and os.path.isabs(exec_path):
+        sandbox.allow_read(exec_path)
+
+
+def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) -> None:
+    """Allow compiler drivers and their exact support paths selected by concrete language edges."""
+    compiler_paths = {path for _language, path, _compiler_spec in _selected_compilers(spec)}
+    for compiler_path in compiler_paths:
+        sandbox.allow_read(compiler_path)
+        for program_path in compiler_support_paths(compiler_path):
+            sandbox.allow_read(program_path)
+            for support_path in executable_support_paths(program_path):
+                sandbox.allow_read(support_path)
+    for path in system_compiler_header_paths(spec):
+        sandbox.allow_read(path)
+
+
+def build_environment_bin_paths(
+    env_mods: spack.util.environment.EnvironmentModifications,
+) -> List[str]:
+    """Return dependency bin directories contributed by the build environment setup."""
+    return [
+        str(modification.value)
+        for modification in env_mods.group_by_name().get("PATH", [])
+        if isinstance(modification, spack.util.environment.PrependPath)
+        and os.path.basename(os.path.normpath(str(modification.value))) in ("bin", "bin64")
+    ]
+
+
+def allow_sandbox_commands(
+    sandbox: spack.sandbox.Sandbox,
+    stage_path: str,
+    spec: Optional[spack.spec.Spec] = None,
+    build_environment_paths: Optional[List[str]] = None,
+) -> None:
+    """Allow fixed compatibility commands through a staging-local ``PATH``."""
+    sandbox_bin = os.path.join(stage_path, "spack-sandbox-bin")
+    os.makedirs(sandbox_bin, exist_ok=True)
+
+    def stage_command(source: str, name: str) -> None:
+        sandbox.allow_read(source)
+        link = os.path.join(sandbox_bin, name)
+        if os.path.lexists(link):
+            if os.path.realpath(link) == os.path.realpath(source):
+                return
+            os.unlink(link)
+        os.symlink(source, link)
+
+    for name in SANDBOX_COMMANDS:
+        source = os.path.join(SANDBOX_COMMAND_DIR, name)
+        if not os.path.isfile(source):
+            raise spack.error.InstallError(f"Missing sandbox command: {source}")
+        stage_command(source, name)
+    for name in BUILD_PROGRAMS:
+        if name in COMPILER_PROGRAMS or name in BINUTILS_PROGRAMS:
+            continue
+        source = shutil.which(name)
+        if source:
+            stage_command(source, name)
+    for bin_dir in build_environment_paths or []:
+        if not os.path.isdir(bin_dir):
+            continue
+        for name in os.listdir(bin_dir):
+            source = os.path.join(bin_dir, name)
+            if os.path.isfile(source) and os.access(source, os.X_OK):
+                stage_command(source, name)
+    if spec is not None:
+        for _language, compiler_path, _compiler_spec in _selected_compilers(spec):
+            for source in compiler_support_paths(compiler_path):
+                name = os.path.basename(source)
+                resolved_source = os.path.realpath(source)
+                if (
+                    name not in BINUTILS_PROGRAMS
+                    or not os.path.isfile(source)
+                    or (
+                        os.path.basename(os.path.dirname(resolved_source)) == "spack"
+                        and os.path.basename(os.path.dirname(os.path.dirname(resolved_source)))
+                        == "libexec"
+                    )
+                ):
+                    continue
+                stage_command(source, name)
+    os.environ["PATH"] = sandbox_bin
+
+
+class SandboxListeners(NamedTuple):
+    exec_fd: Optional[int]
+    network_fd: Optional[int]
+
+
+def _configure_build_proxy(proxy_url: str) -> None:
+    """Replace inherited proxy routing with the trusted build proxy."""
+    for name in ("http_proxy", "https_proxy", "ftp_proxy", "all_proxy", "no_proxy"):
+        os.environ.pop(name, None)
+        os.environ.pop(name.upper(), None)
+    for name in ("http_proxy", "https_proxy", "ftp_proxy"):
+        os.environ[name] = proxy_url
+        os.environ[name.upper()] = proxy_url
+    os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+    os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+    proxy = urlsplit(proxy_url)
+    if proxy.hostname is None or proxy.port is None:
+        raise spack.error.InstallError("Invalid build proxy URL")
+    inherited_java_options = os.environ.get("JAVA_TOOL_OPTIONS")
+    # Current JDKs disable Basic proxy authentication for HTTP tunnels by default.
+    java_auth_options = (
+        "-Djdk.http.auth.tunneling.disabledSchemes= -Djdk.http.auth.proxying.disabledSchemes="
+    )
+    java_proxy_options = (
+        f"-Dhttp.proxyHost={proxy.hostname} -Dhttp.proxyPort={proxy.port} "
+        f"-Dhttps.proxyHost={proxy.hostname} -Dhttps.proxyPort={proxy.port}"
+    )
+    if proxy.username is not None and proxy.password is not None:
+        java_proxy_options += (
+            f" -Dhttp.proxyUser={unquote(proxy.username)}"
+            f" -Dhttp.proxyPassword={unquote(proxy.password)}"
+            f" -Dhttps.proxyUser={unquote(proxy.username)}"
+            f" -Dhttps.proxyPassword={unquote(proxy.password)}"
+        )
+    inherited_maven_options = os.environ.get("MAVEN_OPTS")
+    # Maven Wrapper uses MAVEN_OPTS before Maven can read settings.xml.
+    os.environ["MAVEN_OPTS"] = " ".join(
+        option
+        for option in (inherited_maven_options, java_auth_options, java_proxy_options)
+        if option
+    )
+    os.environ["JAVA_TOOL_OPTIONS"] = " ".join(
+        option
+        for option in (inherited_java_options, java_auth_options, java_proxy_options)
+        if option
+    )
+
+
+def _configure_maven_proxy(proxy_url: str, build_home: str) -> None:
+    """Configure Maven's resolver to use the authenticated build proxy."""
+    proxy = urlsplit(proxy_url)
+    if proxy.hostname is None or proxy.port is None:
+        raise spack.error.InstallError("Invalid build proxy URL")
+    username = escape(unquote(proxy.username or ""))
+    password = escape(unquote(proxy.password or ""))
+    host = escape(proxy.hostname)
+    port = proxy.port
+    settings_dir = os.path.join(build_home, ".m2")
+    os.makedirs(settings_dir, exist_ok=True)
+    settings = os.path.join(settings_dir, "settings.xml")
+    with open(settings, "w", encoding="utf-8") as stream:
+        stream.write(
+            "<settings><proxies>"
+            f"<proxy><id>spack</id><active>true</active><protocol>http</protocol>"
+            f"<host>{host}</host><port>{port}</port><username>{username}</username>"
+            f"<password>{password}</password></proxy>"
+            "</proxies></settings>"
+        )
+    inherited_maven_args = os.environ.get("MAVEN_ARGS")
+    settings_arg = f"--settings={settings}"
+    # Resolver 1.x shares challenged proxy credentials, but parallel initial CONNECTs race before
+    # that cache is populated and fail with 407. Serialize downloads for authenticated builds.
+    resolver_threads_arg = "-Daether.connector.basic.threads=1"
+    os.environ["MAVEN_ARGS"] = " ".join(
+        option for option in (inherited_maven_args, resolver_threads_arg, settings_arg) if option
+    )
+
+
+def _enable_sandbox(
+    config: dict,
+    spec: spack.spec.Spec,
+    stage_path: str,
+    proxy_url: Optional[str] = None,
+    makeflags: Optional[Makeflags] = None,
+    mount_namespace_ready: bool = False,
+    build_environment_paths: Optional[List[str]] = None,
+) -> SandboxListeners:
+    if not config.get("enable", False):
+        return SandboxListeners(None, None)
+
+    spack.sandbox.set_build_worker_rlimits()
+    hidden_dirs = default_hide_as_empty_dirs(spec)
+    try:
+        masked_dirs = spack.sandbox.hide_directories_as_empty(
+            hidden_dirs, stage_path, namespace_ready=mount_namespace_ready
+        )
+    except OSError as e:
+        raise spack.error.InstallError(
+            f"Cannot mask host directories in build sandbox: {e}"
+        ) from e
+    if hidden_dirs and not masked_dirs:
+        spack.util.tty.warn(
+            "Build sandbox could not mask host directories; kernel namespaces unavailable"
+        )
     try:
         sandbox = spack.sandbox.get_sandbox()
     except spack.sandbox.SandboxError as e:
         raise spack.error.InstallError(f"Cannot enable build sandbox: {e}") from e
 
+    allow_sandbox_commands(sandbox, stage_path, spec, build_environment_paths)
+
     for dep in spec.traverse(root=False):
         if not dep.external:
             sandbox.allow_read(dep.prefix)
 
+    for repository in spack.repo.PATH.repos:
+        sandbox.allow_read(repository.root)
+    sandbox.allow_read(spack.caches.fetch_cache_location())
+
     sandbox.allow_write(stage_path)
     sandbox.allow_write(spec.prefix)
+    build_tmpdir = os.path.join(stage_path, "spack-build-tmp")
+    build_home = os.path.join(stage_path, "spack-build-home")
+    os.makedirs(build_tmpdir, exist_ok=True)
+    os.makedirs(build_home, exist_ok=True)
+    os.environ["HOME"] = build_home
+    os.environ["TMPDIR"] = build_tmpdir
+    os.environ["TMP"] = build_tmpdir
+    os.environ["TEMP"] = build_tmpdir
+    tempfile.tempdir = build_tmpdir
+    java_tmpdir = f"-Djava.io.tmpdir={build_tmpdir}"
+    java_home = f"-Duser.home={build_home}"
+    maven_repository = f"-Dmaven.repo.local={os.path.join(build_home, '.m2')}"
+    inherited_java_options = os.environ.get("JAVA_TOOL_OPTIONS")
+    os.environ["JAVA_TOOL_OPTIONS"] = " ".join(
+        option
+        for option in (inherited_java_options, java_tmpdir, java_home, maven_repository)
+        if option
+    )
+    os.environ["XDG_CACHE_HOME"] = os.path.join(stage_path, ".cache")  # font-util
 
     # POSIX prescribes /tmp and /dev/null are present. In the future we can consider setting
     # TMPPATH to a sibling of the stage path to isolate concurrent builds better.
-    sandbox.allow_write(tempfile.gettempdir())
+    # glibc’s tmpfile() does not consult TMPDIR and does not have a runtime override.
+    # We may use LD_PRELOAD to entercept tmpfile() but bypassed by static binaries
+    # and direcy syscalls.
+    # We might use Seccomp user notification around openat(..., O_TMPFILE, ...):
+    # theoretically capable of emulation or FD injection. Complex, but should work if done right.
+    # A private mount namespace would be safest, but requires that the host supports them.
+    sandbox.allow_write("/tmp")  # Required for tmpfile()
     sandbox.allow_write(os.devnull)
+
+    # Python multiprocessing requires /dev/shm for POSIX semaphore support.
+    # otherwise, Python builds fail with:
+    # raise ImportError("This platform lacks a functioning sem_open"
+    if sys.platform == "linux":
+        sandbox.allow_write("/dev/shm")
+    if makeflags is not None:
+        for path in makeflags.sandbox_paths():
+            sandbox.allow_write(path)
 
     # Allow read access to sbang, which might be needed to run build scripts.
     sandbox.allow_read(os.path.join(spack.store.STORE.unpadded_root, "bin", "sbang"))
     for upstream_db in spack.store.STORE.upstreams or []:
         sandbox.allow_read(os.path.join(upstream_db.root, "bin", "sbang"))
 
+    for path in HOST_RUNTIME_READ_PATHS:
+        sandbox.allow_read(path)
+    if masked_dirs:
+        for path in hidden_dirs:
+            sandbox.allow_read(path)
+    sandbox.allow_read(Path("/bin/sh"))
+    allow_compiler_paths(sandbox, spec)
+    allow_git_support_paths(sandbox)
+
     # User-configured paths
     for p in config.get("allow_read", []):
         sandbox.allow_read(p)
     for p in config.get("allow_write", []):
         sandbox.allow_write(p)
+    for executable in spack.install_worker.learning.matching_executables(spec, config):
+        sandbox.allow_read(executable)
 
+    exec_listener_fd = None
+    network_listener_fd = None
     try:
-        sandbox.apply(block_network=not config.get("allow_network", True))
+        learning = spack.install_worker.learning.enabled(config)
+        if learning and proxy_url is None:
+            exec_listener_fd = spack.sandbox.SeccompSandbox().exec_listener()
+        if proxy_url is not None:
+            seccomp = spack.sandbox.SeccompSandbox()
+            network_listener_fd = seccomp.network_listener(include_exec=learning)
+            seccomp.deny_network_bypass()
+            _configure_build_proxy(proxy_url)
+            _configure_maven_proxy(proxy_url, build_home)
+        sandbox.apply(block_network=not config.get("allow_network", False) and proxy_url is None)
     except spack.sandbox.SandboxError as e:
+        for listener_fd in (exec_listener_fd, network_listener_fd):
+            if listener_fd is not None:
+                os.close(listener_fd)
         raise spack.error.InstallError(f"Cannot enable build sandbox: {e}") from e
+    except OSError as e:
+        for listener_fd in (exec_listener_fd, network_listener_fd):
+            if listener_fd is not None:
+                os.close(listener_fd)
+        raise spack.error.InstallError(f"Cannot enable sandbox learning: {e}") from e
+    return SandboxListeners(exec_listener_fd, network_listener_fd)
 
 
 def _rewire_no_db(
@@ -682,7 +1520,11 @@ def _rewire_no_db(
 
 
 def _install(
-    request: BuildRequest, state_stream: io.TextIOWrapper, store: spack.store.Store
+    request: BuildRequest,
+    state_stream: io.TextIOWrapper,
+    store: spack.store.Store,
+    makeflags: Makeflags,
+    mount_namespace_ready: bool = False,
 ) -> None:
     """Install a spec from build cache or source."""
     spec, explicit, install_policy = request.spec, request.explicit, request.install_policy
@@ -760,10 +1602,7 @@ def _install(
         send_state("staging", state_stream)
 
         with timer.measure("stage"):
-            if not request.skip_patch:
-                pkg.do_patch()
-            else:
-                pkg.do_stage()
+            _stage_source(pkg, request.skip_patch)
 
         os.chdir(stage.source_path)
 
@@ -780,7 +1619,21 @@ def _install(
         if stop_at is not None and stop_at not in builder.phases:
             raise spack.error.InstallError(f"'{stop_at}' is not a valid phase for {pkg.name}")
 
-        _enable_sandbox(spack.config.CONFIG.get("config:sandbox", {}), spec, stage.path)
+        # Post-install module hooks run after confinement and must use trusted, preloaded policy.
+        spack.config.CONFIG.get("modules", {})
+        listeners = _enable_sandbox(
+            spack.config.CONFIG.get("config:sandbox", {}),
+            spec,
+            stage.path,
+            request.network_proxy_url,
+            makeflags,
+            mount_namespace_ready,
+            build_environment_bin_paths(env_mods),
+        )
+        if listeners.exec_fd is not None:
+            send_exec_listener(listeners.exec_fd, state_stream)
+        if listeners.network_fd is not None:
+            send_network_listener(listeners.network_fd, state_stream)
 
         for phase in builder:
             if stop_before is not None and phase.name == stop_before:
@@ -822,10 +1675,73 @@ def _post_install(
     _write_timer_json(pkg, timer, cache)
 
 
+def _stage_source(pkg: "spack.package_base.PackageBase", skip_patch: bool) -> None:
+    """Stage installer source through the worker or configured trusted fallback."""
+    selection = spack.install_worker.select_execution()
+    if selection.mode == spack.install_worker.WORKER:
+        spack.install_worker.stage_package(pkg, patch=not skip_patch, acquire_lock=False)
+    elif skip_patch:
+        pkg.do_stage()
+    else:
+        pkg.do_patch()
+
+
 def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
-    """Start a new build in a child process."""
+    """Pivot the install prefix and start its build in a child process."""
     spec = request.spec
     channels = create_build_channels()
+
+    config = spack.config.CONFIG.get("config:sandbox", {})
+    network_proxy = None
+    network_attempts: List[str] = []
+    network_denials: List[str] = []
+    if config.get("enable", False) and not config.get("allow_network", False):
+        learning = spack.install_worker.learning.enabled(config)
+        destinations = list(DEFAULT_BUILD_NETWORK_DESTINATIONS)
+        destinations.extend(
+            spack.install_worker.learning.matching_network_destinations(spec, config)
+        )
+        if learning or destinations:
+            policy = (
+                spack.util.proxy.DestinationPolicy.allow_any()
+                if learning
+                else spack.util.proxy.DestinationPolicy.from_urls(destinations)
+            )
+            attempt_lock = threading.Lock()
+
+            def report_attempt(destination, allowed):
+                canonical = "{0}://{1}:{2}".format(
+                    destination.scheme, destination.host, destination.port
+                )
+                with attempt_lock:
+                    first_attempt = canonical not in network_attempts
+                    network_attempts.append(canonical)
+                if learning and first_attempt:
+                    spack.util.tty.warn(
+                        "Sandbox learning observed build network attempt for {0}: {1}".format(
+                            spec.name, canonical
+                        )
+                    )
+
+            def report_denial(destination, reason):
+                network_denials.append(
+                    "proxy {0}://{1}:{2}: {3}".format(
+                        destination.scheme, destination.host, destination.port, reason
+                    )
+                )
+
+            network_proxy = spack.util.proxy.LocalHTTPProxy(
+                policy,
+                credential=secrets.token_urlsafe(32),
+                request_logger=report_attempt,
+                denial_logger=report_denial,
+            )
+            network_proxy.bind()
+            network_proxy.start()
+            request = request._replace(
+                network_proxy_url=network_proxy.authenticated_url,
+                network_proxy_address=network_proxy.address,
+            )
 
     # Obtain the MAKEFLAGS to be set in the child process, in a style the package's gmake accepts.
     gmake = next(iter(spec.dependencies("gmake")), None)
@@ -833,19 +1749,31 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
 
     # As a performance optimization, we do not serialize the environment which
     # is slow to serialize and not needed in the build job
-    proc = Process(
-        target=worker_function,
-        args=(
-            request,
-            channels.state_w,
-            channels.output_w,
-            channels.control_r,
-            channels.tee_control_w,
-            makeflags,
-            GlobalStateMarshaler(serialize_env=False),
-        ),
-    )
-    proc.start()
+    prefix_pivoter = _prefix_pivoter_for_spec(spec, request.keep_prefix)
+    prefix_pivoted = False
+    try:
+        if prefix_pivoter is not None:
+            prefix_pivoter.__enter__()
+            prefix_pivoted = True
+        proc = Process(
+            target=worker_function,
+            args=(
+                request,
+                channels.state_w,
+                channels.output_w,
+                channels.control_r,
+                channels.tee_control_w,
+                makeflags,
+                GlobalStateMarshaler(serialize_env=False),
+            ),
+        )
+        proc.start()
+    except BaseException:
+        if prefix_pivoted and prefix_pivoter is not None:
+            prefix_pivoter.__exit__(*sys.exc_info())
+        if network_proxy is not None:
+            network_proxy.stop()
+        raise
 
     # The parent process does not need the write ends of the main pipes or the read end of control.
     channels.close_child_ends()
@@ -858,6 +1786,11 @@ def start_build(request: BuildRequest, jobserver: JobServerBase) -> ChildInfo:
         channels.control_w,
         ExitNotifier(proc),
         request.log_path,
+        network_proxy,
+        request.network_proxy_address,
+        network_attempts,
+        network_denials,
+        prefix_pivoter,
     )
 
 
