@@ -45,9 +45,28 @@ Linux confinement
 Before launching a worker, the parent selects:
 
 * configured package-repository roots;
-* their Python import roots; and
-* the Spack Python source tree.
+* their Python import roots;
+* the Spack Python source tree; and
+* the concrete-spec-selected compilers, build tools, headers, and dependency
+  prefixes.
 
-Landlock grants read and execute access only to these roots and denies writes.
-Seccomp denies socket operations, process creation and execution, and IPC.
-The worker sets ``PR_SET_NO_NEW_PRIVS``, enforces memory rlimits, and closes inherited descriptors before confinement.
+When available, the parent prefers a Linux user and mount namespace backend
+described in :doc:`namespace-backend`.  That backend hides host
+``bin``, ``include``, and other directories by mounting empty tmpfs over them
+and bind-mounts only the whitelisted programs, headers, and paths the worker
+needs.  Landlock is then applied inside the namespace so denied paths produce
+``-EPERM`` against the visible mount tree rather than exposing the full host
+tree.
+
+When unprivileged user and mount namespaces are unavailable, the parent uses
+the existing Landlock-only backend.  Landlock grants read and execute access
+only to the selected roots and denies writes.  Seccomp denies socket
+operations, process creation and execution, and IPC.  The worker sets
+``PR_SET_NO_NEW_PRIVS``, enforces memory rlimits, and closes inherited
+descriptors before confinement.
+
+The namespace backend launches the worker as a new executed instance inside
+the namespaces, rather than forking the trusted parent.  That matches the
+Windows sandbox model, where the worker also starts as a new executed process
+with restricted handles.  See :doc:`namespace-backend` for the shared process
+model and the Linux mount-tree design.
