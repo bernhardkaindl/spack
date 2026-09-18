@@ -21,6 +21,7 @@ Documentation map
 * :doc:`checksum-command`: the ``spack checksum`` worker contract.
 * :doc:`network-supervisor`: proxy and download-worker network contract.
 * :doc:`install-worker`: staged design for the existing installer worker option.
+* :doc:`namespace-backend`: Linux user and mount namespace sandbox backend plan.
 * :doc:`concretizer-worker`: staged design for confined recipe evaluation during solving.
 * :doc:`concretizer-worker-review`: code-oriented reviewer guide for the concretizer worker.
 * :doc:`memory-pressure-scheduling`: planned Linux build admission and adaptive parallelism.
@@ -38,6 +39,7 @@ Documentation map
    checksum-command
    network-supervisor
    install-worker
+   namespace-backend
    concretizer-worker
    concretizer-worker-review
    memory-pressure-scheduling

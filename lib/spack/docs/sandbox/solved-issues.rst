@@ -34,7 +34,7 @@ The build worker now enters a private user and mount namespace before starting w
 The build observes an empty directory instead of a ``-EPERM`` failure and cannot use host Autoconf macros.
 The mask is skipped when the concrete DAG provides an external ``autoconf`` dependency, because a host Autoconf legitimately uses its own system macro directory.
 
-This Linux-specific workaround demonstrates masking selected host directories as empty without granting them access or returning ``-EPERM``.
+This Linux-specific workaround demonstrates masking selected host directories as empty without granting them access or returning ``-EPERM``. It is a narrow instance of the Linux user and mount namespace backend described in :doc:`namespace-backend`, which generalizes the approach to hiding host ``bin``, ``include``, and other directories by mounting empty tmpfs over them and bind-mounting only whitelisted content.
 It requires unprivileged user and mount namespaces; when they are unavailable, Spack warns and preserves the existing Landlock behavior.
 A focused real-kernel test verifies that the bind mount appears empty, and ``isa-l`` completes with the mask enabled.
 
@@ -61,7 +61,7 @@ The worker masks competing host GCC installation candidates so Clang's GCC detec
 Both target-first and version-first multiarch libstdc++ layouts are supported.
 It does not change compiler selection recorded in the concrete spec.
 
-This compatibility policy uses the private mount namespace prepared before worker threads start.
+This compatibility policy uses the Linux user and mount namespace backend described in :doc:`namespace-backend` to mask competing host GCC installation candidates so Clang's GCC detector selects the same version that Landlock permits.
 If unprivileged user and mount namespaces are unavailable, Spack emits the existing masking warning.
 Landlock still denies non-allowlisted header paths, but Clang may select a masked-out GCC installation and fail instead of falling back.
 Other namespace and mount errors still fail before recipe-controlled build phases run.
