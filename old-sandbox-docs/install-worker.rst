@@ -49,11 +49,11 @@ The user interface is a worker option for the existing installer, not a new comm
 Build-phase confinement is a later, separate milestone.
 Compiler selection and build-tool access are recorded now, but must not delay staging integration.
 
-When build-phase confinement is enabled, Spack enters a private user and mount namespace before applying Landlock.
+When build-phase confinement is enabled, Spack enters a private user and mount namespace before applying Landlock, using the Linux user and mount namespace backend described in :doc:`namespace-backend`.
 The namespace maps the invoking user's numeric UID and GID to the same values, so programs do not mistake the unprivileged worker for UID 0.
-It bind-mounts an empty stage-owned directory over ``/usr/share/aclocal`` unless the concrete spec has an external ``autoconf`` dependency.
+It hides selected host ``bin``, ``include``, and other directories by mounting empty tmpfs over them, then bind-mounts only the whitelisted programs, headers, and paths the concrete spec needs. It also bind-mounts an empty stage-owned directory over ``/usr/share/aclocal`` unless the concrete spec has an external ``autoconf`` dependency.
 This prevents sandboxed builds from scanning host Autoconf macros while preserving the host macro directory for a host-provided Autoconf.
-When unprivileged user and mount namespaces are unavailable, Spack warns and retains the existing Landlock behavior instead of failing unrelated builds.
+When unprivileged user and mount namespaces are unavailable, Spack falls back to the existing Landlock-only behavior instead of failing unrelated builds.
 Other namespace or mount setup failures fail the build before recipe-controlled build phases run.
 
 Trust Boundary
@@ -225,7 +225,7 @@ It grants only the listed glibc and Linux UAPI files and directories that exist 
 The listed glibc-compatible files include ``crypt.h`` because Perl requires the libxcrypt interface while bootstrapping, and making libxcrypt a build dependency would introduce a dependency cycle.
 It never grants the ``/usr/include`` parent.
 The runtime policy uses compiler-reported paths and filesystem presence checks without querying a distribution package manager.
-For non-GCC C++ compilers, the policy selects the newest installed libstdc++ version at or below its compatibility ceiling and masks competing GCC installation candidates in the existing private mount namespace.
+For non-GCC C++ compilers, the policy selects the newest installed libstdc++ version at or below its compatibility ceiling and masks competing GCC installation candidates using the Linux user and mount namespace backend described in :doc:`namespace-backend`.
 
 The build worker exposes allowlisted host tools and static compatibility commands from ``share/spack/sandbox/commands`` through persistent symlinks in ``config:install_tree:root/bin``.
 It uses the resolved, unpadded store root, alongside ``sbang``, so interpreter paths embedded in installed scripts survive stage cleanup.
@@ -239,7 +239,7 @@ Existing matching host links are reused; conflicting links or regular files fail
 Concurrent creation of the same link is safe, and confined build code receives no write grant to the shared directory.
 Store owners must keep host targets available and manage intentional tool changes; these links do not make host interpreters portable to another machine or repair previously installed stage-local shebangs.
 PATH filtering controls ordinary discovery, not filesystem visibility or absolute-path execution.
-Landlock still grants individual selected executable paths and cannot hide directory entries in ``/usr/bin``.
+Landlock alone grants individual selected executable paths and cannot hide directory entries in ``/usr/bin``; the Linux user and mount namespace backend described in :doc:`namespace-backend` hides host ``bin`` and ``include`` directories by mounting empty tmpfs over them and bind-mounting only whitelisted content.
 Future portable host-tool support would require managed tool dependencies rather than host symlinks.
 Only command names registered by trusted Spack code are granted read and execute access.
 The initial ``df`` command accepts only ``df -P -B1 .`` and returns a fixed synthetic filesystem row with one pebibyte available.
