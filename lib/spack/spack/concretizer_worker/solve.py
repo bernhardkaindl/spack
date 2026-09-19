@@ -140,8 +140,7 @@ def _worker_paths(context: spack.context.SpackContext) -> Tuple[List[str], List[
     concretization_cache.mkdir(parents=True, exist_ok=True)
 
     read_roots = [spack.paths.lib_path, context.store.root]
-    python_paths = list(sysconfig.get_paths().values())
-    read_roots.extend(path for path in python_paths if path and os.path.exists(path))
+    read_roots.extend(_python_read_paths())
     for repository in context.repo.repos:
         read_roots.append(repository.root)
         if repository.python_path:

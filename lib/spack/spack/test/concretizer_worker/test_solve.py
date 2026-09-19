@@ -108,12 +108,22 @@ def test_python_read_paths_include_user_site_packages(tmp_path, monkeypatch):
     user_site = tmp_path / "user-site"
     system_site.mkdir()
     user_site.mkdir()
-    monkeypatch.setattr(
-        worker_solve.sysconfig, "get_paths", lambda: {"purelib": str(system_site)}
-    )
+    monkeypatch.setattr(worker_solve.sysconfig, "get_paths", lambda: {"purelib": str(system_site)})
     monkeypatch.setattr(worker_solve.site, "getusersitepackages", lambda: str(user_site))
 
     assert worker_solve._python_read_paths() == [str(system_site), str(user_site)]
+
+
+def test_worker_paths_include_python_read_paths(mock_packages, monkeypatch, tmp_path):
+    import spack.concretizer_worker.solve as worker_solve
+
+    python_site = tmp_path / "python-site"
+    python_site.mkdir()
+    monkeypatch.setattr(worker_solve, "_python_read_paths", lambda: [str(python_site)])
+
+    read_roots, _ = worker_solve._worker_paths(spack.context.default())
+
+    assert str(python_site) in read_roots
 
 
 def test_worker_bootstraps_clingo_once_in_parent_before_launch(mock_packages, monkeypatch):
