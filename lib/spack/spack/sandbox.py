@@ -17,6 +17,7 @@ build jobservers.
 import atexit
 import ctypes
 import enum
+import errno
 import os
 import platform
 import stat
@@ -47,6 +48,15 @@ LANDLOCK_RULE_PATH_BENEATH = 1
 LANDLOCK_ACCESS_NET_BIND_TCP = 1 << 0
 LANDLOCK_ACCESS_NET_CONNECT_TCP = 1 << 1
 LANDLOCK_RESTRICT_SELF_TSYNC = 1 << 3
+
+# Linux namespace and mount flags for the namespace sandbox capability probe.
+# These are only used on Linux when checking whether an unprivileged user and
+# mount namespace can be created; mounts themselves arrive in a later phase.
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNS = 0x00020000
+CLONE_NEWNET = 0x40000000
+MS_PRIVATE = 0x00040000
+MS_REC = 0x00004000
 
 
 class FSAccess(enum.IntFlag):
@@ -88,6 +98,79 @@ class RulesetAttr(ctypes.Structure):
 
 class PathBeneathAttr(ctypes.Structure):
     _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
+
+
+def _enter_user_mount_namespace(libc) -> None:
+    """Enter a private user and mount namespace and contain mount propagation.
+
+    Phase 1 only uses this to verify that the kernel permits unprivileged
+    namespaces; no temporary filesystem hides or bind mounts are performed.
+    """
+    user_id, group_id = os.getuid(), os.getgid()
+    _check_syscall(
+        libc.unshare(ctypes.c_int(CLONE_NEWUSER | CLONE_NEWNS)),
+        "unshare(CLONE_NEWUSER | CLONE_NEWNS)",
+    )
+    try:
+        with open("/proc/self/setgroups", "w", encoding="ascii") as stream:
+            stream.write("deny")
+    except OSError as error:
+        if error.errno != errno.ENOENT:
+            raise
+    with open("/proc/self/uid_map", "w", encoding="ascii") as stream:
+        stream.write("{0} {0} 1".format(user_id))
+    with open("/proc/self/gid_map", "w", encoding="ascii") as stream:
+        stream.write("{0} {0} 1".format(group_id))
+    _check_syscall(
+        libc.mount(None, b"/", None, ctypes.c_ulong(MS_REC | MS_PRIVATE), None),
+        "mount(MS_PRIVATE)",
+    )
+
+
+def _namespace_available(libc) -> bool:
+    """Probe namespace setup in a disposable child process.
+
+    Runs :func:`_enter_user_mount_namespace` after forking so the parent
+    process is never affected. Returns ``True`` when the kernel allows
+    unprivileged namespaces, ``False`` otherwise.
+    """
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            _enter_user_mount_namespace(libc)
+        except OSError:
+            result = b"0"
+        else:
+            result = b"1"
+        os.write(write_fd, result)
+        os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        result = os.read(read_fd, 1)
+        os.waitpid(pid, 0)
+        return result == b"1"
+    finally:
+        os.close(read_fd)
+
+
+def namespace_sandbox_available(libc=None) -> bool:
+    """Return whether unprivileged user and mount namespaces can be used.
+
+    Returns ``False`` off Linux or when the probe cannot enter a private
+    user and mount namespace. Returns ``True`` when such a namespace can be
+    created; later phases build the mount tree on top of this probe.
+    """
+    if platform.system() != "Linux":
+        return False
+    libc = libc if libc is not None else ctypes.CDLL(None, use_errno=True)
+    try:
+        return _namespace_available(libc)
+    except OSError:
+        return False
 
 
 class Sandbox(ABC):
