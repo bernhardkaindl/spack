@@ -317,21 +317,22 @@ def system_compiler_header_paths(
         )
 
     for language, compiler_path, compiler_spec in system_selected:
-        if language != "cxx":
-            continue
-        installation = _permitted_gcc_installation(compiler_path, compiler_spec, policy)
+        installation = _gcc_installation(compiler_path)
         if installation is None:
             continue
-        version = installation.name
-        paths.extend(
-            [
-                str(include_root / "c++" / version),
-                str(include_root / installation.parent.name / "c++" / version),
-                str(include_root / "c++" / version / installation.parent.name),
-                str(installation / "include"),
-                str(installation / "include-fixed"),
-            ]
-        )
+        if language == "cxx":
+            installation = _permitted_gcc_installation(compiler_path, compiler_spec, policy)
+            if installation is None:
+                continue
+            version = installation.name
+            paths.extend(
+                [
+                    str(include_root / "c++" / version),
+                    str(include_root / installation.parent.name / "c++" / version),
+                    str(include_root / "c++" / version / installation.parent.name),
+                ]
+            )
+        paths.extend([str(installation / "include"), str(installation / "include-fixed")])
     return list(dict.fromkeys(paths))
 
 
@@ -1174,13 +1175,37 @@ def allow_compiler_paths(sandbox: spack.sandbox.Sandbox, spec: spack.spec.Spec) 
 def build_environment_bin_paths(
     env_mods: spack.util.environment.EnvironmentModifications,
 ) -> List[str]:
-    """Return dependency bin directories contributed by the build environment setup."""
+    """Return executable directories contributed by the build environment setup."""
     return [
         str(modification.value)
         for modification in env_mods.group_by_name().get("PATH", [])
         if isinstance(modification, spack.util.environment.PrependPath)
-        and os.path.basename(os.path.normpath(str(modification.value))) in ("bin", "bin64")
     ]
+
+
+def sanitized_host_paths(paths: List[str]) -> List[str]:
+    """Filter ambient host paths, including symlink targets, independently of HOME."""
+    import pwd
+
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    excluded = ["/mnt", "/home", "/tmp", "/var/tmp", home]
+    excluded = [os.path.normpath(path) for path in excluded if os.path.isabs(path)]
+    excluded.extend(os.path.realpath(path) for path in list(excluded))
+    result = []
+    for path in paths:
+        if not os.path.isabs(path):
+            continue
+        normalized = os.path.normpath(path)
+        resolved = os.path.realpath(path)
+        if any(
+            candidate == root or candidate.startswith(root.rstrip(os.sep) + os.sep)
+            for candidate in (normalized, resolved)
+            for root in excluded
+        ):
+            continue
+        if resolved not in result:
+            result.append(resolved)
+    return result
 
 
 def allow_sandbox_commands(
@@ -1189,42 +1214,59 @@ def allow_sandbox_commands(
     spec: Optional[spack.spec.Spec] = None,
     build_environment_paths: Optional[List[str]] = None,
 ) -> None:
-    """Allow fixed compatibility commands through a staging-local ``PATH``."""
-    sandbox_bin = os.path.join(stage_path, "spack-sandbox-bin")
+    """Expose persistent host links and real per-build dependency/compiler paths."""
+    sandbox_bin = os.path.join(spack.store.STORE.unpadded_root, "bin")
     os.makedirs(sandbox_bin, exist_ok=True)
+    host_paths = sanitized_host_paths(os.environ.get("PATH", os.defpath).split(os.pathsep))
+    per_build_paths = {os.path.realpath(path) for path in build_environment_paths or []}
+    per_build_paths.add(os.path.realpath(sandbox_bin))
+    host_paths = [path for path in host_paths if path not in per_build_paths]
 
-    def stage_command(source: str, name: str) -> None:
+    def link_command(source: str, name: str) -> None:
+        source = os.path.realpath(source)
         sandbox.allow_read(source)
         link = os.path.join(sandbox_bin, name)
-        if os.path.lexists(link):
-            if os.path.realpath(link) == os.path.realpath(source):
-                return
-            os.unlink(link)
-        os.symlink(source, link)
+        try:
+            os.symlink(source, link)
+        except FileExistsError:
+            if not os.path.islink(link) or os.readlink(link) != source:
+                raise spack.error.InstallError(
+                    f"Conflicting sandbox host tool: {link}; expected a symlink to {source}"
+                )
 
     for name in SANDBOX_COMMANDS:
         source = os.path.join(SANDBOX_COMMAND_DIR, name)
         if not os.path.isfile(source):
             raise spack.error.InstallError(f"Missing sandbox command: {source}")
-        stage_command(source, name)
+        link_command(source, name)
     for name in BUILD_PROGRAMS:
-        if name in COMPILER_PROGRAMS or name in BINUTILS_PROGRAMS:
+        if name in COMPILER_PROGRAMS or name in BINUTILS_PROGRAMS or name in SANDBOX_COMMANDS:
             continue
-        source = shutil.which(name)
-        if source:
-            stage_command(source, name)
-    for bin_dir in build_environment_paths or []:
+        for directory in host_paths:
+            source = shutil.which(name, path=directory)
+            if source and sanitized_host_paths([source]):
+                link_command(source, name)
+                break
+    command_paths = []
+    for bin_dir in reversed(build_environment_paths or []):
         if not os.path.isdir(bin_dir):
             continue
+        command_paths.append(bin_dir)
         for name in os.listdir(bin_dir):
             source = os.path.join(bin_dir, name)
             if os.path.isfile(source) and os.access(source, os.X_OK):
-                stage_command(source, name)
+                sandbox.allow_read(source)
+    compiler_paths = []
     if spec is not None:
         for language, compiler_path, _compiler_spec in _selected_compilers(spec):
-            stage_command(compiler_path, os.path.basename(compiler_path))
+            sandbox.allow_read(compiler_path)
+            compiler_paths.append(os.path.dirname(compiler_path))
+            alias_search_paths = host_paths + [os.path.dirname(compiler_path)]
             for alias in COMPILER_DRIVER_ALIASES.get(language, ()):
-                stage_command(compiler_path, alias)
+                alias_path = shutil.which(alias, path=os.pathsep.join(alias_search_paths))
+                if alias_path:
+                    sandbox.allow_read(alias_path)
+                    compiler_paths.append(os.path.dirname(alias_path))
             for source in compiler_support_paths(compiler_path):
                 name = os.path.basename(source)
                 aliases = [
@@ -1240,9 +1282,11 @@ def allow_sandbox_commands(
                 )
                 if not aliases or not os.path.isfile(source) or is_spack_wrapper:
                     continue
-                for alias in aliases:
-                    stage_command(source, alias)
-    os.environ["PATH"] = sandbox_bin
+                sandbox.allow_read(source)
+                compiler_paths.append(os.path.dirname(source))
+    os.environ["PATH"] = os.pathsep.join(
+        dict.fromkeys(command_paths + [sandbox_bin] + compiler_paths)
+    )
 
 
 class SandboxListeners(NamedTuple):

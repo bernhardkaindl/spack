@@ -186,6 +186,27 @@ def test_gcc_16_compiler_gets_gcc_16_libstdcxx(tmp_path, monkeypatch):
     ]
 
 
+def test_system_compiler_headers_allow_gcc_internal_headers_for_c(tmp_path, monkeypatch):
+    _install_root, target, include_root = system_gcc_layout(tmp_path)
+    (target / "16" / "include").mkdir()
+    (target / "16" / "include-fixed").mkdir()
+    compiler = SimpleNamespace(
+        name="gcc", version="16.1", extra_attributes={"compilers": {"c": "/usr/bin/gcc-16"}}
+    )
+    edge = SimpleNamespace(spec=compiler, virtuals=("c",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = SimpleNamespace(traverse=lambda: [root])
+    policy = linux_header_policy(include_root)
+    monkeypatch.setattr(
+        spack.installer.build, "_gcc_installation", lambda compiler_path: target / "16"
+    )
+
+    allowed = spack.installer.build.system_compiler_header_paths(spec, policy)
+
+    assert str(target / "16" / "include") in allowed
+    assert str(target / "16" / "include-fixed") in allowed
+
+
 def test_newest_libstdcxx_used_when_no_older_headers_exist(tmp_path, monkeypatch):
     _install_root, target, include_root = system_gcc_layout(tmp_path, older_headers=False)
     spec = compiler_spec("llvm", "18", {"cxx": "/usr/bin/clang++-18"})
@@ -237,7 +258,7 @@ def test_system_header_policy_denies_unselected_libstdcxx(tmp_path, monkeypatch)
     assert result == {"denied_errno": errno.EACCES, "permitted": True}
 
 
-def test_sandbox_df_command_has_fixed_output(tmp_path):
+def test_sandbox_df_command_has_fixed_output(tmp_path, temporary_store):
     try:
         sandbox = spack.sandbox.get_sandbox()
     except spack.sandbox.SandboxError as error:
@@ -278,7 +299,7 @@ def test_sandbox_df_command_has_fixed_output(tmp_path):
 
     result = run_json_worker({}, worker, setup=setup)
 
-    assert result["command"] == os.path.join(str(stage), "spack-sandbox-bin", "df")
+    assert result["command"] == os.path.join(temporary_store.unpadded_root, "bin", "df")
     assert result["command"] != os.path.join(spack.installer.build.SANDBOX_COMMAND_DIR, "df")
     assert result == {
         "accepted_returncode": 0,
@@ -286,7 +307,7 @@ def test_sandbox_df_command_has_fixed_output(tmp_path):
             "Filesystem         1-blocks Used        Available Capacity Mounted on\n"
             "spack-sandbox 1125899906842624    0 1125899906842624       0% /\n"
         ),
-        "command": os.path.join(str(stage), "spack-sandbox-bin", "df"),
+        "command": os.path.join(temporary_store.unpadded_root, "bin", "df"),
         "rejected_returncode": 64,
         "rejected_stderr": "spack sandbox df: unsupported arguments\n",
     }
@@ -539,7 +560,7 @@ def test_system_header_policy_denies_unselected_libstdcxx(tmp_path, monkeypatch)
     assert result == {"denied_errno": errno.EACCES, "permitted": True}
 
 
-def test_sandbox_df_command_has_fixed_output(tmp_path):
+def test_sandbox_df_command_has_fixed_output(tmp_path, temporary_store):
     try:
         sandbox = spack.sandbox.get_sandbox()
     except spack.sandbox.SandboxError as error:
@@ -580,7 +601,7 @@ def test_sandbox_df_command_has_fixed_output(tmp_path):
 
     result = run_json_worker({}, worker, setup=setup)
 
-    assert result["command"] == os.path.join(str(stage), "spack-sandbox-bin", "df")
+    assert result["command"] == os.path.join(temporary_store.unpadded_root, "bin", "df")
     assert result["command"] != os.path.join(spack.installer.build.SANDBOX_COMMAND_DIR, "df")
     assert result == {
         "accepted_returncode": 0,
@@ -588,7 +609,7 @@ def test_sandbox_df_command_has_fixed_output(tmp_path):
             "Filesystem         1-blocks Used        Available Capacity Mounted on\n"
             "spack-sandbox 1125899906842624    0 1125899906842624       0% /\n"
         ),
-        "command": os.path.join(str(stage), "spack-sandbox-bin", "df"),
+        "command": os.path.join(temporary_store.unpadded_root, "bin", "df"),
         "rejected_returncode": 64,
         "rejected_stderr": "spack sandbox df: unsupported arguments\n",
     }
@@ -1154,6 +1175,7 @@ def test_enable_sandbox_paths(
     expected_block_network,
 ):
     """Test that _enable_sandbox in the installer calls allow_read/allow_write correctly."""
+    monkeypatch.setenv("PATH", os.defpath)
     mock_sandbox = MockSandbox()
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
     monkeypatch.setattr(tempfile, "tempdir", tempfile.tempdir)
@@ -1405,7 +1427,28 @@ def test_compiler_support_paths_queries_all_build_tools(monkeypatch):
     assert "make" in spack.installer.build.BUILD_PROGRAMS
 
 
-def test_allow_sandbox_commands_stages_real_compiler_binutils(tmp_path, monkeypatch):
+def test_sandbox_perl_shebang_survives_stage_removal(tmp_path, monkeypatch, temporary_store):
+    perl = spack.installer.build.shutil.which("perl", path=os.defpath)
+    if not perl:
+        pytest.skip("Perl is required for the installed shebang regression")
+    monkeypatch.setenv("PATH", os.defpath)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    spack.installer.build.allow_sandbox_commands(MockSandbox(), str(stage))
+    interpreter = spack.installer.build.shutil.which("perl")
+    installed_script = tmp_path / "installed-tool"
+    installed_script.write_text('#!{0}\nprint "working\\n";\n'.format(interpreter))
+    installed_script.chmod(0o755)
+
+    spack.installer.build.shutil.rmtree(str(stage))
+
+    assert subprocess.check_output([str(installed_script)]) == b"working\n"
+    assert interpreter == os.path.join(temporary_store.unpadded_root, "bin", "perl")
+
+
+def test_allow_sandbox_commands_preserves_real_compiler_binutils(
+    tmp_path, monkeypatch, temporary_store
+):
     allowed = []
     compiler = tmp_path / "g++"
     assembler = tmp_path / "host" / "bin" / "x86_64-linux-gnu-as"
@@ -1431,29 +1474,74 @@ def test_allow_sandbox_commands_stages_real_compiler_binutils(tmp_path, monkeypa
     monkeypatch.setattr(
         spack.installer.build.shutil,
         "which",
-        lambda program: str(wrapper) if program == "as" else None,
+        lambda program, path=None: str(wrapper) if program == "as" else None,
     )
 
-    stage_bin = tmp_path / "stage" / "spack-sandbox-bin"
-    stage_bin.mkdir(parents=True)
-    (stage_bin / "as").symlink_to(wrapper)
     spack.installer.build.allow_sandbox_commands(Sandbox(), str(tmp_path / "stage"), spec=object())
 
-    assert (stage_bin / "g++").is_symlink()
-    assert (stage_bin / "g++").resolve() == compiler
-    assert (stage_bin / "as").is_symlink()
-    assert (stage_bin / "as").resolve() == assembler
+    store_bin = pathlib.Path(temporary_store.unpadded_root) / "bin"
+    assert not (store_bin / "g++").exists()
+    assert not (store_bin / "as").exists()
+    assert os.environ["PATH"].split(os.pathsep) == [
+        str(store_bin),
+        str(compiler.parent),
+        str(assembler.parent),
+    ]
+    assert str(compiler) in allowed
+    assert str(assembler) in allowed
     assert str(wrapper) not in allowed
 
 
-def test_allow_sandbox_commands_stages_build_environment_bin_paths(tmp_path, monkeypatch):
+def test_allow_sandbox_commands_allows_real_compiler_aliases(
+    tmp_path, monkeypatch, temporary_store
+):
+    allowed = []
+    compiler_dir = tmp_path / "compiler" / "bin"
+    compiler_dir.mkdir(parents=True)
+    compiler = compiler_dir / "gcc"
+    alias = compiler_dir / "cc"
+    compiler.touch()
+    alias.symlink_to(compiler)
+
+    class Sandbox:
+        def allow_read(self, path):
+            allowed.append(path)
+
+    monkeypatch.setenv("PATH", os.defpath)
+    monkeypatch.setattr(
+        spack.installer.build, "_selected_compilers", lambda spec: [("c", str(compiler), spec)]
+    )
+    monkeypatch.setattr(spack.installer.build, "compiler_support_paths", lambda path: [])
+    original_which = spack.installer.build.shutil.which
+
+    def which(program, path=None):
+        if program == "cc" and str(compiler_dir) in (path or "").split(os.pathsep):
+            return str(alias)
+        if program == "gcc":
+            return None
+        return original_which(program, path=path)
+
+    monkeypatch.setattr(spack.installer.build.shutil, "which", which)
+    spack.installer.build.allow_sandbox_commands(Sandbox(), str(tmp_path / "stage"), spec=object())
+
+    store_bin = pathlib.Path(temporary_store.unpadded_root) / "bin"
+    assert str(alias) in allowed
+    assert os.environ["PATH"].split(os.pathsep) == [str(store_bin), str(compiler_dir)]
+
+
+def test_allow_sandbox_commands_preserves_build_environment_bin_paths(
+    tmp_path, monkeypatch, temporary_store
+):
     dependency_bin = tmp_path / "dependency" / "bin"
+    preferred_bin = tmp_path / "preferred" / "bin"
     ambient_bin = tmp_path / "ambient" / "bin"
     dependency_bin.mkdir(parents=True)
+    preferred_bin.mkdir(parents=True)
     ambient_bin.mkdir(parents=True)
     dependency_tool = dependency_bin / "dependency-tool"
+    preferred_tool = preferred_bin / "dependency-tool"
     ambient_tool = ambient_bin / "ambient-tool"
-    for executable in (dependency_tool, ambient_tool):
+    for executable in (dependency_tool, preferred_tool, ambient_tool):
         executable.touch()
         executable.chmod(0o755)
 
@@ -1461,19 +1549,159 @@ def test_allow_sandbox_commands_stages_build_environment_bin_paths(tmp_path, mon
         def allow_read(self, path):
             pass
 
-    monkeypatch.setattr(spack.installer.build.shutil, "which", lambda program: None)
+    which = spack.installer.build.shutil.which
+    monkeypatch.setattr(spack.installer.build.shutil, "which", lambda program, path=None: None)
 
     env_mods = spack.util.environment.EnvironmentModifications()
     env_mods.prepend_path("PATH", dependency_bin)
+    env_mods.prepend_path("PATH", preferred_bin)
     build_environment_paths = spack.installer.build.build_environment_bin_paths(env_mods)
 
-    stage_bin = tmp_path / "stage" / "spack-sandbox-bin"
     spack.installer.build.allow_sandbox_commands(
         Sandbox(), str(tmp_path / "stage"), build_environment_paths=build_environment_paths
     )
 
-    assert (stage_bin / "dependency-tool").resolve() == dependency_tool
-    assert not (stage_bin / "ambient-tool").exists()
+    store_bin = pathlib.Path(temporary_store.unpadded_root) / "bin"
+    assert os.environ["PATH"].split(os.pathsep) == [
+        str(preferred_bin),
+        str(dependency_bin),
+        str(store_bin),
+    ]
+    assert which("dependency-tool") == str(preferred_tool)
+    assert not (store_bin / "dependency-tool").exists()
+    assert not (store_bin / "ambient-tool").exists()
+
+
+def test_build_environment_bin_paths_keeps_compiler_wrapper_paths(tmp_path):
+    wrapper_path = tmp_path / "compiler-wrapper" / "libexec" / "spack"
+    wrapper_path.mkdir(parents=True)
+    env_mods = spack.util.environment.EnvironmentModifications()
+    env_mods.prepend_path("PATH", wrapper_path)
+
+    assert spack.installer.build.build_environment_bin_paths(env_mods) == [str(wrapper_path)]
+
+
+@pytest.mark.parametrize("home", ["/root", "/srv/users/builder", "/home/builder"])
+def test_sanitized_host_paths_uses_uid_home(monkeypatch, home):
+    import pwd
+
+    def getpwuid(uid):
+        assert uid == os.getuid()
+        return SimpleNamespace(pw_dir=home)
+
+    monkeypatch.setattr(pwd, "getpwuid", getpwuid)
+    monkeypatch.setenv("HOME", "/unrelated/build-home")
+    paths = [
+        "",
+        ".",
+        "relative/bin",
+        "/mnt",
+        "/mnt/c/Windows",
+        "/home/other/bin",
+        "/tmp",
+        "/tmp/tools",
+        "/var/tmp/tools",
+        home,
+        home + "/bin",
+        "/usr/bin/../../tmp/tools",
+        "/usr/bin",
+        "/usr/bin/.",
+        "/opt/tools/bin",
+        "/mnt-tools/bin",
+        "/home-tools/bin",
+        "/tmp-tools/bin",
+        "/var/tmp-tools/bin",
+    ]
+    assert spack.installer.build.sanitized_host_paths(paths) == [
+        "/usr/bin",
+        "/opt/tools/bin",
+        "/mnt-tools/bin",
+        "/home-tools/bin",
+        "/tmp-tools/bin",
+        "/var/tmp-tools/bin",
+    ]
+
+
+@pytest.mark.parametrize("target", ["/mnt/c/bin", "/home/other/bin", "/tmp/tools", "/var/tmp/bin"])
+def test_sanitized_host_paths_rejects_symlink_targets(monkeypatch, target):
+    realpath = os.path.realpath
+    monkeypatch.setattr(
+        os.path, "realpath", lambda path: target if path == "/opt/linked-bin" else realpath(path)
+    )
+    assert spack.installer.build.sanitized_host_paths(["/opt/linked-bin", "/usr/bin"]) == [
+        "/usr/bin"
+    ]
+
+
+def test_sandbox_host_tools_exclude_dependency_paths(monkeypatch, tmp_path, temporary_store):
+    monkeypatch.setenv("PATH", "/opt/dependency/bin:/usr/bin")
+    monkeypatch.setattr(spack.installer.build, "BUILD_PROGRAMS", ("perl",))
+    searched_paths = []
+
+    def which(name, path=None):
+        searched_paths.append(path)
+        return os.path.join(path, name)
+
+    monkeypatch.setattr(spack.installer.build.shutil, "which", which)
+    spack.installer.build.allow_sandbox_commands(
+        MockSandbox(), str(tmp_path), build_environment_paths=["/opt/dependency/bin"]
+    )
+    assert searched_paths == ["/usr/bin"]
+    link = pathlib.Path(temporary_store.unpadded_root) / "bin" / "perl"
+    assert os.readlink(str(link)) == os.path.realpath("/usr/bin/perl")
+
+
+def test_sandbox_host_tools_reject_unsafe_executable_targets(
+    monkeypatch, tmp_path, temporary_store
+):
+    monkeypatch.setenv("PATH", "/opt/tools/bin:/usr/bin")
+    monkeypatch.setattr(spack.installer.build, "BUILD_PROGRAMS", ("perl",))
+    monkeypatch.setattr(
+        spack.installer.build.shutil,
+        "which",
+        lambda name, path=None: (
+            "/tmp/untrusted/perl" if path == "/opt/tools/bin" else "/usr/bin/perl"
+        ),
+    )
+    spack.installer.build.allow_sandbox_commands(MockSandbox(), str(tmp_path))
+    link = pathlib.Path(temporary_store.unpadded_root) / "bin" / "perl"
+    assert os.readlink(str(link)) == os.path.realpath("/usr/bin/perl")
+
+
+@pytest.mark.parametrize("conflict", ["file", "symlink", "dangling"])
+def test_sandbox_host_tools_preserve_conflicting_entries(
+    monkeypatch, tmp_path, temporary_store, conflict
+):
+    store_bin = pathlib.Path(temporary_store.unpadded_root) / "bin"
+    store_bin.mkdir(parents=True, exist_ok=True)
+    link = store_bin / "df"
+    if conflict == "file":
+        link.write_text("keep me")
+    else:
+        link.symlink_to("/bin/sh" if conflict == "symlink" else tmp_path / "missing")
+    with pytest.raises(spack.error.InstallError, match="Conflicting sandbox host tool"):
+        spack.installer.build.allow_sandbox_commands(MockSandbox(), str(tmp_path))
+    if conflict == "file":
+        assert link.read_text() == "keep me"
+    else:
+        assert os.readlink(str(link)) == (
+            "/bin/sh" if conflict == "symlink" else str(tmp_path / "missing")
+        )
+
+
+def test_sandbox_host_tools_reuse_concurrently_created_links(
+    monkeypatch, tmp_path, temporary_store
+):
+    symlink = os.symlink
+
+    def concurrent_symlink(source, target):
+        symlink(source, target)
+        raise FileExistsError(target)
+
+    monkeypatch.setenv("PATH", os.defpath)
+    monkeypatch.setattr(os, "symlink", concurrent_symlink)
+    spack.installer.build.allow_sandbox_commands(MockSandbox(), str(tmp_path))
+    assert (pathlib.Path(temporary_store.unpadded_root) / "bin" / "df").is_symlink()
 
 
 def test_file_executable_support_paths(monkeypatch):

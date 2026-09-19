@@ -227,13 +227,27 @@ It never grants the ``/usr/include`` parent.
 The runtime policy uses compiler-reported paths and filesystem presence checks without querying a distribution package manager.
 For non-GCC C++ compilers, the policy selects the newest installed libstdc++ version at or below its compatibility ceiling and masks competing GCC installation candidates in the existing private mount namespace.
 
-The build worker prepends a dedicated directory of static compatibility commands from ``share/spack/sandbox/commands`` to ``PATH``.
+The build worker exposes allowlisted host tools and static compatibility commands from ``share/spack/sandbox/commands`` through persistent symlinks in ``config:install_tree:root/bin``.
+It uses the resolved, unpadded store root, alongside ``sbang``, so interpreter paths embedded in installed scripts survive stage cleanup.
+Host-tool discovery rejects empty and relative PATH entries and entries under ``/mnt``, ``/home``, ``/tmp``, ``/var/tmp``, and the current UID's home directory from the password database, independently of ``HOME``.
+The filter checks both lexical paths and resolved symlink targets, including the selected executable target.
+Explicit dependency and compiler paths remain real paths and are not filtered as ambient host paths, even when the configured store is under a home or temporary directory.
+They are not published into the shared host-tool directory, where package-specific links would conflict across builds.
+Compiler-wrapper executable directories and their delegated ``SPACK_CC``, ``SPACK_CXX``, ``SPACK_F77``, and ``SPACK_FC`` targets are retained as explicit build paths.
+The wrapper and the selected compiler therefore both receive read and execute access.
+Existing matching host links are reused; conflicting links or regular files fail setup without being overwritten.
+Concurrent creation of the same link is safe, and confined build code receives no write grant to the shared directory.
+Store owners must keep host targets available and manage intentional tool changes; these links do not make host interpreters portable to another machine or repair previously installed stage-local shebangs.
+PATH filtering controls ordinary discovery, not filesystem visibility or absolute-path execution.
+Landlock still grants individual selected executable paths and cannot hide directory entries in ``/usr/bin``.
+Future portable host-tool support would require managed tool dependencies rather than host symlinks.
 Only command names registered by trusted Spack code are granted read and execute access.
 The initial ``df`` command accepts only ``df -P -B1 .`` and returns a fixed synthetic filesystem row with one pebibyte available.
 It does not read or reveal host mount metadata or capacity.
 Absolute invocations such as ``/usr/bin/df`` bypass this compatibility layer and remain subject to the normal executable policy.
 The fixed result intentionally disables the installer's real free-space check, so the build can still exhaust its writable filesystem.
 The sandbox tests execute the accepted and rejected forms under real Landlock and verify the exact fixed output.
+They also execute an installed Perl script after deleting its stage and cover path filtering, dependency precedence, store-root selection, and link conflicts.
 Every added tool or path requires a focused test demonstrating why it is needed.
 
 * [ ] Review why the generic compiler-wrapper ``cpp`` alias dispatches to the host-default preprocessor instead of the compiler selected by ``SPACK_CC``.
