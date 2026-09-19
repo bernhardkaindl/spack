@@ -465,6 +465,12 @@ def get_sandbox() -> Sandbox:
     system = platform.system()
     try:
         if system == "Linux":
+            from spack.sandbox_namespaces import namespace_sandbox_available
+
+            if namespace_sandbox_available():
+                from spack.sandbox_namespaces import NamespaceSandbox
+
+                return NamespaceSandbox()
             return LandlockSandbox()
         elif system == "Windows":
             return WindowsAppContainerSandbox()
