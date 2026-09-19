@@ -107,3 +107,69 @@ def test_enable_sandbox_paths(
     assert pathlib.Path(tempfile.gettempdir()).resolve() in allow_write_resolved
 
     assert mock_sandbox.apply_calls == [False]
+
+
+class MockNamespaceSandbox(spack.sandbox.NamespaceSandbox):
+    """NamespaceSandbox that records mount-tree preparation instead of mounting."""
+
+    def __init__(self):
+        super().__init__()
+        self.prepare_mount_tree_calls = []
+        self.apply_calls: List[bool] = []
+
+    def _allow_read(self, original: pathlib.Path, resolved: pathlib.Path):
+        pass
+
+    def _allow_write(self, original: pathlib.Path, resolved: pathlib.Path):
+        pass
+
+    def prepare_mount_tree(self, hidden_dirs, stage_path):
+        self.prepare_mount_tree_calls.append((list(hidden_dirs), stage_path))
+        return True
+
+    def apply(self, block_network=False):
+        self.apply_calls.append(block_network)
+
+
+def test_enable_sandbox_prepares_namespace_mount_tree(
+    config, mock_packages, monkeypatch, temporary_store: spack.store.Store, tmp_path: pathlib.Path
+):
+    """The namespace backend hides host directories before Landlock is applied.
+
+    ``_enable_sandbox`` must call ``prepare_mount_tree`` on the selected
+    NamespaceSandbox with the default hidden directories, and the returned
+    Landlock-visible tree is what ``apply`` then confines.
+    """
+    mock_sandbox = MockNamespaceSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+
+    spec = spack.concretize.concretize_one("dependent-install")
+    pathlib.Path(spec.prefix).mkdir(parents=True, exist_ok=True)
+    for dep in spec.traverse(root=False):
+        pathlib.Path(dep.prefix).mkdir(parents=True, exist_ok=True)
+
+    stage_path = tmp_path / "stage"
+    stage_path.mkdir()
+
+    _enable_sandbox({"enable": True, "allow_network": True}, spec, str(stage_path))
+
+    assert mock_sandbox.prepare_mount_tree_calls == [(["/usr/share/aclocal"], str(stage_path))]
+    assert mock_sandbox.apply_calls == [False]
+
+
+def test_default_hide_as_empty_dirs_skips_external_autoconf():
+    """An external autoconf keeps access to its own host macro directory."""
+    import types
+
+    from spack.installer.build import default_hide_as_empty_dirs
+
+    def fake_spec(dependencies):
+        spec = types.SimpleNamespace()
+        spec.traverse = lambda root=True: iter(dependencies)
+        return spec
+
+    external = types.SimpleNamespace(name="autoconf", external=True)
+    assert default_hide_as_empty_dirs(fake_spec([external])) == []
+
+    not_external = types.SimpleNamespace(name="autoconf", external=False)
+    assert default_hide_as_empty_dirs(fake_spec([not_external])) == ["/usr/share/aclocal"]
