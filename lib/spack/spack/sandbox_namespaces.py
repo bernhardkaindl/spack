@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, List, Optional
 
 if TYPE_CHECKING:
-    from spack.sandbox import LandlockSandbox, Sandbox
+    from spack.sandbox import LandlockSandbox
 
-from spack.sandbox import SandboxError
+from spack.sandbox import Sandbox, SandboxError
 
 # Linux namespace and mount flags.
 CLONE_NEWUSER = 0x10000000

@@ -625,6 +625,19 @@ def _archive_build_metadata(pkg: "spack.package_base.PackageBase") -> None:
         spack.util.tty.debug(e)
 
 
+def default_hide_as_empty_dirs(spec: spack.spec.Spec) -> List[str]:
+    """Return host directories hidden as empty by default for this build.
+
+    The host ``/usr/share/aclocal`` directory is hidden unless the spec has an
+    external ``autoconf`` dependency, because a host autoconf legitimately relies
+    on its own system macro directory.
+    """
+    hidden_dirs = []
+    if not any(dep.name == "autoconf" and dep.external for dep in spec.traverse(root=False)):
+        hidden_dirs.append("/usr/share/aclocal")
+    return hidden_dirs
+
+
 def _enable_sandbox(config: dict, spec: spack.spec.Spec, stage_path: str) -> None:
     if not config.get("enable", False):
         return
@@ -633,6 +646,21 @@ def _enable_sandbox(config: dict, spec: spack.spec.Spec, stage_path: str) -> Non
         sandbox = spack.sandbox.get_sandbox()
     except spack.sandbox.SandboxError as e:
         raise spack.error.InstallError(f"Cannot enable build sandbox: {e}") from e
+
+    # If the namespace backend is active, prepare the mount tree (enter the
+    # private user and mount namespace and hide selected host directories as
+    # empty) before building Landlock rules. Landlock rules then operate on the
+    # namespace-restricted mount tree, so denied paths are truly hidden rather
+    # than merely producing -EPERM.
+    namespace_module = getattr(spack, "sandbox_namespaces", None)
+    if namespace_module is not None and isinstance(
+        sandbox, namespace_module.NamespaceSandbox
+    ):
+        hidden_dirs = default_hide_as_empty_dirs(spec)
+        if hidden_dirs and not sandbox.prepare_mount_tree(hidden_dirs, stage_path):
+            spack.util.tty.warn(
+                "Build sandbox could not mask host directories; kernel namespaces unavailable"
+            )
 
     for dep in spec.traverse(root=False):
         if not dep.external:
