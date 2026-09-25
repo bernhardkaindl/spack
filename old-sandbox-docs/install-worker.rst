@@ -49,7 +49,7 @@ The user interface is a worker option for the existing installer, not a new comm
 Build-phase confinement is a later, separate milestone.
 Compiler selection and build-tool access are recorded now, but must not delay staging integration.
 
-When build-phase confinement is enabled, Spack enters a private user and mount namespace before applying Landlock, using the Linux user and mount namespace backend described in :doc:`namespace-backend`.
+When build-phase confinement is enabled, Spack enters a private user and mount namespace, prepares the selected mount view, and drops namespace capabilities before starting the logging thread. Landlock is then applied before build phases, using the Linux user and mount namespace backend described in :doc:`namespace-backend`.
 The namespace maps the invoking user's numeric UID and GID to the same values, so programs do not mistake the unprivileged worker for UID 0.
 The current narrow integration bind-mounts an empty stage-owned directory over ``/usr/share/aclocal`` unless the concrete spec has an external ``autoconf`` dependency. Phase 4 will hide selected host ``bin``, ``include``, and other directories and bind-mount only the whitelisted programs, headers, and paths the concrete spec needs.
 This prevents sandboxed builds from scanning host Autoconf macros while preserving the host macro directory for a host-provided Autoconf.
@@ -206,12 +206,14 @@ Acceptance checks:
 After staging is integrated, apply dedicated build policy immediately before existing builder phases.
 It receives the concrete spec and prepared stage and prefix; it does not change compiler selection or create a new build path.
 
-On Linux, this policy is applied in the existing forked installer child. The
-child enters the private user and mount namespace, prepares the mount view, and
-applies Landlock to itself; the installer supervisor remains unaffected. A
-fresh ``exec`` is not required for the internal Linux backend. External tools
-such as Bubblewrap may be added later as alternate launchers. Windows
-AppContainer process creation remains a separate platform-specific boundary.
+On Linux, this policy is applied in the existing forked installer child. Before
+starting child-local threads, trusted Spack code enters the private user and
+mount namespace, prepares the mount view, and drops namespace capabilities.
+Recipe-controlled setup cannot create additional mounts before Landlock is
+applied to itself; the installer supervisor remains unaffected. A fresh
+``exec`` is not required for the internal Linux backend. External tools such
+as Bubblewrap may be added later as alternate launchers. Windows AppContainer
+process creation remains a separate platform-specific boundary.
 
 Read access includes non-external dependency prefixes, the selected package directory, Spack runtime and sbang resources, selected loader files, and selected compiler tools.
 Write access is limited to the stage, exact selected prefix, necessary temporary space, and explicit trusted configuration.

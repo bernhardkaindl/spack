@@ -166,11 +166,31 @@ def test_probe_transports_bind_mount_failure(monkeypatch):
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_probe_transports_capability_drop_failure(monkeypatch):
+    class FailingLibc:
+        def mount(self, source, target, filesystemtype, flags, data):
+            return 0
+
+        def capset(self, header, capabilities):
+            ctypes.set_errno(errno.EPERM)
+            return -1
+
+    monkeypatch.setattr(ns, "_enter_user_mount_namespace", lambda *args, **kwargs: None)
+    capability = ns._probe_namespace_capability(FailingLibc())
+    assert capability == ns.NamespaceCapability(
+        False, "capset(drop namespace capabilities)", "Operation not permitted"
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
 def test_probe_removes_bind_mount_directories(monkeypatch, tmp_path):
     probe_root = tmp_path / "probe"
 
     class SuccessfulLibc:
         def mount(self, source, target, filesystemtype, flags, data):
+            return 0
+
+        def capset(self, header, capabilities):
             return 0
 
     def make_probe_root(**kwargs):
@@ -210,7 +230,7 @@ def test_worker_freezes_unavailable_result_after_retry(monkeypatch):
     monkeypatch.setattr(ns.ctypes, "CDLL", fail)
     assert not ns.namespace_sandbox_available()
     assert ns._namespace_probe_result is None
-    assert not ns.prepare_empty_directory_masking([], cache_unavailable=True)
+    assert not ns.freeze_namespace_sandbox_capability().available
     assert ns._namespace_probe_result == ns.NamespaceCapability(
         False, "load libc", "temporary probe failure"
     )

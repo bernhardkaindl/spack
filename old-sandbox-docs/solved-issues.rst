@@ -30,13 +30,25 @@ Empty host Autoconf macro directory
 
 ``isa-l`` invoked ``aclocal`` with ``-I /usr/share/aclocal`` and failed with ``Permission denied`` because Landlock correctly denied the host directory.
 Returning ``ENOENT`` is not compatible with tools that expect an existing macro search directory.
-The build worker now enters a private user and mount namespace before starting worker threads, then bind-mounts an empty stage-owned directory over ``/usr/share/aclocal`` before Landlock is applied.
+Before starting worker threads, trusted Spack code enters a private user and
+mount namespace, then bind-mounts an empty stage-owned directory over
+``/usr/share/aclocal`` and drops namespace capabilities. Landlock is applied
+later, before build phases.
 The build observes an empty directory instead of a ``-EPERM`` failure and cannot use host Autoconf macros.
 The mask is skipped when the concrete DAG provides an external ``autoconf`` dependency, because a host Autoconf legitimately uses its own system macro directory.
 
 This Linux-specific workaround demonstrates masking selected host directories as empty without granting their host content or returning ``-EPERM``. It is a narrow instance of the Linux user and mount namespace backend described in :doc:`namespace-backend`; Phase 4 will generalize the approach to hiding host ``bin``, ``include``, and other directories and bind-mounting only whitelisted content.
 It requires unprivileged user and mount namespaces; when they are unavailable, Spack warns and preserves the existing Landlock behavior.
 A focused real-kernel test verifies that the bind mount appears empty, and ``isa-l`` completes with the mask enabled.
+
+This ordering also closes the :term:`mount-authority window`: package hooks,
+patching, and builder construction cannot create a bind mount below a path that
+Landlock will later grant recursively. The capability probe verifies the
+capability drop in a disposable child; focused lifecycle tests check the
+``prepare -> drop -> Tee -> recipe setup -> Landlock`` order and reject a
+later ``bind_mount`` call. The current protection only covers the narrow mask;
+the immutable, policy-driven Phase 4 mount plan remains necessary before
+adding further mounts.
 
 The preferred solution is the package-level change in `spack/spack-packages#6277 <https://github.com/spack/spack-packages/pull/6277>`_, which avoids this host path and does not require Linux mount namespaces.
 

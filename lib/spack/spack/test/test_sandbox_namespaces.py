@@ -38,6 +38,9 @@ class FakeLibc:
         self.mount_calls.append((source, target, flags.value))
         return 0
 
+    def capset(self, header, capabilities):
+        return 0
+
 
 @pytest.fixture
 def namespace_setup(monkeypatch):
@@ -170,6 +173,19 @@ def test_bind_mount_flags(tmp_path, directory):
     ]
 
 
+def test_dropped_mount_authority_rejects_later_mounts(namespace_setup, tmp_path):
+    libc, _ = namespace_setup
+    sandbox = ns.NamespaceSandbox(libc)
+    assert sandbox.prepare_mount_tree([], str(tmp_path))
+    assert sandbox.drop_mount_authority()
+    assert sandbox.drop_mount_authority()
+
+    source = tmp_path / "source"
+    source.mkdir()
+    with pytest.raises(spack.sandbox.SandboxError, match="mount authority was already dropped"):
+        sandbox.bind_mount(str(source))
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
 def test_live_mask_is_private(tmp_path):
     if not ns.namespace_sandbox_available():
@@ -300,22 +316,62 @@ def test_namespace_selection_rejects_unconstrained_fallback(monkeypatch):
         spack.sandbox.get_sandbox()
 
 
-def test_worker_enters_namespace_before_tee(monkeypatch):
+def test_worker_prepares_namespace_before_tee(monkeypatch):
     calls = []
+    sandbox = SimpleNamespace()
     monkeypatch.setattr(
         ns,
-        "prepare_empty_directory_masking",
-        lambda paths, **kwargs: calls.append(("prepare", list(paths), kwargs)) or True,
+        "freeze_namespace_sandbox_capability",
+        lambda: calls.append(("freeze",)) or ns.NamespaceCapability(True, None, None),
+    )
+    monkeypatch.setattr(
+        build,
+        "_prepare_namespace_sandbox_before_threads",
+        lambda config, spec, stage_path: calls.append(("prepare", spec, stage_path)) or sandbox,
     )
     monkeypatch.setattr(build, "Tee", lambda *args: calls.append(("tee", args)) or object())
+    spec = SimpleNamespace()
 
-    tee = build._start_tee_after_namespace(
-        {"enable": True}, "control-r", "control-w", "parent", "build.log"
+    tee, returned_sandbox = build._start_tee_after_namespace(
+        {"enable": True}, "control-r", "control-w", "parent", "build.log", spec, "stage"
     )
     assert tee is not None
+    assert returned_sandbox is sandbox
     assert calls == [
-        ("prepare", [], {"cache_unavailable": True}),
+        ("prepare", spec, "stage"),
         ("tee", ("control-r", "control-w", "parent", "build.log")),
+    ]
+
+
+def test_pre_thread_setup_prepares_and_drops_namespace_authority(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare", hidden_dirs, stage_path))
+            return True
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
+    sandbox = RecordingSandbox()
+    spec = SimpleNamespace(traverse=lambda **kwargs: [], prefix=tmp_path / "prefix")
+    monkeypatch.setattr(
+        ns,
+        "freeze_namespace_sandbox_capability",
+        lambda: calls.append(("freeze",)) or ns.NamespaceCapability(True, None, None),
+    )
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+
+    assert (
+        build._prepare_namespace_sandbox_before_threads({"enable": True}, spec, str(tmp_path))
+        is sandbox
+    )
+    assert calls == [
+        ("freeze",),
+        ("prepare", ["/usr/share/aclocal"], str(tmp_path)),
+        ("drop mount authority",),
     ]
 
 
@@ -358,6 +414,10 @@ def test_installer_mounts_before_landlock(monkeypatch, tmp_path, available, exte
         def allow_write(self, path):
             calls.append(("write", str(path)))
 
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
         def apply(self, block_network=False):
             calls.append(("apply", block_network))
 
@@ -373,6 +433,58 @@ def test_installer_mounts_before_landlock(monkeypatch, tmp_path, available, exte
     assert calls[0] == ("prepare", hidden_dirs, str(tmp_path))
     assert ("write", str(tmp_path)) in calls
     assert calls[-1] == ("apply", True)
+
+
+def test_recipe_setup_cannot_add_mounts_after_pre_thread_setup(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare", hidden_dirs, stage_path))
+            return True
+
+        def allow_read(self, path):
+            calls.append(("read", str(path)))
+
+        def allow_write(self, path):
+            calls.append(("write", str(path)))
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
+        def apply(self, block_network=False):
+            calls.append(("apply", block_network))
+
+    sandbox = RecordingSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    monkeypatch.setattr(
+        build,
+        "_prepare_namespace_sandbox_before_threads",
+        lambda config, spec, stage_path: (
+            calls.append(("prepare", stage_path)),
+            calls.append(("drop mount authority",)),
+            sandbox,
+        )[-1],
+    )
+    monkeypatch.setattr(build, "Tee", lambda *args: calls.append(("tee", args)) or object())
+    spec = SimpleNamespace(traverse=lambda **kw: [], prefix=tmp_path / "prefix")
+
+    _, prepared_sandbox = build._start_tee_after_namespace(
+        {"enable": True}, "control-r", "control-w", "parent", "build.log", spec, str(tmp_path)
+    )
+    calls.append(("recipe-controlled setup",))
+    build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=prepared_sandbox)
+
+    assert calls[:4] == [
+        ("prepare", str(tmp_path)),
+        ("drop mount authority",),
+        ("tee", ("control-r", "control-w", "parent", "build.log")),
+        ("recipe-controlled setup",),
+    ]
+    assert not any(call[0] == "prepare" for call in calls[3:])
+    assert calls.count(("drop mount authority",)) == 1
+    assert calls[-1] == ("apply", False)
 
 
 @pytest.mark.parametrize("external", [False, True])

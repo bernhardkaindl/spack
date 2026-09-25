@@ -1,0 +1,45 @@
+While working on sandbox code
+-----------------------------
+
+Documentation
+-------------
+
+Security issue documentation
+----------------------------
+
+When a review finds a security boundary issue, document the authority involved,
+the untrusted action it permits, the affected trusted asset or policy, the
+mitigation, and the residual limitation. Add stable glossary definitions for
+new security terms and link review-ledger findings to those definitions.
+
+While working o
+Update the sandbox docs th a new plan how to implement a Linux user and mount namespaces based sandbox backend capability which would be used as a preference when available for the install-worker. The problem there is that landlock can only deny permissions -EPERM while the benefit of mount namespaces is that the files can be truly hidden inside the sandbox by e.g. mounting an empty tmpfs over bin and include directories and only bind-mount the whitelisted programd and headers into those directories.
+The directory lib.sandbox/spack has a copy of the sources of lib/spack directory from a development branch that enabled using the Linux Landlock-based sandbox already present in this current develop branch checkout for sandboxing the package recipe parsing and installing of packages.
+
+    I moved the sandbox docs from that developement experiment to
+    lib/spack/docs/sandbox and added them to the current branch (based on the main develop branch)
+
+    See lib/spack/docs/sandbox/index.rst and lib/spack/docs/sandbox/overview.rst for an  overview. For installing packages or the install-worker, see  lib/spack/docs/sandbox/install-worker.rst
+
+    Update these docs for implementing a new approach using Linux user and mount namespaces, and starting the worker processes as new executed instances because that would be needed for the Windows implementation.
+
+
+
+    Make the plan by adding new documentation files to the sandbox docs and referring to them in existing docs as well as changing the existing docs as needed to indicate the new apprach for implementing the new plan from scratch based on this develop branch on top and the Windows sandbox PR I also merged on top of develop.
+
+
+    The directory lib.sandbox/spack has a copy of the sources of lib/spack directory from a development branch that enabled using the Linux Landlock-based sandbox already present in this current develop branch checkout for sandboxing the package recipe parsing and installing of packages.
+
+    I moved the sandbox docs from that developement experiment to
+    lib/spack/docs/sandbox and added them to the current branch (based on the main develop branch)
+
+    See lib/spack/docs/sandbox/index.rst and lib/spack/docs/sandbox/overview.rst for an  overview. For installing packages or the install-worker, see  lib/spack/docs/sandbox/install-worker.rst
+
+    Update these docs for implementing a new approach using Linux user and mount namespaces, and starting the worker processes as new executed instances because that would be needed for the Windows implementation.
+
+    Update the sandbox docs with a new plan how to implement a Linux user and mount namespaces based sandbox backend capability which would be used as a preference when available for the install-worker. The problem there is that landlock can only deny permissions -EPERM while the benefit of mount namespaces is that the files can be truly hidden inside the sandbox by e.g. mounting an empty tmpfs over bin and include directories and only bind-mount the whitelisted programd and headers into those directories.
+
+    Make the plan by adding new documentation files to the sandbox docs and referring to them in existing docs as well as changing the existing docs as needed to indicate the new apprach for implementing the new plan from scratch based on this develop branch on top and the Windows sandbox PR I also merged on top of develop.
+
+The sandbox documentation is in
+keep the documentation in
