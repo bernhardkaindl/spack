@@ -32,12 +32,12 @@ The worker reuses existing ``Stage`` and fetcher abstractions.
 It must not introduce a second fetch implementation.
 
 Build-phase confinement
-^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
 
 * Grant selected compilers, build tools, dependency prefixes, stage, and install-prefix access without opening their parent directories.
 * Use the Linux user and mount namespace backend described in :doc:`namespace-backend` when available to hide host ``bin``, ``include``, and other directories by mounting empty tmpfs over them and bind-mounting only whitelisted content.
 * When unprivileged user and mount namespaces are unavailable, fall back to the existing Landlock-only backend subject to ``config:sandbox:allow_fallback``.
-* On Windows, launch the worker as a new executed instance with restricted handles rather than forking the trusted parent, matching the Linux namespace backend's new-instance model.
+* Keep process creation platform-specific: the internal Linux backend self-restricts the existing forked install child, while a future recipe-confining Windows worker must be created inside AppContainer. External Linux tools such as Bubblewrap may use an alternate fresh-exec launcher later.
 * Preserve existing hooks, phases, logs, metadata archiving, prefix commit, and database behavior.
 * Keep build-time network access denied by default.
 * Replace the current unlimited installer worker memory profile with the measured Linux admission, throttling, and recovery design in the adaptive build memory scheduling plan.

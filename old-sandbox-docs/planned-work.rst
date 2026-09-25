@@ -15,7 +15,7 @@ Evaluate a per-invocation unprivileged user and mount namespace shared by the pr
 
 The namespace backend is the preferred Linux confinement backend when available. It complements the existing Landlock and seccomp stack by providing true filesystem hiding rather than only denial. When unavailable, the existing Landlock-only backend is used subject to ``config:sandbox:allow_fallback``.
 
-The Windows sandbox implementation starts the worker as a new executed instance with restricted handles rather than forking the trusted parent. That matches the Linux namespace backend's new-instance model: the trusted parent creates protocol endpoints, then launches a fresh process that applies confinement before importing any recipe code.
+The internal Linux backend self-restricts the existing forked install child, leaving the trusted installer supervisor outside the namespace. A future external launcher such as Bubblewrap may use a fresh executed worker. A future Windows worker that confines recipe Python must be created inside AppContainer, but that platform-specific requirement does not determine the Linux process model.
 
 .. list-table:: Namespace design questions
    :header-rows: 1
@@ -27,9 +27,9 @@ The Windows sandbox implementation starts the worker as a new executed instance 
      - Optional.  Some distributions disable unprivileged user namespaces or
        restrict user/group ID mapping.
    * - Process layout
-     - A trusted launcher creates the namespaces and starts the worker as a new
-       executed instance inside them.  The worker does not fork from the trusted
-       parent.
+     - The existing forked Linux install child enters the namespaces before
+       starting child-local threads and applies Landlock before build phases.
+       External launcher backends may instead execute a fresh worker.
    * - Supervisor
      - The seccomp supervisor can remain outside the shared namespace while it
        retains the notification and pidfd handles.

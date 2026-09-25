@@ -65,8 +65,10 @@ operations, process creation and execution, and IPC.  The worker sets
 ``PR_SET_NO_NEW_PRIVS``, enforces memory rlimits, and closes inherited
 descriptors before confinement.
 
-The namespace backend launches the worker as a new executed instance inside
-the namespaces, rather than forking the trusted parent.  That matches the
-Windows sandbox model, where the worker also starts as a new executed process
-with restricted handles.  See :doc:`namespace-backend` for the shared process
-model and the Linux mount-tree design.
+The internal namespace backend self-restricts the existing forked Linux install
+child; the trusted installer supervisor remains in the host namespaces.
+External launchers such as Bubblewrap may use a fresh executed worker as an
+alternate backend. Windows AppContainer has its own process-creation
+requirements and does not determine the Linux launch model. See
+:doc:`namespace-backend` for the platform-specific process boundaries and the
+Linux mount-tree design.
