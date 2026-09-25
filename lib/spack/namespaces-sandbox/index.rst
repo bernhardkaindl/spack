@@ -42,9 +42,11 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   phases. The broader mount policy is Phase 4.
 * **Phase 4 -- planning increment complete, policy work open:** the current
   narrow mask is represented by an immutable, validated, deterministic mount
-  plan before namespace mutation. Explicit preserved sources are staged before
-  hiding parents, canonical merged-``/usr`` aliases are restored in safe order,
-  and policy-derived compiler, tool, and header mounts remain future work.
+  plan before namespace mutation. Its empty sources are private tmpfs mounts
+  remounted read-only before exposure, so stage write grants cannot populate
+  them. Explicit preserved sources are staged before hiding parents, canonical
+  merged-``/usr`` aliases are restored in safe order, and policy-derived
+  compiler, tool, and header mounts remain future work.
 * **Phases 5 and 6 -- not started:** full build-phase policy validation and
   concretizer-worker evaluation remain future work.
 
@@ -111,10 +113,13 @@ holding the namespace exits; ``cleanup`` does not actively unmount them.
 Phase 3: install-worker integration
 -----------------------------------
 
-``NamespaceSandbox`` delegates read/write grants and application to Landlock.
-Namespace masking does not replace Landlock confinement. Backend selection
-prefers namespaces on Linux when the probe succeeds, otherwise it records the
-failed operation and selects constrained Landlock.
+The current transitional ``NamespaceSandbox`` delegates read/write grants and
+application to Landlock after namespace masking. The intended completed
+namespace policy will replace that default filesystem role with hidden trees
+and explicit read-only or writable bind mounts; Landlock will remain available
+as an opt-in mode for testing ``EPERM`` behavior. Backend selection prefers
+namespaces on Linux when the probe succeeds, otherwise it records the failed
+operation and selects constrained Landlock.
 
 Before starting its ``Tee`` logging thread, the installer prepares the mount
 tree and drops all user-namespace capabilities. Its default mask hides
