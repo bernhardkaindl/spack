@@ -188,10 +188,18 @@ sources. A missing target remains a no-op for the narrow mask. An existing
 stage path must be a directory; a not-yet-created stage path is created only
 when the validated plan is applied.
 
+The plan also accepts explicitly selected source-to-target pairs for the
+policy-driven tree. Source paths and targets are canonicalized, source and
+target file types are checked, and a target must be below a hidden directory.
+The plan creates stage-owned preservation endpoints before hiding parents,
+then restores those endpoints into the hidden tree in increasing target-depth
+order. This handles merged-``/usr`` aliases by planning against their resolved
+targets and uses recursive bind mounts only for preserved directory trees.
+
 This is the planning and validation boundary for Phase 4, not the complete
-policy-driven mount tree. Preserving whitelisted sources before hiding their
-parents, resolving merged-``/usr`` aliases, and selecting safe ordering for
-compiler, tool, and header mounts remain the next implementation step.
+policy-driven mount tree. Selecting the compiler, tool, and header source set
+and replacing writable stage-owned mask sources with immutable empty sources
+remain open.
 
 Base mounts
 ~~~~~~~~~~~
@@ -393,9 +401,10 @@ may be added later as a further inner layer; see `Relationship to Landlock
 Phase 4: Policy-driven mount tree
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The immutable mount-plan validation increment is complete for the current
-narrow mask. Extend it so the set of hidden directories and bind-mounted
-content is driven by policy rather than a fixed list. The policy derives from:
+The immutable mount-plan validation and preserved-source ordering increments
+are complete for the current narrow mask. Extend them so the set of hidden
+directories and bind-mounted content is driven by policy rather than a fixed
+list. The policy derives from:
 
 * The concrete spec's selected compilers and build tools.
 * The host's available header trees and compiler installations.
