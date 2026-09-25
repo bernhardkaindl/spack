@@ -114,33 +114,36 @@ launches an unconstrained worker.
 Process model
 -------------
 
-The namespace backend uses a fresh executed instance rather than a fork of
-the trusted parent. This is the model that also applies to the Windows
-implementation, where sandboxing depends on starting the worker as a new
-process rather than inheriting the parent's address space and file-descriptor
-table.
+The internal Linux namespace backend reuses the existing forked install child.
+The trusted installer supervisor creates that child through the existing
+``multiprocessing.Process`` launch path. Only the child calls
+``unshare(CLONE_NEWUSER | CLONE_NEWNS)``, configures UID and GID mappings,
+makes the root mount private, prepares the mount tree, and applies Landlock.
+The supervisor remains in the host namespaces and is not restricted.
 
-On Linux, the trusted parent:
+Namespace entry happens before the child starts its logging thread. Landlock
+is applied later, immediately before the existing package build-phase loop.
+This is the same self-restriction pattern used by the Landlock-only backend:
+neither ``unshare()`` nor ``landlock_restrict_self()`` requires an intervening
+``exec``.
 
-1. Creates a Pipe or socketpair for the bounded worker protocol before
-   confinement.
-2. Forks a short-lived setup child or uses ``clone()`` with
-   ``CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWNET`` to create the namespaces.
-3. The setup child configures UID and GID mapping, mount propagation
-   containment, and the mount tree.
-4. The setup child executes the worker binary as a new process inside the
-   namespaces, passing the pre-created protocol endpoints as inherited
-   descriptors.
-5. The worker applies Landlock inside the namespaces before importing any
-   recipe code. Seccomp is a later-stage enhancement that can add syscall
-   filtering and user notifications on top of the Landlock and namespace
-   confinement; see `Relationship to Landlock (and future seccomp)`_.
+On Landlock ABI 8 and newer, ``LANDLOCK_RESTRICT_SELF_TSYNC`` applies the
+Landlock domain to the child-local logging thread as well. On older ABIs that
+trusted thread is outside the Landlock domain, although it remains inside the
+mount namespace; it must not execute package recipe or build-tool code.
 
-This model means the worker does not inherit the parent's loaded Python
-modules, open file descriptors, or process state beyond the explicitly
-passed protocol endpoints. It is a cleaner isolation boundary than
-fork-based launch for the namespace case, and it matches the Windows
-requirement for a fresh executed instance.
+The forked child inherits loaded modules, Python objects, environment state,
+and open descriptors from the supervisor. The current boundary therefore
+protects build phases; it is not confinement-before-recipe-import and does not
+claim that inherited descriptors have been minimized. A future fresh-executed
+worker may provide that additional hardening, but it is not required to use
+the internal namespace backend.
+
+External Linux launchers such as Bubblewrap have a different interface: they
+construct confinement while starting another command. Supporting one naturally
+adds an alternate fresh-exec launcher. That optional backend must preserve the
+same installer state, logging, and failure contracts, but it does not replace
+the internal fork-and-self-restrict path.
 
 Mount tree design
 -----------------
@@ -152,7 +155,7 @@ content the worker legitimately needs.
 Base mounts
 ~~~~~~~~~~~
 
-The setup child performs these mounts in order:
+The install child performs these mounts in order:
 
 1. Make the root mount private with ``MS_PRIVATE`` so mounts do not propagate
    back to the host.
@@ -201,8 +204,8 @@ utilities.
 Mount cleanup
 ~~~~~~~~~~~~~
 
-The setup child or the worker's parent reaps the namespace and its mounts
-when the worker exits. Mount cleanup must handle:
+The namespace and all of its mounts disappear when the install child exits.
+Future code that performs explicit cleanup before process exit must handle:
 
 * Unmounting the tmpfs hides in reverse order.
 * Unmounting bind mounts.
@@ -222,10 +225,10 @@ behave as expected for files the worker legitimately accesses.
 
 The mapping is:
 
-* ``uid_map``: ``0 <numeric-uid> 1`` for the invoking user, plus any
+* ``uid_map``: ``<numeric-uid> <numeric-uid> 1`` for the invoking user, plus any
   additional mapping needed for files owned by other UIDs that the worker
   must read.
-* ``gid_map``: ``0 <numeric-gid> 1`` for the invoking user's primary group,
+* ``gid_map``: ``<numeric-gid> <numeric-gid> 1`` for the invoking user's primary group,
   plus any additional mapping needed for files owned by other GIDs.
 
 The worker runs as the mapped UID inside the namespace. It does not gain
@@ -282,31 +285,17 @@ backend is the general facility that the workaround was pointing at.
 Windows equivalent
 ------------------
 
-Windows does not have mount namespaces or Landlock. The Windows sandbox
-implementation starts the worker as a new executed instance with its own
-process identity, its own environment, and restricted access to the host
-filesystem through job objects, integrity levels, and inherited-handle
-restriction.
+Windows does not have mount namespaces or Landlock, and AppContainer cannot
+self-restrict an already-running process. The current Windows backend therefore
+applies AppContainer when it creates external build-tool processes. Direct
+Python file I/O performed by package recipes in the installer process is not
+confined by that backend.
 
-The Windows model is the same conceptual shape as the Linux namespace backend:
-
-* The trusted parent creates the protocol endpoints.
-* The trusted parent launches a new process for the worker.
-* The new process does not inherit the parent's open file descriptors,
-  loaded modules, or process state beyond the explicitly passed endpoints.
-* The new process applies its confinement policy before importing any recipe
-  code.
-
-On Linux, the namespace backend achieves this by executing the worker inside
-a fresh user and mount namespace. On Windows, the equivalent is launching the
-worker as a new process with restricted handles and job-object containment.
-Both models avoid fork-based launch for the confined worker, because fork
-inherits state that the sandbox is meant to isolate.
-
-The shared documentation shape is that the sandbox backend launches a new
-executed instance of the worker, applies confinement, and then the worker
-imports recipe code. The platform-specific mechanism differs, but the
-trust boundary and process model are the same.
+A future Windows boundary that also confines recipe Python must create the
+installer worker inside an AppContainer, with explicit handles and process
+state. That fresh-process requirement is specific to AppContainer. It does not
+require the internal Linux namespace backend to replace its existing forked
+install child with a fresh-executed worker.
 
 Implementation phases
 ---------------------
@@ -336,16 +325,20 @@ Implement the mount tree setup in a dedicated module. The module:
 * Cleans up the mount tree when the worker exits.
 
 The module is independent of the worker protocol and confinement policy. It
-exposes a function that prepares a namespace and returns a file descriptor or
-handle for the namespace, plus a function that executes the worker inside the
-namespace.
+exposes process-local namespace-entry, masking, and bind-mount primitives used
+by the existing install child.
 
 Phase 3: Integration with the install worker
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Integrate the namespace backend into the install worker's launch path. When
-the namespace backend is available, the worker launches inside the namespace
-and then applies Landlock inside the namespace.
+the namespace backend is available, the existing Linux install child enters
+the namespace before starting child-local threads. It prepares the selected
+mount view and then applies Landlock immediately before the build phases.
+
+This phase does not require a second worker protocol or ``exec``. An external
+sandboxing tool may be added later as an alternate launcher, and a future
+fresh-exec boundary may harden inherited-state and recipe-import isolation.
 
 The existing Landlock policies remain valid inside the namespace.
 They operate on the visible mount tree, so their rules apply to the
@@ -395,9 +388,13 @@ Decision gates
 * [ ] The namespace backend is preferred when available; Landlock-only is the
   fallback, not the default.
 * [ ] The mount tree is derived from policy, not a fixed list.
-* [ ] The namespace backend launches a new executed instance, not a fork of
-  the trusted parent.
-* [ ] The Windows implementation uses the same new-executed-instance model.
+* [x] The internal Linux backend confines only the existing forked install
+  child; the trusted installer supervisor remains outside the namespace.
+* [ ] External Linux sandbox tools use a separate launcher without changing
+  the internal backend's process model.
+* [ ] A future Windows worker that confines recipe Python is created directly
+  inside AppContainer; this platform-specific requirement does not constrain
+  Linux launch design.
 * [ ] Landlock remains in force inside the namespace; seccomp is a later-stage
   addition not yet in the develop branch.
 * [ ] The capability probe reports specific reasons when the namespace backend

@@ -196,7 +196,7 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: install-worker integration (experimental in-process hook)
+# Phase 3: existing Linux install-child integration
 # ---------------------------------------------------------------------------
 
 

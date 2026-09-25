@@ -198,11 +198,20 @@ Acceptance checks:
 * [x] source installs use proxy-supervised staging; and
 * [x] binary-cache, cache-only, and source-only paths retain current behavior.
 
+.. _install-worker-build-phase:
+
 4. Build-phase confinement and tool policy
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 After staging is integrated, apply dedicated build policy immediately before existing builder phases.
 It receives the concrete spec and prepared stage and prefix; it does not change compiler selection or create a new build path.
+
+On Linux, this policy is applied in the existing forked installer child. The
+child enters the private user and mount namespace, prepares the mount view, and
+applies Landlock to itself; the installer supervisor remains unaffected. A
+fresh ``exec`` is not required for the internal Linux backend. External tools
+such as Bubblewrap may be added later as alternate launchers. Windows
+AppContainer process creation remains a separate platform-specific boundary.
 
 Read access includes non-external dependency prefixes, the selected package directory, Spack runtime and sbang resources, selected loader files, and selected compiler tools.
 Write access is limited to the stage, exact selected prefix, necessary temporary space, and explicit trusted configuration.
