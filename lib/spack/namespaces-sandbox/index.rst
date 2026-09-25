@@ -36,9 +36,10 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   empty-directory masking, and bind-mount primitives are implemented. The
   policy-driven tmpfs tree, preserved mount sources, namespace handle, and
   explicit cleanup interface remain open.
-* **Phase 3 -- complete for the narrow integration:** the current build worker
-  enters the namespace before starting its logging thread, and the installer
-  applies the narrow mask before Landlock. The broader mount policy is Phase 4.
+* **Phase 3 -- complete for the narrow integration:** before starting its
+  logging thread, the current build worker performs trusted namespace mount
+  setup and drops mount authority. The installer applies Landlock before build
+  phases. The broader mount policy is Phase 4.
 * **Phases 4 through 6 -- not started:** policy-driven mounts, full build-phase
   confinement, and concretizer-worker evaluation remain future work.
 
@@ -62,9 +63,10 @@ same numeric values, denies setgroups, and makes the root mount private with
   descriptor and reaps the child even if reading the probe result fails.
 * The child always exits with ``os._exit``; unexpected setup exceptions cannot
   unwind into the parent's caller or duplicate the test runner.
-* The probe checks namespace creation, mappings, and propagation containment.
-  Child and parent failures retain operation-specific diagnostics. It does not
-  yet test every mount type needed by the Phase 4 policy tree.
+* The probe checks namespace creation, mappings, propagation containment, the
+  current directory bind mount, and capability dropping. Child and parent
+  failures retain operation-specific diagnostics. It does not yet test every
+  mount type needed by the Phase 4 policy tree.
 * Completed default-libc probe results are cached. Installer construction
   performs the preflight before build workers start; forked workers inherit
   that result. If preflight failed operationally, the worker retries before
@@ -109,16 +111,17 @@ Namespace masking does not replace Landlock confinement. Backend selection
 prefers namespaces on Linux when the probe succeeds, otherwise it records the
 failed operation and selects constrained Landlock.
 
-The installer prepares the mount tree before granting Landlock permissions.
-Its default mask hides ``/usr/share/aclocal`` unless an external ``autoconf``
-dependency needs the host macros. An empty mask still enters the namespace.
-The worker performs this entry before starting its ``Tee`` logging thread. If
-preparation reports namespace unavailability, the existing hook warns and
-still applies Landlock. Setup or mount exceptions abort rather than continuing
-with a partial mount tree. Pre-thread setup failures close the state stream,
-write their traceback to the build log, and exit with ``BUILD_ERROR``. Landlock
-initialization errors are normalized as ``SandboxError`` and then as installer
-errors.
+Before starting its ``Tee`` logging thread, the installer prepares the mount
+tree and drops all user-namespace capabilities. Its default mask hides
+``/usr/share/aclocal`` unless an external ``autoconf`` dependency needs the
+host macros. An empty mask still enters the namespace. The resulting sandbox
+instance is handed to later setup solely for Landlock grants and application;
+it rejects later bind mounts. If preparation reports namespace unavailability,
+the existing hook warns and still applies Landlock. Setup or mount exceptions
+abort rather than continuing with a partial mount tree. Pre-thread setup
+failures close the state stream, write their traceback to the build log, and
+exit with ``BUILD_ERROR``. Landlock initialization errors are normalized as
+``SandboxError`` and then as installer errors.
 The shared ``config:sandbox:allow_fallback`` policy for trusted direct execution
 when no constrained worker is available is not implemented by this hook.
 
@@ -126,13 +129,14 @@ Verification
 ------------
 
 Unit tests cover UID/GID mapping, re-entry, empty-tree readiness, denied
-availability, fatal mount errors, bind flags, Landlock delegation, and installer
-ordering on both the namespace and fallback paths. Tests also observe namespace
-preparation before ``Tee`` construction and verify controlled reporting of
-pre-thread setup failures. Unit namespace setup mocks both libc and mapping-file
-writes; it never writes the test runner's ``/proc`` mappings. Probe lifecycle
-regressions exercise descriptor cleanup, retry and cache behavior, and isolate
-the unexpected-exception case in a separate interpreter.
+availability, fatal mount errors, bind flags, capability dropping, Landlock
+delegation, and installer ordering on both the namespace and fallback paths.
+Tests observe trusted prepare-and-drop before ``Tee`` construction, reject a
+later bind mount, and verify controlled reporting of pre-thread setup failures.
+Unit namespace setup mocks both libc and mapping-file writes; it never writes
+the test runner's ``/proc`` mappings. Probe lifecycle regressions exercise
+descriptor cleanup, retry and cache behavior, and isolate the
+unexpected-exception case in a separate interpreter.
 
 A Linux integration test creates an actual private namespace and masks a
 temporary host directory. It verifies an empty listing and ``ENOENT`` inside

@@ -27,9 +27,10 @@ The internal Linux backend self-restricts the existing forked install child, lea
      - Optional.  Some distributions disable unprivileged user namespaces or
        restrict user/group ID mapping.
    * - Process layout
-     - The existing forked Linux install child enters the namespaces before
-       starting child-local threads and applies Landlock before build phases.
-       External launcher backends may instead execute a fresh worker.
+     - Before starting child-local threads, the existing forked Linux install
+       child completes trusted namespace mount setup and drops namespace
+       capabilities. It applies Landlock before build phases. External launcher
+       backends may instead execute a fresh worker.
    * - Supervisor
      - The seccomp supervisor can remain outside the shared namespace while it
        retains the notification and pidfd handles.

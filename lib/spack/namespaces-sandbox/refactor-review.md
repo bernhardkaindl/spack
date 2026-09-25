@@ -20,9 +20,10 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - [x] Phase 2 increment, mount-tree setup: the narrow namespace-entry and bind-mount
   primitives exist. The planned tmpfs policy tree, preserved sources, namespace
   handle, and explicit cleanup API remain open.
-- [x] Phase 3 increment, install-worker integration: the existing forked Linux
-  install child enters the namespace before starting its logging thread and
-  applies Landlock before build phases. The supervisor remains unaffected.
+- [x] Phase 3 increment, install-worker integration: before starting its
+  logging thread, the existing forked Linux install child completes trusted
+  namespace mount setup and drops mount authority. It applies Landlock before
+  build phases. The supervisor remains unaffected.
 - [ ] Phase 4, policy-driven mount tree.
 - [ ] Phase 5, complete build-phase policy validation and hardening.
 - [ ] Phase 6, concretizer-worker evaluation.
@@ -61,10 +62,6 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - [ ] Use mask sources that remain non-writable after confinement. The current
   stage-owned source hides host content but can be populated through the
   writable stage path, so it is not a permanent-empty foundation for Phase 4.
-- [ ] Define and validate an immutable Phase 4 mount plan before performing any
-  mounts. Resolve preserved source paths and merged-`/usr` aliases, validate
-  source and target types, reject conflicting or duplicate targets, and produce
-  deterministic mount order.
 
 ### Landlock composition and installer errors
 
@@ -87,12 +84,22 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   setup failures fatal. Add focused selection and diagnostic tests before
   starting the Phase 4 mount policy.
 
-- [ ] Close the mount-authority window between pre-thread namespace entry and
-  Landlock application. Recipe-controlled Python currently runs after the
-  child gains mount capability but before Landlock, and could bind host content
-  beneath a path that Landlock later grants recursively. Add an adversarial
-  regression first, then make namespace setup and confinement adjacent or drop
-  mount authority before recipe-controlled code. Resolve this before Phase 4.
+- [x] Close the [mount-authority window](../docs/sandbox/glossary.rst#sandbox-term-mount-authority-window)
+  between pre-thread namespace entry and Landlock application. This was the
+  interval in which recipe-controlled Python could create a bind mount beneath
+  a path that Landlock later grants recursively. The disposable probe now
+  verifies capability dropping; the trusted pre-thread path prepares the narrow
+  mask, drops user-namespace capabilities, and hands the same sandbox instance
+  to later Landlock setup. A regression asserts
+  ``prepare -> drop -> Tee -> recipe setup -> Landlock`` and rejects a later
+  ``bind_mount`` call. This protects the current narrow mount set; the
+  immutable Phase 4 mount plan remains required before adding policy mounts.
+
+- [ ] Define and validate an immutable Phase 4 mount plan before performing any
+  mounts. Resolve preserved source paths and merged-``/usr`` aliases, validate
+  source and target types, reject conflicting or duplicate targets, and produce
+  deterministic mount order. Add plan-level regressions before enabling any
+  additional mounts.
 
 ### Tests and documentation structure
 
@@ -120,6 +127,9 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - The disposable probe now exercises the directory bind mount required by the
   current masking backend, so that failure selects Landlock before mutating the
   install worker.
+- The trusted pre-thread path completes the narrow mount setup and drops all
+  user-namespace capabilities before `Tee` or recipe-controlled Python runs.
+  Later namespace bind mounts are rejected; Landlock then confines build phases.
 - Fork, pipe, read, and wait lifecycle paths have direct regression coverage.
 - Empty mount trees now establish real readiness rather than reporting probe-only
   availability.
@@ -188,6 +198,12 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   recorded that stage-owned mask sources are writable and corrected broader
   docs that described the unimplemented Phase 4 ``bin``/``include`` policy as
   current behavior. Closing the authority window is the next selected work.
+- 2026-09-25: Closed the mount-authority window by performing the narrow trusted
+  mount setup before `Tee`, dropping all user-namespace capabilities, and
+  handing the prepared sandbox to later Landlock setup. The capability probe
+  now tests the drop, lifecycle tests assert ordering and reject later bind
+  mounts, and the public sandbox glossary defines the term. Selected immutable
+  Phase 4 mount-plan validation as the next work item.
 - 2026-09-25: Ran `ruff format`, `ruff format --check`, and `ruff check` on all
   four changed Python files; the focused namespace and shared sandbox suite
   passed 45 tests. A fresh full Sphinx build reports no warnings from changed

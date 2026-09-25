@@ -12,6 +12,7 @@ Documentation map
 -----------------
 
 * :doc:`overview`: scope and shared trust boundary.
+* :doc:`glossary`: shared sandbox security terms.
 * :doc:`status`: implemented behavior and focused validation.
 * :doc:`solved-issues`: resolved failures, root causes, and retained regression boundaries.
 * :doc:`roadmap`: immediate command-hardening milestones.
@@ -30,6 +31,7 @@ Documentation map
    :maxdepth: 1
 
    overview
+   glossary
    status
    solved-issues
    roadmap

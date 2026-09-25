@@ -128,6 +128,9 @@ class MockNamespaceSandbox(spack.sandbox_namespaces.NamespaceSandbox):
         self.prepare_mount_tree_calls.append((list(hidden_dirs), stage_path))
         return True
 
+    def drop_mount_authority(self):
+        return True
+
     def apply(self, block_network=False):
         self.apply_calls.append(block_network)
 
