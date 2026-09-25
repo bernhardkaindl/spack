@@ -17,6 +17,7 @@ import spack.error
 import spack.installer.build as build
 import spack.sandbox
 import spack.sandbox_namespaces as ns
+import spack.util.tty
 
 
 @pytest.fixture(autouse=True)
@@ -57,7 +58,9 @@ def namespace_setup(monkeypatch):
     monkeypatch.setattr(ns.os, "getuid", lambda: 1234, raising=False)
     monkeypatch.setattr(ns.os, "getgid", lambda: 5678, raising=False)
     monkeypatch.setattr(ns, "open", lambda path, *a, **kw: Mapping(path), raising=False)
-    monkeypatch.setattr(ns, "_namespace_available", lambda libc: True)
+    monkeypatch.setattr(
+        ns, "_probe_namespace_capability", lambda libc: ns.NamespaceCapability(True, None, None)
+    )
     return libc, writes
 
 
@@ -106,13 +109,19 @@ def test_empty_mount_tree_enters_namespace(namespace_setup, tmp_path):
 def test_prepare_reuses_active_namespace(namespace_setup, monkeypatch):
     libc, _ = namespace_setup
     ns._enter_user_mount_namespace(libc)
-    monkeypatch.setattr(ns, "_namespace_available", lambda libc: False)
+    monkeypatch.setattr(
+        ns, "_probe_namespace_capability", lambda libc: pytest.fail("unexpected probe")
+    )
     assert ns.prepare_empty_directory_masking(["/unused"], libc)
     assert len(libc.unshare_calls) == 1
 
 
 def test_unavailable_namespace_is_not_ready(monkeypatch, tmp_path):
-    monkeypatch.setattr(ns, "namespace_sandbox_available", lambda libc=None: False)
+    monkeypatch.setattr(
+        ns,
+        "namespace_sandbox_capability",
+        lambda libc=None: ns.NamespaceCapability(False, "unshare", "not permitted"),
+    )
     sandbox = ns.NamespaceSandbox(FakeLibc())
     assert not sandbox.prepare_mount_tree([], str(tmp_path))
     assert not sandbox.namespace_ready
@@ -244,12 +253,51 @@ def test_installer_normalizes_landlock_initialization_error(monkeypatch, tmp_pat
 def test_namespace_selection_preflights_landlock(monkeypatch):
     landlock = object()
     monkeypatch.setattr(spack.sandbox.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(ns, "namespace_sandbox_available", lambda: True)
+    monkeypatch.setattr(
+        ns,
+        "namespace_sandbox_decision",
+        lambda: ns.NamespaceSandboxDecision(
+            ns.NamespaceSandboxBackend.NAMESPACE, ns.NamespaceCapability(True, None, None)
+        ),
+    )
     monkeypatch.setattr(spack.sandbox, "LandlockSandbox", lambda: landlock)
 
     sandbox = spack.sandbox.get_sandbox()
     assert isinstance(sandbox, ns.NamespaceSandbox)
     assert sandbox._landlock is landlock
+
+
+def test_namespace_selection_uses_constrained_landlock_fallback(monkeypatch):
+    capability = ns.NamespaceCapability(False, "write uid_map", "operation not permitted")
+    decision = ns.NamespaceSandboxDecision(ns.NamespaceSandboxBackend.LANDLOCK, capability)
+    landlock = object()
+    messages = []
+    monkeypatch.setattr(spack.sandbox.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(ns, "namespace_sandbox_decision", lambda: decision)
+    monkeypatch.setattr(spack.sandbox, "LandlockSandbox", lambda: landlock)
+    monkeypatch.setattr(spack.util.tty, "debug", messages.append)
+
+    assert decision.is_fallback
+    assert decision.is_constrained
+    assert spack.sandbox.get_sandbox() is landlock
+    assert messages == [
+        "Namespace sandbox unavailable during write uid_map: operation not permitted; "
+        "using Landlock-only sandbox"
+    ]
+
+
+def test_namespace_selection_rejects_unconstrained_fallback(monkeypatch):
+    capability = ns.NamespaceCapability(False, "unshare", "operation not permitted")
+    decision = ns.NamespaceSandboxDecision(ns.NamespaceSandboxBackend.UNCONSTRAINED, capability)
+    monkeypatch.setattr(spack.sandbox.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(ns, "namespace_sandbox_decision", lambda: decision)
+
+    assert decision.is_fallback
+    assert not decision.is_constrained
+    with pytest.raises(
+        spack.sandbox.SandboxError, match="unconstrained fallback is not permitted"
+    ):
+        spack.sandbox.get_sandbox()
 
 
 def test_worker_enters_namespace_before_tee(monkeypatch):
