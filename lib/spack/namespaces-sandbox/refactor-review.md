@@ -220,9 +220,20 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
   it before Tee/thread creation. Landlock remains fallback-only and no
   config.yaml option is introduced.
 
-- [ ] Exercise the activated policy through a complete install-child lifecycle,
-  including home/device hiding, the whole writable inventory, and failure-path
-  stage/prefix evidence.
+- [x] D1, make the production-selected activation policy compile. Visible
+  read-only candidates use the recursively read-only inherited view; explicit
+  writable paths outside hidden roots receive writable identity mounts;
+  devices are not duplicated across access categories; Python runtime paths
+  are canonical; and installer setup supplies the configured fetch cache.
+
+- [ ] D2, configure worker-local home and temporary state during automatic
+  activation. Carry the scoped worker root in the immutable payload and set
+  home, XDG cache, POSIX temporary, Python temporary, and Java home/temporary
+  settings before threads or recipe-controlled setup. Add focused environment
+  and writable-policy evidence.
+
+After D2, complete the private `/dev` view and run the whole writable inventory
+and stage/prefix failure semantics through a complete install-child lifecycle.
 
 - [x] Materialize the complete trusted input selection in trusted installer
   setup. Select the complete hidden host/device roots; resolve the concrete
@@ -297,11 +308,13 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
   validated as directories at explicit hidden roots and mounted before nested
   restorations; generated alias paths remain lexical while their targets are
   canonicalized and created in the private mask source.
-- Trusted installer construction classifies the existing dependency, prefix,
-  stage, temporary, device, `sbang`, and configured path grants. Missing paths
-  are omitted like current sandbox grants and redundant same-access descendants
-  are collapsed. Policy compilation rejects classified paths that do not yet
-  have a containing hidden root; the live worker does not use this broad policy.
+- Trusted installer construction classifies the dependency, prefix, stage,
+  temporary, device, `sbang`, and configured path grants. Missing optional
+  candidates are omitted and redundant same-access descendants are collapsed.
+  Read-only paths outside hidden roots use the inherited read-only view;
+  writable paths outside hidden roots receive writable identity mounts. The
+  live worker activates this policy automatically when namespaces are
+  available.
 - Hidden roots must exist, lexical overlap checks consider every prior ancestor,
   and mount-plan scratch space and its reserved source subtrees may not overlap
   hidden roots. Preserved sources are rechecked and never recreated after
@@ -502,3 +515,13 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
   setup skips Landlock; the Landlock-only backend remains the capability
   fallback. No ``config.yaml`` option was added. Selected complete
   install-child lifecycle evidence as the next hardening item.
+- 2026-09-26: Completed D1 production-policy compilation hardening. The first
+  full preparation regression exposed conflicting `/dev/null` access,
+  non-canonical Python executable selection, incorrect misc-cache wiring, and
+  invalid restoration mounts for visible read-only candidates. Policy assembly
+  now uses inherited read-only passthrough, supports explicit writable identity
+  mounts outside hidden roots, cancels a hidden-root candidate when that exact
+  tree is selected read-only, permits narrower writable overrides below
+  read-only ancestors, resolves duplicate runtime/device paths to writable
+  device access, and passes the configured fetch cache. Selected D2 scoped home and temporary
+  environment setup next.

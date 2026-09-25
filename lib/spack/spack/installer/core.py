@@ -806,7 +806,7 @@ class PackageInstaller:
                         self.log_paths[dag_hash],
                         jobserver_paths,
                         worker_root,
-                        spack.caches.misc_cache_location(config=spack.config.CONFIG),
+                        spack.caches.fetch_cache_location(config=spack.config.CONFIG),
                     )
                 except BaseException:
                     lifecycle.finalize(ExitCode.BUILD_ERROR)
