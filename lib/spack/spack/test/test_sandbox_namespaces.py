@@ -150,6 +150,83 @@ def test_mount_plan_rejects_invalid_types(tmp_path):
         ns.build_namespace_mount_plan([], str(stage_file))
 
 
+def test_mount_plan_preserves_sources_before_hiding_and_restores_aliases(tmp_path):
+    hidden = tmp_path / "usr" / "bin"
+    hidden.mkdir(parents=True)
+    merged_alias = tmp_path / "bin"
+    merged_alias.symlink_to(tmp_path / "usr" / "bin", target_is_directory=True)
+    source = tmp_path / "selected-tool"
+    source.touch()
+    stage = tmp_path / "stage"
+
+    plan = ns.build_namespace_mount_plan(
+        [str(hidden)], str(stage), [(str(source), str(merged_alias / "tool"))]
+    )
+
+    assert plan.preserved_mounts == (
+        ns.NamespacePreservedMount(
+            str(source.resolve()),
+            str(stage / "spack-preserved-host-paths/0"),
+            False,
+        ),
+    )
+    assert plan.restoration_mounts == (
+        ns.NamespacePreservedMount(
+            str(stage / "spack-preserved-host-paths/0"),
+            str(hidden / "tool"),
+            False,
+        ),
+    )
+
+    libc = FakeLibc()
+    assert ns._apply_namespace_mount_plan(plan, libc)
+    assert libc.mount_calls == [
+        (
+            os.fsencode(source),
+            os.fsencode(stage / "spack-preserved-host-paths/0"),
+            ns.MS_BIND,
+        ),
+        (os.fsencode(stage / "spack-empty-host-dirs/0"), os.fsencode(hidden), ns.MS_BIND),
+        (
+            os.fsencode(stage / "spack-preserved-host-paths/0"),
+            os.fsencode(hidden / "tool"),
+            ns.MS_BIND,
+        ),
+    ]
+
+
+def test_mount_plan_preserves_directory_trees_recursively(tmp_path):
+    hidden = tmp_path / "usr" / "include"
+    hidden.mkdir(parents=True)
+    source = tmp_path / "headers"
+    source.mkdir()
+    plan = ns.build_namespace_mount_plan(
+        [str(hidden)], str(tmp_path / "stage"), [(str(source), str(hidden / "selected"))]
+    )
+
+    libc = FakeLibc()
+    assert ns._apply_namespace_mount_plan(plan, libc)
+    assert libc.mount_calls[0][2] == ns.MS_BIND | ns.MS_REC
+    assert libc.mount_calls[1][2] == ns.MS_BIND
+    assert libc.mount_calls[2][2] == ns.MS_BIND | ns.MS_REC
+
+
+def test_mount_plan_rejects_preserved_source_relationships(tmp_path):
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+
+    with pytest.raises(ns.NamespaceSetupError, match="preserved source does not exist"):
+        ns.build_namespace_mount_plan(
+            [str(hidden)], str(tmp_path / "stage"), [(str(tmp_path / "missing"), str(hidden / "x"))]
+        )
+    with pytest.raises(ns.NamespaceSetupError, match="not below a hidden directory"):
+        ns.build_namespace_mount_plan(
+            [str(hidden)], str(tmp_path / "stage"), [(str(source), str(tmp_path / "other"))]
+        )
+
+
 def test_mount_plan_validation_precedes_namespace_entry(namespace_setup, tmp_path):
     libc, _ = namespace_setup
     parent = tmp_path / "parent"
@@ -160,6 +237,19 @@ def test_mount_plan_validation_precedes_namespace_entry(namespace_setup, tmp_pat
 
     with pytest.raises(ns.NamespaceSetupError, match="conflicting mount targets"):
         sandbox.prepare_mount_tree([str(parent), str(child)], str(tmp_path / "stage"))
+    assert libc.unshare_calls == []
+
+
+def test_preserved_source_validation_precedes_namespace_entry(namespace_setup, tmp_path):
+    libc, _ = namespace_setup
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    sandbox = ns.NamespaceSandbox(libc)
+
+    with pytest.raises(ns.NamespaceSetupError, match="preserved source does not exist"):
+        sandbox.prepare_mount_tree(
+            [str(hidden)], str(tmp_path / "stage"), [(str(tmp_path / "missing"), str(hidden / "x"))]
+        )
     assert libc.unshare_calls == []
 
 

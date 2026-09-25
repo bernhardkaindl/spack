@@ -84,11 +84,21 @@ class NamespaceMount(NamedTuple):
     target: str
 
 
+class NamespacePreservedMount(NamedTuple):
+    """A preserved bind mount with the source type needed at application time."""
+
+    source: str
+    target: str
+    source_is_directory: bool
+
+
 class NamespaceMountPlan(NamedTuple):
     """Immutable mount plan validated before namespace mutation."""
 
     stage_path: str
     mounts: Tuple[NamespaceMount, ...]
+    preserved_mounts: Tuple[NamespacePreservedMount, ...] = ()
+    restoration_mounts: Tuple[NamespacePreservedMount, ...] = ()
 
 
 class _CapabilityHeader(ctypes.Structure):
@@ -125,17 +135,25 @@ def _raise_namespace_setup_error(operation: str, error: OSError) -> NoReturn:
     raise NamespaceSetupError(error.errno or errno.EIO, operation, reason) from error
 
 
-def _mount_plan_error(operation: str, reason: str, error_number: int = errno.EINVAL):
+def _mount_plan_error(
+    operation: str, reason: str, error_number: int = errno.EINVAL
+) -> NoReturn:
     raise NamespaceSetupError(error_number, operation, reason)
 
 
-def build_namespace_mount_plan(paths: Iterable[str], stage_path: str) -> NamespaceMountPlan:
-    """Validate and deterministically plan empty-directory bind mounts.
+def build_namespace_mount_plan(
+    paths: Iterable[str],
+    stage_path: str,
+    preserved_sources: Iterable[Tuple[str, str]] = (),
+) -> NamespaceMountPlan:
+    """Validate and deterministically plan namespace bind mounts.
 
     Missing targets retain the narrow masking helper's no-op behavior. Existing
     targets must be directories. Canonical targets are sorted before assigning
-    stage-owned sources, and duplicate or ancestor/descendant targets are
-    rejected before entering a namespace or creating a source directory.
+    stage-owned sources. Preserved sources are mounted to stage-owned locations
+    before masks and restored into their canonical targets afterward. Duplicate
+    or conflicting relationships are rejected before entering a namespace or
+    creating a source directory.
     """
     resolved_stage = os.path.realpath(os.path.abspath(stage_path))
     if os.path.exists(resolved_stage) and not os.path.isdir(resolved_stage):
@@ -171,46 +189,116 @@ def build_namespace_mount_plan(paths: Iterable[str], stage_path: str) -> Namespa
                 f"conflicting mount targets: {sorted_targets[index - 1]} and {target}",
             )
 
-    mount_root = os.path.join(resolved_stage, "spack-empty-host-dirs")
+    hidden_targets = tuple(sorted_targets)
+    preserved_requests = []
+    for source, target in preserved_sources:
+        resolved_source = os.path.realpath(os.path.abspath(source))
+        if not os.path.exists(resolved_source):
+            _mount_plan_error(
+                "validate preserved source", f"preserved source does not exist: {source}", errno.ENOENT
+            )
+        source_is_directory = os.path.isdir(resolved_source)
+        resolved_target = os.path.realpath(os.path.abspath(target))
+        if os.path.exists(resolved_target):
+            if os.path.isdir(resolved_target) != source_is_directory:
+                _mount_plan_error(
+                    "validate preserved target",
+                    f"preserved source and target types differ: {source} -> {target}",
+                    errno.ENOTDIR,
+                )
+        elif not os.path.isdir(os.path.dirname(resolved_target)):
+            _mount_plan_error(
+                "validate preserved target",
+                f"preserved target parent does not exist: {target}",
+                errno.ENOENT,
+            )
+        containing_targets = [
+            hidden_target
+            for hidden_target in hidden_targets
+            if os.path.commonpath((hidden_target, resolved_target)) == hidden_target
+            and hidden_target != resolved_target
+        ]
+        if not containing_targets:
+            _mount_plan_error(
+                "validate preserved relationship",
+                f"preserved target is not below a hidden directory: {target}",
+            )
+        preserved_requests.append((resolved_source, resolved_target, source_is_directory))
+
+    preserved_requests.sort(key=lambda item: (item[1], item[0]))
+    for index, (_, target, _) in enumerate(preserved_requests):
+        if index and target == preserved_requests[index - 1][1]:
+            _mount_plan_error("validate preserved targets", f"duplicate preserved target: {target}")
+
+    empty_root = os.path.join(resolved_stage, "spack-empty-host-dirs")
     mounts = tuple(
-        NamespaceMount(os.path.join(mount_root, str(index)), target)
+        NamespaceMount(os.path.join(empty_root, str(index)), target)
         for index, target in enumerate(sorted_targets)
     )
-    return NamespaceMountPlan(resolved_stage, mounts)
+    preserved_root = os.path.join(resolved_stage, "spack-preserved-host-paths")
+    preserved_mounts = tuple(
+        NamespacePreservedMount(
+            source,
+            os.path.join(preserved_root, str(index)),
+            source_is_directory,
+        )
+        for index, (source, _, source_is_directory) in enumerate(preserved_requests)
+    )
+    restoration_mounts = tuple(
+        NamespacePreservedMount(
+            preserved_mount.target,
+            target,
+            preserved_mount.source_is_directory,
+        )
+        for preserved_mount, (_, target, _) in sorted(
+            zip(preserved_mounts, preserved_requests), key=lambda item: (item[1][1].count(os.sep), item[1][1])
+        )
+    )
+    return NamespaceMountPlan(resolved_stage, mounts, preserved_mounts, restoration_mounts)
 
 
 def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> bool:
     """Create and apply a previously validated namespace mount plan."""
-    if not plan.mounts:
+    if not plan.mounts and not plan.preserved_mounts:
         return True
 
-    os.makedirs(os.path.dirname(plan.mounts[0].source), exist_ok=True)
-    for mount in plan.mounts:
-        try:
-            os.mkdir(mount.source)
-        except FileExistsError:
-            if not os.path.isdir(mount.source):
-                _mount_plan_error(
-                    "apply mount plan source",
-                    f"mount source is not a directory: {mount.source}",
-                    errno.ENOTDIR,
-                )
-        if not os.path.isdir(mount.target):
+    os.makedirs(plan.stage_path, exist_ok=True)
+
+    def apply_mount(
+        source: str, target: str, source_is_directory: bool, recursive: bool
+    ) -> None:
+        if source_is_directory:
+            os.makedirs(source, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(source), exist_ok=True)
+            Path(source).touch(exist_ok=True)
+        if not os.path.exists(target):
+            if source_is_directory:
+                os.makedirs(target)
+            else:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                Path(target).touch()
+        if os.path.isdir(target) != source_is_directory:
             _mount_plan_error(
-                "apply mount plan target",
-                f"mount target disappeared: {mount.target}",
-                errno.ENOENT,
+                "apply mount plan target", f"mount endpoint type changed: {target}", errno.ENOTDIR
             )
         _check_syscall(
             libc.mount(
-                os.fsencode(mount.source),
-                os.fsencode(mount.target),
+                os.fsencode(source),
+                os.fsencode(target),
                 None,
-                ctypes.c_ulong(MS_BIND),
+                ctypes.c_ulong(MS_BIND | (MS_REC if recursive else 0)),
                 None,
             ),
             "mount(MS_BIND)",
         )
+
+    for mount in plan.preserved_mounts:
+        apply_mount(mount.source, mount.target, mount.source_is_directory, mount.source_is_directory)
+    for mount in plan.mounts:
+        apply_mount(mount.source, mount.target, True, False)
+    for mount in plan.restoration_mounts:
+        apply_mount(mount.source, mount.target, mount.source_is_directory, mount.source_is_directory)
     return True
 
 
@@ -221,8 +309,8 @@ def _enter_user_mount_namespace(libc, _probe_child: bool = False) -> None:
     and GID mapping, disables setgroups, and makes the root mount private
     (``MS_REC | MS_PRIVATE``) so mounts do not propagate back to the host.
 
-    Idempotent within a single process: subsequent calls from the same PID
-    are no-ops. A forked child gets its own copy of the guard.
+    Idempotent within a single process: subsequent calls from the same PID are
+    no-ops. A forked child gets its own copy of the guard.
     """
 
     my_pid = os.getpid()
@@ -477,6 +565,7 @@ def hide_directories_as_empty(
     stage_path: str,
     namespace_ready: bool = False,
     libc: Optional[ctypes.CDLL] = None,
+    preserved_sources: Iterable[Tuple[str, str]] = (),
 ) -> bool:
     """Mask each existing host directory with an empty stage-owned directory.
 
@@ -491,7 +580,7 @@ def hide_directories_as_empty(
     """
 
     path_list = list(paths)
-    plan = build_namespace_mount_plan(path_list, stage_path)
+    plan = build_namespace_mount_plan(path_list, stage_path, preserved_sources)
     if not namespace_ready and not prepare_empty_directory_masking(path_list, libc):
         return False
     if libc is None:
@@ -546,7 +635,12 @@ class NamespaceSandbox(Sandbox):
                 raise SandboxError(f"Landlock is unavailable: {error}") from error
         return self._landlock  # type: ignore[return-value]
 
-    def prepare_mount_tree(self, hidden_dirs: Iterable[str], stage_path: str) -> bool:
+    def prepare_mount_tree(
+        self,
+        hidden_dirs: Iterable[str],
+        stage_path: str,
+        preserved_sources: Iterable[Tuple[str, str]] = (),
+    ) -> bool:
         """Enter the private namespace and mask *hidden_dirs* as empty.
 
         Called before Landlock rules are built so that Landlock operates on the
@@ -558,7 +652,7 @@ class NamespaceSandbox(Sandbox):
             return True
         self._hidden_dirs = hidden_list
         self._stage_path = stage_path
-        plan = build_namespace_mount_plan(hidden_list, stage_path)
+        plan = build_namespace_mount_plan(hidden_list, stage_path, preserved_sources)
         if not prepare_empty_directory_masking(hidden_list, self.libc):
             return False
         libc = self.libc or ctypes.CDLL(None, use_errno=True)
