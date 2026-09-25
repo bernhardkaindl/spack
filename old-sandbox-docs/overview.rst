@@ -51,12 +51,12 @@ Before launching a worker, the parent selects:
   prefixes.
 
 When available, the parent prefers a Linux user and mount namespace backend
-described in :doc:`namespace-backend`.  That backend hides host
-``bin``, ``include``, and other directories by mounting empty tmpfs over them
-and bind-mounts only the whitelisted programs, headers, and paths the worker
-needs.  Landlock is then applied inside the namespace so denied paths produce
-``-EPERM`` against the visible mount tree rather than exposing the full host
-tree.
+described in :doc:`namespace-backend`.  The current narrow integration masks
+``/usr/share/aclocal`` when an external Autoconf does not require it. Phase 4
+will hide host ``bin``, ``include``, and other directories and bind-mount only
+the whitelisted programs, headers, and paths the worker needs. Landlock is
+applied inside the namespace so denied paths produce ``-EPERM`` against the
+visible mount tree rather than exposing the full host tree.
 
 When unprivileged user and mount namespaces are unavailable, the parent uses
 the existing Landlock-only backend.  Landlock grants read and execute access

@@ -28,9 +28,10 @@ Status by design phase
 The phases below match ``lib/spack/docs/sandbox/namespace-backend.rst`` and the
 grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
 
-* **Phase 1 -- partial:** the boolean capability probe, cached preflight, and
-  Landlock fallback selection are implemented. Reason-specific capability
-  reports and the final shared worker policy remain open.
+* **Phase 1 increment -- complete:** the disposable capability probe reports
+  the failed operation and reason, caches completed preflight results, and
+  explicitly selects either namespaces or constrained Landlock fallback. The
+  broader shared trusted-direct fallback policy remains separate.
 * **Phase 2 -- partial:** namespace entry, mapping, propagation containment,
   empty-directory masking, and bind-mount primitives are implemented. The
   policy-driven tmpfs tree, preserved mount sources, namespace handle, and
@@ -47,11 +48,12 @@ The case-by-case findings, acceptance criteria, and worklog are tracked in
 Phase 1: capability probe and fallback
 --------------------------------------
 
-``namespace_sandbox_available(libc=None)`` runs in a disposable forked child.
-The child creates a user and mount namespace, maps the invoking UID and GID to
-the same numeric values, denies setgroups, and makes the root mount private
-with ``MS_REC | MS_PRIVATE``. This probe does not execute recipe code and does
-not establish the planned worker launch model.
+``namespace_sandbox_capability(libc=None)`` runs setup in a disposable forked
+child and returns availability, the failed operation, and its reason.
+``namespace_sandbox_available`` remains the boolean compatibility wrapper. The
+child creates a user and mount namespace, maps the invoking UID and GID to the
+same numeric values, denies setgroups, and makes the root mount private with
+``MS_REC | MS_PRIVATE``. This probe does not execute recipe code.
 
 * Missing fork support, libc-loading failures, and operating-system errors in
   the probe report unavailability. Parent-side operational failures are not
@@ -61,12 +63,16 @@ not establish the planned worker launch model.
 * The child always exits with ``os._exit``; unexpected setup exceptions cannot
   unwind into the parent's caller or duplicate the test runner.
 * The probe checks namespace creation, mappings, and propagation containment.
-  It does not yet diagnose individual failure reasons or test every mount type.
+  Child and parent failures retain operation-specific diagnostics. It does not
+  yet test every mount type needed by the Phase 4 policy tree.
 * Completed default-libc probe results are cached. Installer construction
   performs the preflight before build workers start; forked workers inherit
   that result. If preflight failed operationally, the worker retries before
   starting ``Tee`` and then freezes its local fallback result so later backend
   selection cannot probe after threads exist.
+* ``namespace_sandbox_decision`` selects the namespace backend when available
+  and otherwise labels Landlock-only as a constrained fallback. It rejects an
+  unconstrained backend; the shared trusted-direct fallback policy is separate.
 
 Phase 2: mount-tree setup
 -------------------------
@@ -77,6 +83,8 @@ empty path list. Repeated preparation in that process reuses the active
 namespace rather than probing a nested namespace. A failed availability probe
 returns ``False``. Errors during actual setup propagate; they must not be
 interpreted as a harmless fallback after partially changing process state.
+The worker does not retry after such a failure because namespace or mount state
+may already be partially changed; controlled worker failure is the recovery.
 
 ``hide_directories_as_empty(paths, stage_path, namespace_ready=False,
 libc=None)`` masks existing directories with empty stage-owned directories at
@@ -98,7 +106,8 @@ Phase 3: install-worker integration
 
 ``NamespaceSandbox`` delegates read/write grants and application to Landlock.
 Namespace masking does not replace Landlock confinement. Backend selection
-prefers namespaces on Linux when the probe succeeds, otherwise Landlock.
+prefers namespaces on Linux when the probe succeeds, otherwise it records the
+failed operation and selects constrained Landlock.
 
 The installer prepares the mount tree before granting Landlock permissions.
 Its default mask hides ``/usr/share/aclocal`` unless an external ``autoconf``
@@ -110,8 +119,8 @@ with a partial mount tree. Pre-thread setup failures close the state stream,
 write their traceback to the build log, and exit with ``BUILD_ERROR``. Landlock
 initialization errors are normalized as ``SandboxError`` and then as installer
 errors.
-The shared ``config:sandbox:allow_fallback`` worker policy in the design is not
-yet implemented by this hook.
+The shared ``config:sandbox:allow_fallback`` policy for trusted direct execution
+when no constrained worker is available is not implemented by this hook.
 
 Verification
 ------------
