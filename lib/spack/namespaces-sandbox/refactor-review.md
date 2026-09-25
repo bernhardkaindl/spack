@@ -8,8 +8,8 @@ focused test evidence, and deferred items remain explicit.
 
 The staged increment improves the capability probe, mount-tree helpers,
 `NamespaceSandbox`, installer wiring, tests, and this project's status page. It
-does not implement the fresh-executed worker or the policy-driven mount tree in
-`lib/spack/docs/sandbox/namespace-backend.rst`.
+implements the narrow Linux install-child integration, but not the
+policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 
 ## Phase status
 
@@ -18,12 +18,11 @@ does not implement the fresh-executed worker or the policy-driven mount tree in
 - [x] Phase 2 increment, mount-tree setup: the narrow namespace-entry and bind-mount
   primitives exist. The planned tmpfs policy tree, preserved sources, namespace
   handle, and explicit cleanup API remain open.
-- [ ] Phase 3, install-worker integration: the current in-process installer hook
-  is an experiment. It does not satisfy the fresh-executed worker boundary and
-  remains incomplete even though probing and namespace entry now precede the
-  worker's logging thread.
+- [x] Phase 3 increment, install-worker integration: the existing forked Linux
+  install child enters the namespace before starting its logging thread and
+  applies Landlock before build phases. The supervisor remains unaffected.
 - [ ] Phase 4, policy-driven mount tree.
-- [ ] Phase 5, build-phase confinement through the fresh worker boundary.
+- [ ] Phase 5, complete build-phase policy validation and hardening.
 - [ ] Phase 6, concretizer-worker evaluation.
 
 ## Case-by-case review
@@ -38,7 +37,7 @@ does not implement the fresh-executed worker or the policy-driven mount tree in
 - [x] Avoid invoking the fork-based probe after any worker thread has started.
   Installer preflight caches the default-libc result, and the build worker
   enters the namespace before starting `Tee`. Later selection reuses the cache.
-  A fresh-executed worker remains required for the final Phase 3 boundary.
+  A fresh-exec mode remains optional hardening or an external-backend concern.
 - [ ] Add reason-specific capability results after the boolean probe lifecycle is
   stable.
 
@@ -66,6 +65,15 @@ does not implement the fresh-executed worker or the policy-driven mount tree in
 - [ ] Implement the documented shared fallback policy. A warning in the current
   hook is not the final `config:sandbox:allow_fallback` trust decision.
 
+### Next selected work
+
+- [ ] Define and implement a structured namespace capability and fallback
+  decision. It must distinguish namespace-to-Landlock fallback from an
+  unconstrained-worker fallback, report the failed probe operation, permit
+  fallback only before process mutation, and keep partial namespace or mount
+  setup failures fatal. Add focused selection and diagnostic tests before
+  starting the Phase 4 mount policy.
+
 ### Tests and documentation structure
 
 - [x] Keep the live test in a disposable interpreter and verify both child
@@ -73,9 +81,12 @@ does not implement the fresh-executed worker or the policy-driven mount tree in
 - [x] Keep probe lifecycle tests separate from mocked namespace setup tests.
 - [x] Restore Phase 1 through Phase 6 headings in
   `test_sandbox_namespaces.py`, preserving the stronger staged tests.
-- [x] Restore the same phase map in `index.rst`, distinguishing complete,
-  partial, experimental, and not-started work.
-- [x] Ensure docs do not call the current installer hook completed Phase 3.
+- [x] Restore the same phase map in `index.rst`, distinguishing completed
+  increments from incomplete broader phases and not-started work.
+- [x] Scope Phase 3 completion to the internal Linux install-child integration;
+  do not imply confinement-before-recipe-import or inherited-state minimization.
+- [x] Re-evaluate Phase 3 with platform-specific process requirements and mark
+  the narrow Linux install-child integration complete.
 - [x] Run formatting, focused tests, staged-diff checks, and documentation
   validation after the final edits.
 
@@ -91,7 +102,7 @@ does not implement the fresh-executed worker or the policy-driven mount tree in
 - The integration test checks actual `ENOENT` visibility and parent isolation
   without masking system directories.
 - The status page is candid about the narrow `/usr/share/aclocal` policy and the
-  missing worker trust boundary.
+  optional inherited-state and pre-import hardening that Phase 3 does not claim.
 
 ## Worklog
 
@@ -123,3 +134,13 @@ does not implement the fresh-executed worker or the policy-driven mount tree in
 - 2026-09-25: Ran `ruff format` and `ruff format --check` on all six changed
   Python files, `ruff check`, standalone RST parsing, and complete-patch
   whitespace validation; all passed.
+- 2026-09-25: Re-reviewed the process boundary after the implementation commit.
+  Confirmed that Linux namespace entry and Landlock self-restriction work in
+  the existing forked install child and do not restrict the supervisor. Decoupled
+  Linux from Windows AppContainer and optional external-launcher requirements,
+  marked the narrow Phase 3 increment complete, and selected structured
+  capability/fallback policy as the next slice.
+- 2026-09-25: Reran Ruff and the focused namespace/shared sandbox suite (38
+  passed). A fresh full Sphinx build reports no warnings from the changed
+  sandbox pages; its warning gate remains blocked by 15 unrelated repository
+  autodoc, toctree, and reference warnings.

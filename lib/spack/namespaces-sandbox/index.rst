@@ -10,9 +10,10 @@ Review boundary
 ---------------
 
 The capability probe, basic mount-tree helpers, backend selection, and the
-existing installer hook are implemented and tested. This is a prerequisite for,
-not the implementation of, the fresh-executed install-worker boundary described
-in ``lib/spack/docs/sandbox/namespace-backend.rst``.
+existing Linux install-child integration are implemented and tested. The
+internal Linux backend self-restricts that existing forked child; a fresh
+``exec`` is optional later hardening or part of an external launcher, not a
+namespace requirement.
 
 This increment makes namespace readiness truthful, contains probe failures, and
 checks mount visibility in a disposable process. It deliberately keeps the
@@ -34,9 +35,9 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   empty-directory masking, and bind-mount primitives are implemented. The
   policy-driven tmpfs tree, preserved mount sources, namespace handle, and
   explicit cleanup interface remain open.
-* **Phase 3 -- experimental:** the current build worker enters the namespace
-  before starting its logging thread, and the installer applies the narrow
-  mask before Landlock. This is not the planned fresh-executed worker boundary.
+* **Phase 3 -- complete for the narrow integration:** the current build worker
+  enters the namespace before starting its logging thread, and the installer
+  applies the narrow mask before Landlock. The broader mount policy is Phase 4.
 * **Phases 4 through 6 -- not started:** policy-driven mounts, full build-phase
   confinement, and concretizer-worker evaluation remain future work.
 
@@ -148,10 +149,11 @@ fixed tool list.
 Phase 5: build-phase confinement
 --------------------------------
 
-Launch a fresh executed worker with bounded protocol descriptors and apply
-confinement before importing recipe code. The current installer hook alone is
-not that trust boundary. Implement and test the shared fallback policy and
-richer capability reports as part of this boundary.
+Extend the current build-phase boundary with the complete policy-driven mount
+tree and validate real package builds. A future fresh-exec mode may minimize
+inherited descriptors and confine before recipe import, but it is separate
+hardening rather than a prerequisite for the internal Linux backend. External
+sandbox tools may provide alternate launchers.
 
 Phase 6: concretizer worker
 ---------------------------
