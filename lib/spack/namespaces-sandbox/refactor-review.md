@@ -24,7 +24,8 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   logging thread, the existing forked Linux install child completes trusted
   namespace mount setup and drops mount authority. It applies Landlock before
   build phases. The supervisor remains unaffected.
-- [ ] Phase 4, policy-driven mount tree.
+- [ ] Phase 4, policy-driven mount tree (immutable plan validation is complete;
+  source preservation and policy-derived mounts remain open).
 - [ ] Phase 5, complete build-phase policy validation and hardening.
 - [ ] Phase 6, concretizer-worker evaluation.
 
@@ -57,8 +58,12 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - [x] Do not retry after failed namespace entry or masking. The process may
   already contain partial namespace or mount state, so the worker fails and a
   fresh worker is the only valid retry boundary.
-- [ ] Preserve selected sources before hiding parent directories; create and
-  validate targets; account for merged-`/usr` aliases and mount ordering.
+- [x] Validate the current narrow mask targets before namespace mutation. The
+  immutable plan canonicalizes existing directory targets, rejects invalid,
+  duplicate, and ancestor/descendant targets, and assigns deterministic
+  stage-owned source paths.
+- [ ] Preserve selected sources before hiding parent directories; account for
+  merged-`/usr` aliases and mount ordering in the policy-driven plan.
 - [ ] Use mask sources that remain non-writable after confinement. The current
   stage-owned source hides host content but can be populated through the
   writable stage path, so it is not a permanent-empty foundation for Phase 4.
@@ -95,11 +100,18 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   ``bind_mount`` call. This protects the current narrow mount set; the
   immutable Phase 4 mount plan remains required before adding policy mounts.
 
-- [ ] Define and validate an immutable Phase 4 mount plan before performing any
-  mounts. Resolve preserved source paths and merged-``/usr`` aliases, validate
-  source and target types, reject conflicting or duplicate targets, and produce
-  deterministic mount order. Add plan-level regressions before enabling any
-  additional mounts.
+- [x] Define and validate an immutable Phase 4 mount plan before performing any
+  mounts. The current increment covers the narrow empty-directory masks:
+  resolve and sort existing directory targets, validate target and stage types,
+  reject duplicate or overlapping targets, and produce deterministic
+  stage-owned source paths. Plan-level regressions prove invalid plans fail
+  before namespace entry. Policy-derived preserved sources and merged-``/usr``
+  aliases remain out of scope.
+
+- [ ] Preserve selected sources before hiding parent directories. Resolve
+  whitelisted source paths and merged-``/usr`` aliases, validate their source
+  and target relationships, determine safe mount ordering, and add policy-level
+  regressions before enabling additional mounts.
 
 ### Tests and documentation structure
 
@@ -130,6 +142,10 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - The trusted pre-thread path completes the narrow mount setup and drops all
   user-namespace capabilities before `Tee` or recipe-controlled Python runs.
   Later namespace bind mounts are rejected; Landlock then confines build phases.
+- The narrow masking path now builds an immutable mount plan before namespace
+  entry. It canonicalizes and sorts targets, validates directory types, rejects
+  duplicates and overlapping targets, and assigns deterministic empty-source
+  paths. Invalid plans cannot partially mutate the worker.
 - Fork, pipe, read, and wait lifecycle paths have direct regression coverage.
 - Empty mount trees now establish real readiness rather than reporting probe-only
   availability.
@@ -209,3 +225,10 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   passed 45 tests. A fresh full Sphinx build reports no warnings from changed
   pages; its warning gate remains blocked by the same 15 unrelated repository
   autodoc, toctree, and reference warnings.
+- 2026-09-25: Implemented the immutable mount-plan increment for the current
+  narrow mask. Plans canonicalize and deterministically order existing directory
+  targets, validate stage and target types, reject duplicate and overlapping
+  targets before namespace entry, and create stage-owned sources only during
+  application. Added plan-level regressions and selected preservation of
+  whitelisted sources, merged-``/usr`` aliases, and mount ordering as the next
+  work item.

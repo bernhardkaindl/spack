@@ -109,6 +109,60 @@ def test_empty_mount_tree_enters_namespace(namespace_setup, tmp_path):
     assert len(libc.unshare_calls) == 1
 
 
+def test_mount_plan_is_immutable_and_deterministic(tmp_path):
+    first = tmp_path / "z-target"
+    second = tmp_path / "a-target"
+    first.mkdir()
+    second.mkdir()
+
+    plan = ns.build_namespace_mount_plan([str(first), str(second)], str(tmp_path / "stage"))
+
+    assert plan.stage_path == str((tmp_path / "stage").resolve())
+    assert plan.mounts == (
+        ns.NamespaceMount(str(tmp_path / "stage/spack-empty-host-dirs/0"), str(second)),
+        ns.NamespaceMount(str(tmp_path / "stage/spack-empty-host-dirs/1"), str(first)),
+    )
+    with pytest.raises(AttributeError):
+        setattr(plan, "mounts", ())
+
+
+@pytest.mark.parametrize("conflict", ["duplicate", "nested"])
+def test_mount_plan_rejects_conflicting_targets(tmp_path, conflict):
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    parent.mkdir()
+    child.mkdir()
+    paths = [str(parent), str(parent)] if conflict == "duplicate" else [str(parent), str(child)]
+
+    with pytest.raises(ns.NamespaceSetupError, match="mount plan targets"):
+        ns.build_namespace_mount_plan(paths, str(tmp_path / "stage"))
+
+
+def test_mount_plan_rejects_invalid_types(tmp_path):
+    target_file = tmp_path / "target-file"
+    stage_file = tmp_path / "stage-file"
+    target_file.touch()
+    stage_file.touch()
+
+    with pytest.raises(ns.NamespaceSetupError, match="target is not a directory"):
+        ns.build_namespace_mount_plan([str(target_file)], str(tmp_path / "stage"))
+    with pytest.raises(ns.NamespaceSetupError, match="stage path is not a directory"):
+        ns.build_namespace_mount_plan([], str(stage_file))
+
+
+def test_mount_plan_validation_precedes_namespace_entry(namespace_setup, tmp_path):
+    libc, _ = namespace_setup
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    parent.mkdir()
+    child.mkdir()
+    sandbox = ns.NamespaceSandbox(libc)
+
+    with pytest.raises(ns.NamespaceSetupError, match="conflicting mount targets"):
+        sandbox.prepare_mount_tree([str(parent), str(child)], str(tmp_path / "stage"))
+    assert libc.unshare_calls == []
+
+
 def test_prepare_reuses_active_namespace(namespace_setup, monkeypatch):
     libc, _ = namespace_setup
     ns._enter_user_mount_namespace(libc)

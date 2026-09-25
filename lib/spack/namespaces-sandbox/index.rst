@@ -40,8 +40,12 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   logging thread, the current build worker performs trusted namespace mount
   setup and drops mount authority. The installer applies Landlock before build
   phases. The broader mount policy is Phase 4.
-* **Phases 4 through 6 -- not started:** policy-driven mounts, full build-phase
-  confinement, and concretizer-worker evaluation remain future work.
+* **Phase 4 -- planning increment complete, policy work open:** the current
+  narrow mask is represented by an immutable, validated, deterministic mount
+  plan before namespace mutation. Preserved sources, merged-``/usr`` aliases,
+  and policy-derived compiler, tool, and header mounts remain future work.
+* **Phases 5 and 6 -- not started:** full build-phase policy validation and
+  concretizer-worker evaluation remain future work.
 
 The case-by-case findings, acceptance criteria, and worklog are tracked in
 ``lib/spack/namespaces-sandbox/refactor-review.md``.
@@ -129,8 +133,9 @@ Verification
 ------------
 
 Unit tests cover UID/GID mapping, re-entry, empty-tree readiness, denied
-availability, fatal mount errors, bind flags, capability dropping, Landlock
-delegation, and installer ordering on both the namespace and fallback paths.
+availability, fatal mount errors, immutable mount-plan validation, bind flags,
+capability dropping, Landlock delegation, and installer ordering on both the
+namespace and fallback paths.
 Tests observe trusted prepare-and-drop before ``Tee`` construction, reject a
 later bind mount, and verify controlled reporting of pre-thread setup failures.
 Unit namespace setup mocks both libc and mapping-file writes; it never writes

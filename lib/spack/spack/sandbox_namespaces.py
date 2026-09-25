@@ -21,7 +21,7 @@ import platform
 import shutil
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Optional
+from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Optional, Tuple
 
 from spack.sandbox import Sandbox, SandboxError
 
@@ -77,6 +77,20 @@ class NamespaceSetupError(OSError):
         self.reason = reason
 
 
+class NamespaceMount(NamedTuple):
+    """One validated source-to-target mount in a namespace plan."""
+
+    source: str
+    target: str
+
+
+class NamespaceMountPlan(NamedTuple):
+    """Immutable mount plan validated before namespace mutation."""
+
+    stage_path: str
+    mounts: Tuple[NamespaceMount, ...]
+
+
 class _CapabilityHeader(ctypes.Structure):
     _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
 
@@ -109,6 +123,95 @@ _namespace_probe_result: Optional[NamespaceCapability] = None
 def _raise_namespace_setup_error(operation: str, error: OSError) -> NoReturn:
     reason = error.strerror or str(error)
     raise NamespaceSetupError(error.errno or errno.EIO, operation, reason) from error
+
+
+def _mount_plan_error(operation: str, reason: str, error_number: int = errno.EINVAL):
+    raise NamespaceSetupError(error_number, operation, reason)
+
+
+def build_namespace_mount_plan(paths: Iterable[str], stage_path: str) -> NamespaceMountPlan:
+    """Validate and deterministically plan empty-directory bind mounts.
+
+    Missing targets retain the narrow masking helper's no-op behavior. Existing
+    targets must be directories. Canonical targets are sorted before assigning
+    stage-owned sources, and duplicate or ancestor/descendant targets are
+    rejected before entering a namespace or creating a source directory.
+    """
+    resolved_stage = os.path.realpath(os.path.abspath(stage_path))
+    if os.path.exists(resolved_stage) and not os.path.isdir(resolved_stage):
+        _mount_plan_error(
+            "validate mount plan stage",
+            f"stage path is not a directory: {stage_path}",
+            errno.ENOTDIR,
+        )
+
+    targets = []
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        if not os.path.isdir(path):
+            _mount_plan_error(
+                "validate mount plan target",
+                f"mount target is not a directory: {path}",
+                errno.ENOTDIR,
+            )
+        targets.append(os.path.realpath(os.path.abspath(path)))
+
+    sorted_targets = sorted(targets)
+    for index, target in enumerate(sorted_targets):
+        if index and target == sorted_targets[index - 1]:
+            _mount_plan_error("validate mount plan targets", f"duplicate mount target: {target}")
+        if (
+            index
+            and os.path.commonpath((sorted_targets[index - 1], target))
+            == sorted_targets[index - 1]
+        ):
+            _mount_plan_error(
+                "validate mount plan targets",
+                f"conflicting mount targets: {sorted_targets[index - 1]} and {target}",
+            )
+
+    mount_root = os.path.join(resolved_stage, "spack-empty-host-dirs")
+    mounts = tuple(
+        NamespaceMount(os.path.join(mount_root, str(index)), target)
+        for index, target in enumerate(sorted_targets)
+    )
+    return NamespaceMountPlan(resolved_stage, mounts)
+
+
+def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> bool:
+    """Create and apply a previously validated namespace mount plan."""
+    if not plan.mounts:
+        return True
+
+    os.makedirs(os.path.dirname(plan.mounts[0].source), exist_ok=True)
+    for mount in plan.mounts:
+        try:
+            os.mkdir(mount.source)
+        except FileExistsError:
+            if not os.path.isdir(mount.source):
+                _mount_plan_error(
+                    "apply mount plan source",
+                    f"mount source is not a directory: {mount.source}",
+                    errno.ENOTDIR,
+                )
+        if not os.path.isdir(mount.target):
+            _mount_plan_error(
+                "apply mount plan target",
+                f"mount target disappeared: {mount.target}",
+                errno.ENOENT,
+            )
+        _check_syscall(
+            libc.mount(
+                os.fsencode(mount.source),
+                os.fsencode(mount.target),
+                None,
+                ctypes.c_ulong(MS_BIND),
+                None,
+            ),
+            "mount(MS_BIND)",
+        )
+    return True
 
 
 def _enter_user_mount_namespace(libc, _probe_child: bool = False) -> None:
@@ -388,26 +491,12 @@ def hide_directories_as_empty(
     """
 
     path_list = list(paths)
-    if not path_list:
-        return True
+    plan = build_namespace_mount_plan(path_list, stage_path)
     if not namespace_ready and not prepare_empty_directory_masking(path_list, libc):
         return False
     if libc is None:
         libc = ctypes.CDLL(None, use_errno=True)
-    empty_root = os.path.join(stage_path, "spack-empty-host-dirs")
-    os.makedirs(empty_root, exist_ok=True)
-    for index, path in enumerate(path_list):
-        if not os.path.isdir(path):
-            continue
-        empty_dir = os.path.join(empty_root, str(index))
-        os.mkdir(empty_dir)
-        _check_syscall(
-            libc.mount(
-                os.fsencode(empty_dir), os.fsencode(path), None, ctypes.c_ulong(MS_BIND), None
-            ),
-            "mount(MS_BIND)",
-        )
-    return True
+    return _apply_namespace_mount_plan(plan, libc)
 
 
 class NamespaceSandbox(Sandbox):
@@ -469,11 +558,11 @@ class NamespaceSandbox(Sandbox):
             return True
         self._hidden_dirs = hidden_list
         self._stage_path = stage_path
+        plan = build_namespace_mount_plan(hidden_list, stage_path)
         if not prepare_empty_directory_masking(hidden_list, self.libc):
             return False
-        self._namespace_ready = hide_directories_as_empty(
-            hidden_list, stage_path, namespace_ready=True, libc=self.libc
-        )
+        libc = self.libc or ctypes.CDLL(None, use_errno=True)
+        self._namespace_ready = _apply_namespace_mount_plan(plan, libc)
         return self._namespace_ready
 
     def drop_mount_authority(self) -> bool:
