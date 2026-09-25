@@ -186,11 +186,13 @@ when the validated plan is applied.
 The plan also accepts explicitly selected source-to-target requests for the
 policy-driven tree. Every request declares read-only or read-write access.
 Source paths and targets are canonicalized, source and target file types are
-checked, and a target must be below a hidden directory. The plan creates
-stage-owned preservation endpoints before hiding parents, then restores those
-endpoints into the hidden tree in increasing target-depth order. This handles
-merged-``/usr`` aliases by planning against their resolved targets and uses
-recursive bind mounts only for preserved directory trees.
+checked, and read-only targets must be below a hidden directory. With the
+recursively read-only inherited view, writable identity mounts may also target
+paths outside hidden roots. The plan creates stage-owned preservation endpoints
+before hiding parents, then restores hidden endpoints in increasing target-depth
+order and writable passthrough endpoints directly. This handles merged-``/usr``
+aliases by planning against their resolved targets and uses recursive bind
+mounts only for preserved directory trees.
 
 Read-only requests use ``mount_setattr(MOUNT_ATTR_RDONLY)`` on both the
 preserved and restored aliases. Directory requests use ``AT_RECURSIVE`` so
@@ -198,10 +200,9 @@ nested mounts cannot retain write access. Read-write requests do not receive
 that attribute. This access distinction is enforced by the mount namespace and
 does not depend on Landlock.
 
-This is the planning and validation boundary for Phase 4, not the complete
-policy-driven mount tree. Immutable empty sources and mount access modes are
-implemented; selecting the compiler, tool, header, runtime, and writable path
-set remains open.
+The complete selected policy is compiled at this boundary before namespace
+entry and is activated automatically when namespace capability probing
+succeeds.
 
 Base mounts
 ~~~~~~~~~~~
@@ -558,8 +559,17 @@ replacement roots, generated aliases, and selected compiler, tool, header,
 runtime, dependency, repository, Spack-source, stage, prefix, device, and
 temporary paths, including an intentionally ancestor-covered header subtree.
 They also prove concurrent scratch allocation, symlinked bases, allocation
-collisions, disappeared sources, stale-path replacement, and uncovered
-selected paths fail closed.
+collisions, disappeared sources, and stale-path replacement fail closed.
+Read-only candidates outside hidden roots remain available through the
+recursively read-only inherited view and require no restoration mount.
+Explicit writable paths receive writable identity mounts after that inherited
+view is made read-only, including when they are outside hidden roots. Devices
+are selected only in the writable category even when they also appear as
+runtime candidates. An exact read-only selection cancels the matching
+hidden-root candidate, so selected whole runtime trees such as ``/usr/lib``
+remain visible through the inherited read-only view pending narrower policy
+evidence. Python runtime paths are canonicalized, and installer setup supplies
+the configured fetch cache rather than the unrelated misc cache.
 
 The worker activates the installer-derived policy when namespace capability
 probing succeeds. Only paths below selected hidden roots are absent; unrelated

@@ -1529,14 +1529,29 @@ def namespace_selected_filesystem_policy_from_inputs(
             result.append(path)
         return tuple(result)
 
-    effective_read_only = minimal_paths(requested_read_only)
     effective_read_write = minimal_paths(requested_read_write)
+    effective_read_only = minimal_paths(
+        path
+        for path in requested_read_only
+        if not any(
+            path == writable
+            or os.path.commonpath((path, writable)) == writable
+            for writable in effective_read_write
+        )
+    )
 
-    hidden_roots = minimal_paths(requested_hidden_roots)
+    hidden_roots = minimal_paths(
+        root for root in requested_hidden_roots if root not in effective_read_only
+    )
+    mounted_read_only = tuple(
+        path
+        for path in effective_read_only
+        if any(os.path.commonpath((root, path)) == root for root in hidden_roots)
+    )
 
     policy = spack.sandbox_namespaces.build_namespace_filesystem_policy(
         hidden_roots,
-        ((path, path) for path in effective_read_only),
+        ((path, path) for path in mounted_read_only),
         ((path, path) for path in effective_read_write),
         replacement_mounts=replacement_mounts,
         generated_symlinks=generated_symlinks,
@@ -1556,7 +1571,7 @@ def namespace_selected_filesystem_policy_from_inputs(
                     f"{access} path is not represented by the policy: {path}",
                 )
 
-    assert_covered(requested_read_only, policy.read_only_mounts, "read-only")
+    assert_covered(mounted_read_only, policy.read_only_mounts, "read-only")
     assert_covered(requested_read_write, policy.read_write_mounts, "read-write")
     return policy
 
@@ -1621,10 +1636,14 @@ def prepare_namespace_activation(
     tool_paths.extend(tool_runtime_paths(spec, tool_entries))
 
     runtime_paths = list(host_paths.host_runtime_paths)
-    runtime_paths.extend(host_paths.device_paths)
     runtime_paths.extend(host_paths.read_only_paths)
-    runtime_paths.append(sys.executable)
-    runtime_paths.extend(path for path in sys.path if os.path.isabs(path))
+    runtime_paths.append(os.path.realpath(sys.executable))
+    runtime_paths.extend(
+        os.path.realpath(path) for path in sys.path if os.path.isabs(path) and os.path.exists(path)
+    )
+
+    writable_paths = set(host_paths.writable_paths)
+    writable_paths.update(host_paths.device_paths)
 
     selected_paths = NamespacePolicyInputPaths(
         host_paths.hidden_roots,
@@ -1632,7 +1651,7 @@ def prepare_namespace_activation(
         tuple(sorted(set(path for path in tool_paths if os.path.exists(path)))),
         tuple(system_compiler_header_paths(spec)),
         tuple(sorted(set(path for path in runtime_paths if os.path.exists(path)))),
-        host_paths.writable_paths,
+        tuple(sorted(writable_paths)),
     )
     replacement_mounts = tuple((worker_root, root) for root in host_paths.replacement_roots)
     generated_symlinks = tuple(compiler_alias_symlink_paths(spec))

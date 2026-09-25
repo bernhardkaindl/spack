@@ -542,7 +542,25 @@ def build_namespace_filesystem_policy(
     ]
     classified_paths.extend((path.path, "generated") for path in canonical_generated)
     classified_paths.extend((path.path, "generated symlink") for path in canonical_symlinks)
-    _validate_non_overlapping_paths(classified_paths, "validate namespace policy classified paths")
+    sorted_classified_paths = sorted(classified_paths, key=lambda item: item[0])
+    for index, (path, category) in enumerate(sorted_classified_paths):
+        for previous_path, previous_category in sorted_classified_paths[:index]:
+            if path == previous_path:
+                _mount_plan_error(
+                    "validate namespace policy classified paths",
+                    f"duplicate or access-conflicting {category} and "
+                    f"{previous_category} path: {path}",
+                )
+            if _path_contains(previous_path, path) and not (
+                read_only_view
+                and previous_category == NamespaceMountAccess.READ_ONLY.value
+                and category == NamespaceMountAccess.READ_WRITE.value
+            ):
+                _mount_plan_error(
+                    "validate namespace policy classified paths",
+                    f"overlapping {previous_category} and {category} paths: "
+                    f"{previous_path} and {path}",
+                )
     _validate_non_overlapping_paths(
         ((mount.target, "replacement") for mount in canonical_replacement),
         "validate namespace policy replacement mounts",
@@ -656,15 +674,21 @@ def build_namespace_mount_plan_from_policy(
             _mount_plan_error(
                 "compile namespace policy", f"hidden root overlaps mount-plan scratch: {root}"
             )
-    classified_paths = [mount.target for mount in policy.read_only_mounts]
-    classified_paths.extend(mount.target for mount in policy.read_write_mounts)
-    classified_paths.extend(path.path for path in policy.generated_paths)
-    classified_paths.extend(path.path for path in policy.generated_symlinks)
-    for path in classified_paths:
+    hidden_read_only_paths = [mount.target for mount in policy.read_only_mounts]
+    hidden_generated_paths = [path.path for path in policy.generated_paths]
+    hidden_generated_paths.extend(path.path for path in policy.generated_symlinks)
+    for path in hidden_read_only_paths + hidden_generated_paths:
         if not any(_path_contains(root, path) for root in policy.hidden_roots):
             _mount_plan_error(
                 "compile namespace policy", f"classified path is not below a hidden root: {path}"
             )
+    if not policy.read_only_view:
+        for mount in policy.read_write_mounts:
+            if not any(_path_contains(root, mount.target) for root in policy.hidden_roots):
+                _mount_plan_error(
+                    "compile namespace policy",
+                    f"classified path is not below a hidden root: {mount.target}",
+                )
     mounts = policy.read_only_mounts + policy.read_write_mounts
     plan = _build_namespace_mount_plan(
         policy.hidden_roots,
@@ -964,10 +988,15 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
             os.makedirs(mount.source)
         for restoration in plan.restoration_mounts:
             mask = next(
-                mount
-                for mount in plan.mounts
-                if os.path.commonpath((mount.target, restoration.target)) == mount.target
+                (
+                    mount
+                    for mount in plan.mounts
+                    if os.path.commonpath((mount.target, restoration.target)) == mount.target
+                ),
+                None,
             )
+            if mask is None:
+                continue
             endpoint = os.path.join(mask.source, os.path.relpath(restoration.target, mask.target))
             if restoration.source_is_directory:
                 os.makedirs(endpoint, exist_ok=True)
