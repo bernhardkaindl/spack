@@ -34,6 +34,7 @@ CLONE_NEWNS = 0x00020000
 MS_BIND = 0x00001000
 MS_PRIVATE = 0x00040000
 MS_REC = 0x00004000
+LINUX_CAPABILITY_VERSION_3 = 0x20080522
 
 
 class NamespaceCapability(NamedTuple):
@@ -74,6 +75,18 @@ class NamespaceSetupError(OSError):
         super().__init__(error_number, f"{operation}: {reason}")
         self.operation = operation
         self.reason = reason
+
+
+class _CapabilityHeader(ctypes.Structure):
+    _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+
+class _CapabilityData(ctypes.Structure):
+    _fields_ = [
+        ("effective", ctypes.c_uint32),
+        ("permitted", ctypes.c_uint32),
+        ("inheritable", ctypes.c_uint32),
+    ]
 
 
 def _check_syscall(result: int, name: str) -> int:
@@ -140,6 +153,20 @@ def _enter_user_mount_namespace(libc, _probe_child: bool = False) -> None:
         "mount(MS_PRIVATE)",
     )
     _namespace_entered_pids.add(my_pid)
+
+
+def _drop_namespace_capabilities(libc) -> None:
+    """Drop all capabilities gained by entering the private user namespace.
+
+    Namespace setup temporarily needs mount authority. Once trusted code has
+    prepared the mount tree, no later recipe or build tool may create mounts in
+    this namespace.
+    """
+    header = _CapabilityHeader(version=LINUX_CAPABILITY_VERSION_3, pid=0)
+    capabilities = (_CapabilityData * 2)()
+    _check_syscall(
+        libc.capset(ctypes.byref(header), capabilities), "capset(drop namespace capabilities)"
+    )
 
 
 def _encode_capability(capability: NamespaceCapability) -> bytes:
@@ -213,6 +240,7 @@ def _probe_namespace_capability(libc) -> NamespaceCapability:
                     ),
                     "mount(MS_BIND probe)",
                 )
+                _drop_namespace_capabilities(libc)
             except NamespaceSetupError as error:
                 result = NamespaceCapability(False, error.operation, error.reason)
             except OSError as error:
@@ -296,6 +324,21 @@ def namespace_sandbox_decision() -> NamespaceSandboxDecision:
     return NamespaceSandboxDecision(backend, capability)
 
 
+def freeze_namespace_sandbox_capability() -> NamespaceCapability:
+    """Freeze the worker-local capability result before any worker thread starts.
+
+    This is side-effect-free: it must not enter a namespace or create a mount.
+    Namespace entry remains adjacent to trusted mount preparation and Landlock
+    application, after recipe-controlled setup has completed.
+    """
+    global _namespace_probe_result
+
+    capability = namespace_sandbox_capability()
+    if _namespace_probe_result is None:
+        _namespace_probe_result = capability
+    return capability
+
+
 def prepare_empty_directory_masking(
     paths: Iterable[str], libc: Optional[ctypes.CDLL] = None, cache_unavailable: bool = False
 ) -> bool:
@@ -316,8 +359,8 @@ def prepare_empty_directory_masking(
     if os.getpid() in _namespace_entered_pids:
         return True
     capability = namespace_sandbox_capability(libc)
-    if cache_unavailable and libc is None and _namespace_probe_result is None:
-        _namespace_probe_result = capability
+    if cache_unavailable and libc is None:
+        freeze_namespace_sandbox_capability()
     if not capability.available:
         return False
     if libc is None:
@@ -388,6 +431,7 @@ class NamespaceSandbox(Sandbox):
         self._hidden_dirs: List[str] = []
         self._stage_path: Optional[str] = None
         self._granted_dirs: List[Path] = []
+        self._mount_authority_dropped = False
         # Create the internal Landlock sandbox lazily unless selection already
         # preflighted and supplied it.
         self._landlock = landlock
@@ -432,6 +476,23 @@ class NamespaceSandbox(Sandbox):
         )
         return self._namespace_ready
 
+    def drop_mount_authority(self) -> bool:
+        """Irreversibly drop namespace capabilities after trusted mount setup.
+
+        The caller must prepare all namespace mounts first. Returns ``False``
+        if the namespace is inactive and otherwise drops capability state once.
+        """
+        if not self._namespace_ready:
+            return False
+        if self._mount_authority_dropped:
+            return True
+        libc = self.libc
+        if libc is None:
+            libc = ctypes.CDLL(None, use_errno=True)
+        _drop_namespace_capabilities(libc)
+        self._mount_authority_dropped = True
+        return True
+
     def bind_mount(self, source: str, target: Optional[str] = None) -> bool:
         """Bind-mount *source* at *target* inside the namespace.
 
@@ -440,6 +501,8 @@ class NamespaceSandbox(Sandbox):
         """
         if not self._namespace_ready:
             return False
+        if self._mount_authority_dropped:
+            raise SandboxError("Namespace mount authority was already dropped")
         if target is None:
             target = source
         resolved_source = os.path.realpath(source)
