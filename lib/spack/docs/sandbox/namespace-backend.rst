@@ -103,13 +103,29 @@ The capability probe must test:
 * ``uid_map`` and ``gid_map`` write ability for the calling user's numeric
   UID and GID; and
 * mount propagation containment ability, including ``MS_PRIVATE`` on the
-  root mount and the ability to create bind mounts and tmpfs mounts without
-  privilege.
+  root mount and the directory bind mount required by the current masking
+  backend.
 
-When any of these fail, the namespace backend is unavailable and the
-install worker falls back to the existing Landlock-only behavior, subject to
-the shared ``config:sandbox:allow_fallback`` policy. The command never
+The Phase 4 probe must additionally test tmpfs and every other mount operation
+introduced by the policy-driven mount tree before selecting that backend.
+
+The probe returns a structured capability result with availability, the failed
+operation, and its reason. Completed child results are cached and inherited by
+forked workers. Parent-side operational failures remain retryable until the
+install child freezes its pre-thread result. This preserves diagnostics such as
+``write /proc/self/uid_map: Operation not permitted`` without probing after a
+worker thread exists.
+
+When the probe reports unavailability, backend selection explicitly chooses
+the existing Landlock-only sandbox. This is a constrained fallback, so it is
+distinct from the shared ``config:sandbox:allow_fallback`` policy for trusted
+direct execution when no sandbox worker is available. The command never
 launches an unconstrained worker.
+
+Fallback is permitted only from this side-effect-free capability decision.
+Once the install child starts namespace entry or mount-tree preparation, a
+failure is fatal for that child: it neither retries setup nor falls back from a
+possibly partially mutated process.
 
 Process model
 -------------
@@ -307,10 +323,12 @@ Add a capability probe for unprivileged user and mount namespaces to the
 shared sandbox capability detection. The probe reports whether the namespace
 backend is available and, if not, why.
 
-The probe result feeds the shared worker selection policy. When the namespace
-backend is available, the install worker prefers it. When it is unavailable,
-the worker uses the existing Landlock-only backend. The command never
-silently uses an unconstrained worker.
+The structured probe result feeds an explicit backend decision. When the
+namespace backend is available, the install worker prefers it. When it is
+unavailable, the worker uses the existing Landlock-only backend and retains the
+failed operation and reason for diagnostics. The decision identifies Landlock
+as constrained and rejects an unconstrained backend. It is made before any
+process mutation; namespace-entry and mount failures remain fatal.
 
 Phase 2: Mount tree setup
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -385,7 +403,7 @@ user notifications; see `Relationship to Landlock (and future seccomp)`_.
 Decision gates
 --------------
 
-* [ ] The namespace backend is preferred when available; Landlock-only is the
+* [x] The namespace backend is preferred when available; Landlock-only is the
   fallback, not the default.
 * [ ] The mount tree is derived from policy, not a fixed list.
 * [x] The internal Linux backend confines only the existing forked install
@@ -397,9 +415,9 @@ Decision gates
   Linux launch design.
 * [ ] Landlock remains in force inside the namespace; seccomp is a later-stage
   addition not yet in the develop branch.
-* [ ] The capability probe reports specific reasons when the namespace backend
+* [x] The capability probe reports specific reasons when the namespace backend
   is unavailable.
-* [ ] The command never launches an unconstrained worker when the namespace
+* [x] The command never launches an unconstrained worker when the namespace
   backend is unavailable.
 
 References

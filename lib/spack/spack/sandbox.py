@@ -35,6 +35,7 @@ else:
 
 import spack.error
 import spack.util.executable
+import spack.util.tty
 
 # Linux landlock syscalls
 SYSCALL_LANDLOCK_CREATE_RULESET = 444
@@ -465,13 +466,26 @@ def get_sandbox() -> Sandbox:
     system = platform.system()
     try:
         if system == "Linux":
-            from spack.sandbox_namespaces import namespace_sandbox_available
+            from spack.sandbox_namespaces import (
+                NamespaceSandboxBackend,
+                namespace_sandbox_decision,
+            )
 
-            if namespace_sandbox_available():
+            decision = namespace_sandbox_decision()
+            if decision.backend is NamespaceSandboxBackend.NAMESPACE:
                 from spack.sandbox_namespaces import NamespaceSandbox
 
                 return NamespaceSandbox(landlock=LandlockSandbox())
-            return LandlockSandbox()
+            if decision.backend is NamespaceSandboxBackend.LANDLOCK:
+                spack.util.tty.debug(
+                    "Namespace sandbox unavailable during {0}: {1}; using Landlock-only "
+                    "sandbox".format(decision.capability.operation, decision.capability.reason)
+                )
+                return LandlockSandbox()
+            raise SandboxError(
+                "Namespace sandbox unavailable during {0}: {1}; unconstrained fallback is "
+                "not permitted".format(decision.capability.operation, decision.capability.reason)
+            )
         elif system == "Windows":
             return WindowsAppContainerSandbox()
         else:

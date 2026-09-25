@@ -13,8 +13,10 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 
 ## Phase status
 
-- [x] Phase 1 increment, capability probe and fallback: a boolean disposable-child probe
-  exists, with lifecycle regression tests. Reason-specific reports remain open.
+- [x] Phase 1 increment, capability probe and fallback: the disposable-child
+  probe returns availability, failed operation, and reason. Backend selection
+  distinguishes namespaces, constrained Landlock, and forbidden unconstrained
+  fallback, with lifecycle and diagnostic regression tests.
 - [x] Phase 2 increment, mount-tree setup: the narrow namespace-entry and bind-mount
   primitives exist. The planned tmpfs policy tree, preserved sources, namespace
   handle, and explicit cleanup API remain open.
@@ -38,8 +40,9 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   Installer preflight caches the default-libc result, and the build worker
   enters the namespace before starting `Tee`. Later selection reuses the cache.
   A fresh-exec mode remains optional hardening or an external-backend concern.
-- [ ] Add reason-specific capability results after the boolean probe lifecycle is
-  stable.
+- [x] Add reason-specific capability results after the boolean probe lifecycle
+  is stable. Child setup and parent probe failures retain the failed operation
+  and reason across the pipe and process-local cache.
 
 ### Mount-tree state and failure semantics
 
@@ -50,10 +53,18 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - [x] Keep namespace re-entry idempotent within a process.
 - [x] Enter the namespace even when the selected hidden-directory list is empty.
   Fixed in `_enable_sandbox()` and covered for external `autoconf`.
-- [ ] Decide and document retry behavior after a failed mask. The process may
-  already be in a namespace and may contain a partial mount tree.
+- [x] Do not retry after failed namespace entry or masking. The process may
+  already contain partial namespace or mount state, so the worker fails and a
+  fresh worker is the only valid retry boundary.
 - [ ] Preserve selected sources before hiding parent directories; create and
   validate targets; account for merged-`/usr` aliases and mount ordering.
+- [ ] Use mask sources that remain non-writable after confinement. The current
+  stage-owned source hides host content but can be populated through the
+  writable stage path, so it is not a permanent-empty foundation for Phase 4.
+- [ ] Define and validate an immutable Phase 4 mount plan before performing any
+  mounts. Resolve preserved source paths and merged-`/usr` aliases, validate
+  source and target types, reject conflicting or duplicate targets, and produce
+  deterministic mount order.
 
 ### Landlock composition and installer errors
 
@@ -63,16 +74,25 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   raw `OSError`; the composite backend now raises `SandboxError`, the installer
   wraps grants and application, and backend selection preflights Landlock.
 - [ ] Implement the documented shared fallback policy. A warning in the current
-  hook is not the final `config:sandbox:allow_fallback` trust decision.
+  hook is not the final `config:sandbox:allow_fallback` trust decision for
+  trusted direct execution when no constrained worker is available. It does not
+  gate namespace-to-Landlock fallback because Landlock remains constrained.
 
 ### Next selected work
 
-- [ ] Define and implement a structured namespace capability and fallback
+- [x] Define and implement a structured namespace capability and fallback
   decision. It must distinguish namespace-to-Landlock fallback from an
   unconstrained-worker fallback, report the failed probe operation, permit
   fallback only before process mutation, and keep partial namespace or mount
   setup failures fatal. Add focused selection and diagnostic tests before
   starting the Phase 4 mount policy.
+
+- [ ] Close the mount-authority window between pre-thread namespace entry and
+  Landlock application. Recipe-controlled Python currently runs after the
+  child gains mount capability but before Landlock, and could bind host content
+  beneath a path that Landlock later grants recursively. Add an adversarial
+  regression first, then make namespace setup and confinement adjacent or drop
+  mount authority before recipe-controlled code. Resolve this before Phase 4.
 
 ### Tests and documentation structure
 
@@ -93,6 +113,13 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 ## Accepted staged improvements
 
 - Probe children cannot escape into the caller on unexpected setup exceptions.
+- Structured capability results retain exact child and parent failure
+  operations and reasons across the probe pipe and cache.
+- Backend decisions identify Landlock-only fallback as constrained and reject
+  an unconstrained fallback before constructing a sandbox.
+- The disposable probe now exercises the directory bind mount required by the
+  current masking backend, so that failure selects Landlock before mutating the
+  install worker.
 - Fork, pipe, read, and wait lifecycle paths have direct regression coverage.
 - Empty mount trees now establish real readiness rather than reporting probe-only
   availability.
@@ -143,4 +170,26 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - 2026-09-25: Reran Ruff and the focused namespace/shared sandbox suite (38
   passed). A fresh full Sphinx build reports no warnings from the changed
   sandbox pages; its warning gate remains blocked by 15 unrelated repository
+  autodoc, toctree, and reference warnings.
+- 2026-09-25: Replaced the boolean-only probe result with a structured
+  capability result, transported operation-specific child failures through the
+  probe pipe, retained parent failure diagnostics, and preserved retry/freeze
+  cache semantics.
+- 2026-09-25: Added an explicit namespace backend decision: prefer namespaces,
+  classify Landlock-only as constrained fallback, and reject unconstrained
+  fallback. Confirmed that actual namespace and mount failures remain fatal and
+  selected preflight validation of an immutable Phase 4 mount plan as the next
+  work item.
+- 2026-09-25: An independent review found that the capability probe omitted the
+  bind mount required by current masking. Added that operation to the disposable
+  probe and a focused failure-transport regression.
+- 2026-09-25: The same review identified a pre-existing mount-authority window:
+  recipe-controlled setup runs after namespace entry but before Landlock. Also
+  recorded that stage-owned mask sources are writable and corrected broader
+  docs that described the unimplemented Phase 4 ``bin``/``include`` policy as
+  current behavior. Closing the authority window is the next selected work.
+- 2026-09-25: Ran `ruff format`, `ruff format --check`, and `ruff check` on all
+  four changed Python files; the focused namespace and shared sandbox suite
+  passed 45 tests. A fresh full Sphinx build reports no warnings from changed
+  pages; its warning gate remains blocked by the same 15 unrelated repository
   autodoc, toctree, and reference warnings.
