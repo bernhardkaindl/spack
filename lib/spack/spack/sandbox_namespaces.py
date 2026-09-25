@@ -19,10 +19,10 @@ import platform
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, List, Optional
 
+from spack.sandbox import Sandbox, SandboxError
+
 if TYPE_CHECKING:
     from spack.sandbox import LandlockSandbox
-
-from spack.sandbox import Sandbox, SandboxError
 
 # Linux namespace and mount flags.
 CLONE_NEWUSER = 0x10000000
@@ -43,6 +43,10 @@ def _check_syscall(result: int, name: str) -> int:
 # Process-local set of PIDs that have already entered the user/mount namespace.
 # Makes _enter_user_mount_namespace idempotent within a single process.
 _namespace_entered_pids: set = set()
+
+# The installer probes before launching build workers. POSIX workers inherit
+# this result, avoiding a second fork after their logging thread has started.
+_namespace_probe_result: Optional[bool] = None
 
 
 def _enter_user_mount_namespace(libc, _probe_child: bool = False) -> None:
@@ -90,30 +94,38 @@ def _namespace_available(libc) -> bool:
     the result through a pipe. The parent is never affected.
     """
 
+    fork_fn = getattr(os, "fork", None)
+    if fork_fn is None:
+        return False
     read_fd, write_fd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
+    try:
+        pid = fork_fn()
+    except BaseException:
         os.close(read_fd)
-        try:
-            _enter_user_mount_namespace(libc, _probe_child=True)
-        except OSError:
-            result = b"0"
-        else:
-            result = b"1"
-        try:
-            os.write(write_fd, result)
-        except OSError:
-            pass
         os.close(write_fd)
-        os._exit(0)
+        raise
+    if pid == 0:
+        # Never unwind into the caller in the forked child, even when setup
+        # raises an unexpected exception. EOF also reports probe failure.
+        try:
+            os.close(read_fd)
+            try:
+                _enter_user_mount_namespace(libc, _probe_child=True)
+            except OSError:
+                result = b"0"
+            else:
+                result = b"1"
+            os.write(write_fd, result)
+        finally:
+            os._exit(0)
 
     os.close(write_fd)
     try:
         result = os.read(read_fd, 1)
-        os.waitpid(pid, 0)
         return result == b"1"
     finally:
         os.close(read_fd)
+        os.waitpid(pid, 0)
 
 
 def namespace_sandbox_available(libc: Optional[ctypes.CDLL] = None) -> bool:
@@ -122,38 +134,50 @@ def namespace_sandbox_available(libc: Optional[ctypes.CDLL] = None) -> bool:
     Returns ``False`` off Linux or when the probe fails. Returns ``True`` when
     such a namespace can be created.
     """
+    global _namespace_probe_result
+
     if platform.system() != "Linux":
         return False
-    if libc is None:
-        libc = ctypes.CDLL(None, use_errno=True)
+    use_cache = libc is None
+    if use_cache and _namespace_probe_result is not None:
+        return _namespace_probe_result
     try:
-        return _namespace_available(libc)
+        if libc is None:
+            libc = ctypes.CDLL(None, use_errno=True)
+        result = _namespace_available(libc)
     except OSError:
         return False
+    if use_cache:
+        _namespace_probe_result = result
+    return result
 
 
 def prepare_empty_directory_masking(
-    paths: Iterable[str], libc: Optional[ctypes.CDLL] = None
+    paths: Iterable[str], libc: Optional[ctypes.CDLL] = None, cache_unavailable: bool = False
 ) -> bool:
     """Enter a private user and mount namespace for directory masking.
 
     Returns ``True`` once the namespace is active, ``False`` when
     unprivileged namespaces are not permitted by the kernel.
 
-    When *paths* is empty, also probes namespace availability and returns
-    ``True`` only if the namespace is available.
+    Even when *paths* is empty, success means the calling process has entered
+    the namespace. Setup errors after the probe propagate to the caller. When
+    *cache_unavailable* is true, freeze an unavailable result so later backend
+    selection in the same worker cannot start another probe after threads exist.
     """
+    global _namespace_probe_result
 
-    path_list = list(paths)
-    if not path_list:
-        return namespace_sandbox_available(libc)
     if platform.system() != "Linux":
         return False
-
+    if os.getpid() in _namespace_entered_pids:
+        return True
+    available = namespace_sandbox_available(libc)
+    if cache_unavailable and libc is None and _namespace_probe_result is None:
+        _namespace_probe_result = available
+    if not available:
+        return False
     if libc is None:
         libc = ctypes.CDLL(None, use_errno=True)
-    if not _namespace_available(libc):
-        return False
     _enter_user_mount_namespace(libc)
     return True
 
@@ -171,8 +195,9 @@ def hide_directories_as_empty(
     Sandboxed tools see an empty directory (``ENOENT`` for missing entries)
     instead of the host tree.
 
-    Returns ``True`` on success, ``False`` when the namespace backend is
-    unavailable or already active but a bind mount fails.
+    Returns ``True`` on success (including an empty path list), ``False`` when
+    the namespace backend is unavailable. Mount failures raise ``OSError``;
+    callers must not continue with a partially prepared mount tree.
     """
 
     path_list = list(paths)
@@ -191,18 +216,14 @@ def hide_directories_as_empty(
         os.mkdir(empty_dir)
         _check_syscall(
             libc.mount(
-                os.fsencode(empty_dir),
-                os.fsencode(path),
-                None,
-                ctypes.c_ulong(MS_BIND),
-                None,
+                os.fsencode(empty_dir), os.fsencode(path), None, ctypes.c_ulong(MS_BIND), None
             ),
             "mount(MS_BIND)",
         )
     return True
 
 
-class NamespaceSandbox(Sandbox):  # type: ignore[valid-type]
+class NamespaceSandbox(Sandbox):
     """Sandbox backend that combines Linux user/mount namespaces with Landlock.
 
     On Linux, when unprivileged user and mount namespaces are available, this
@@ -215,14 +236,17 @@ class NamespaceSandbox(Sandbox):  # type: ignore[valid-type]
     namespace-restricted mount tree.
     """
 
-    def __init__(self, libc: Optional[ctypes.CDLL] = None) -> None:
+    def __init__(
+        self, libc: Optional[ctypes.CDLL] = None, landlock: Optional["LandlockSandbox"] = None
+    ) -> None:
         self.libc = libc
         self._namespace_ready = False
         self._hidden_dirs: List[str] = []
         self._stage_path: Optional[str] = None
         self._granted_dirs: List[Path] = []
-        # Create the internal Landlock sandbox lazily (only when needed).
-        self._landlock: Optional["LandlockSandbox"] = None
+        # Create the internal Landlock sandbox lazily unless selection already
+        # preflighted and supplied it.
+        self._landlock = landlock
 
     @property
     def namespace_available(self) -> bool:
@@ -239,12 +263,13 @@ class NamespaceSandbox(Sandbox):  # type: ignore[valid-type]
         from spack.sandbox import LandlockSandbox
 
         if self._landlock is None:
-            self._landlock = LandlockSandbox(self.libc)
+            try:
+                self._landlock = LandlockSandbox(self.libc)
+            except OSError as error:
+                raise SandboxError(f"Landlock is unavailable: {error}") from error
         return self._landlock  # type: ignore[return-value]
 
-    def prepare_mount_tree(
-        self, hidden_dirs: Iterable[str], stage_path: str
-    ) -> bool:
+    def prepare_mount_tree(self, hidden_dirs: Iterable[str], stage_path: str) -> bool:
         """Enter the private namespace and mask *hidden_dirs* as empty.
 
         Called before Landlock rules are built so that Landlock operates on the
@@ -256,14 +281,14 @@ class NamespaceSandbox(Sandbox):  # type: ignore[valid-type]
             return True
         self._hidden_dirs = hidden_list
         self._stage_path = stage_path
+        if not prepare_empty_directory_masking(hidden_list, self.libc):
+            return False
         self._namespace_ready = hide_directories_as_empty(
-            hidden_list, stage_path, namespace_ready=False, libc=self.libc
+            hidden_list, stage_path, namespace_ready=True, libc=self.libc
         )
         return self._namespace_ready
 
-    def bind_mount(
-        self, source: str, target: Optional[str] = None
-    ) -> bool:
+    def bind_mount(self, source: str, target: Optional[str] = None) -> bool:
         """Bind-mount *source* at *target* inside the namespace.
 
         *target* defaults to *source*. Returns ``True`` if the mount was
@@ -284,7 +309,7 @@ class NamespaceSandbox(Sandbox):  # type: ignore[valid-type]
                 os.fsencode(resolved_source),
                 os.fsencode(target),
                 None,
-                ctypes.c_ulong(MS_BIND),
+                ctypes.c_ulong(MS_BIND | (MS_REC if os.path.isdir(resolved_source) else 0)),
                 None,
             ),
             "mount(MS_BIND)",
