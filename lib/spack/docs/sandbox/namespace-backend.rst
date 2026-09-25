@@ -177,6 +177,22 @@ The namespace backend prepares a private mount tree before the worker
 applies Landlock. The mount tree hides host content and presents only the
 content the worker legitimately needs.
 
+Mount-plan validation
+~~~~~~~~~~~~~~~~~~~~~
+
+The current narrow masking path first builds an immutable mount plan before
+entering the namespace. It canonicalizes existing directory targets, rejects
+non-directory targets, duplicate targets, and ancestor/descendant conflicts,
+then sorts the targets and assigns deterministic stage-owned empty-directory
+sources. A missing target remains a no-op for the narrow mask. An existing
+stage path must be a directory; a not-yet-created stage path is created only
+when the validated plan is applied.
+
+This is the planning and validation boundary for Phase 4, not the complete
+policy-driven mount tree. Preserving whitelisted sources before hiding their
+parents, resolving merged-``/usr`` aliases, and selecting safe ordering for
+compiler, tool, and header mounts remain the next implementation step.
+
 Base mounts
 ~~~~~~~~~~~
 
@@ -377,8 +393,9 @@ may be added later as a further inner layer; see `Relationship to Landlock
 Phase 4: Policy-driven mount tree
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Make the set of hidden directories and bind-mounted content driven by policy
-rather than a fixed list. The policy derives from:
+The immutable mount-plan validation increment is complete for the current
+narrow mask. Extend it so the set of hidden directories and bind-mounted
+content is driven by policy rather than a fixed list. The policy derives from:
 
 * The concrete spec's selected compilers and build tools.
 * The host's available header trees and compiler installations.
@@ -415,7 +432,9 @@ Decision gates
 
 * [x] The namespace backend is preferred when available; Landlock-only is the
   fallback, not the default.
-* [ ] The mount tree is derived from policy, not a fixed list.
+* [x] The current narrow mask is represented by an immutable, validated,
+  deterministic mount plan before namespace mutation.
+* [ ] The complete mount tree is derived from policy, not a fixed list.
 * [x] The internal Linux backend confines only the existing forked install
   child; the trusted installer supervisor remains outside the namespace.
 * [ ] External Linux sandbox tools use a separate launcher without changing
