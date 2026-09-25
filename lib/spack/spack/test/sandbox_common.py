@@ -12,6 +12,7 @@ import pytest
 
 import spack.concretize
 import spack.sandbox
+import spack.sandbox_namespaces
 import spack.store
 from spack.installer.build import _enable_sandbox
 
@@ -109,7 +110,7 @@ def test_enable_sandbox_paths(
     assert mock_sandbox.apply_calls == [False]
 
 
-class MockNamespaceSandbox(spack.sandbox.NamespaceSandbox):
+class MockNamespaceSandbox(spack.sandbox_namespaces.NamespaceSandbox):
     """NamespaceSandbox that records mount-tree preparation instead of mounting."""
 
     def __init__(self):

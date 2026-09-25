@@ -470,7 +470,7 @@ def get_sandbox() -> Sandbox:
             if namespace_sandbox_available():
                 from spack.sandbox_namespaces import NamespaceSandbox
 
-                return NamespaceSandbox()
+                return NamespaceSandbox(landlock=LandlockSandbox())
             return LandlockSandbox()
         elif system == "Windows":
             return WindowsAppContainerSandbox()
