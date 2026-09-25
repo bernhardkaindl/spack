@@ -62,8 +62,11 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   immutable plan canonicalizes existing directory targets, rejects invalid,
   duplicate, and ancestor/descendant targets, and assigns deterministic
   stage-owned source paths.
-- [ ] Preserve selected sources before hiding parent directories; account for
-  merged-`/usr` aliases and mount ordering in the policy-driven plan.
+- [x] Preserve explicitly selected sources before hiding parent directories.
+  The immutable plan canonicalizes source paths and merged-`/usr` target
+  aliases, validates source/target types and target containment below a hidden
+  directory, stages sources before masks, and restores them by increasing
+  target depth. Recursive binds are limited to preserved directory trees.
 - [ ] Use mask sources that remain non-writable after confinement. The current
   stage-owned source hides host content but can be populated through the
   writable stage path, so it is not a permanent-empty foundation for Phase 4.
@@ -101,17 +104,17 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   immutable Phase 4 mount plan remains required before adding policy mounts.
 
 - [x] Define and validate an immutable Phase 4 mount plan before performing any
-  mounts. The current increment covers the narrow empty-directory masks:
-  resolve and sort existing directory targets, validate target and stage types,
-  reject duplicate or overlapping targets, and produce deterministic
-  stage-owned source paths. Plan-level regressions prove invalid plans fail
-  before namespace entry. Policy-derived preserved sources and merged-``/usr``
-  aliases remain out of scope.
+  mounts. The current increment covers the narrow empty-directory masks and
+  explicit preserved sources: resolve and sort targets, validate target and
+  stage types, canonicalize merged-``/usr`` aliases, reject duplicate or
+  overlapping targets, validate source containment, and produce deterministic
+  preservation and restoration order. Plan-level regressions prove invalid
+  plans fail before namespace entry.
 
-- [ ] Preserve selected sources before hiding parent directories. Resolve
-  whitelisted source paths and merged-``/usr`` aliases, validate their source
-  and target relationships, determine safe mount ordering, and add policy-level
-  regressions before enabling additional mounts.
+- [ ] Use non-writable empty mask sources. Replace the current writable
+  stage-owned mask directory with an immutable source that remains empty after
+  Landlock write grants, and add a real-kernel regression for attempted source
+  modification.
 
 ### Tests and documentation structure
 
@@ -146,6 +149,10 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   entry. It canonicalizes and sorts targets, validates directory types, rejects
   duplicates and overlapping targets, and assigns deterministic empty-source
   paths. Invalid plans cannot partially mutate the worker.
+- Explicit preserved sources are now planned before masks and restored into the
+  hidden tree afterward. Source and target types are validated, merged-``/usr``
+  aliases resolve to canonical targets, preserved directory trees use recursive
+  binds, and restoration order is deterministic by target depth.
 - Fork, pipe, read, and wait lifecycle paths have direct regression coverage.
 - Empty mount trees now establish real readiness rather than reporting probe-only
   availability.
@@ -232,3 +239,9 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   application. Added plan-level regressions and selected preservation of
   whitelisted sources, merged-``/usr`` aliases, and mount ordering as the next
   work item.
+- 2026-09-25: Implemented preserved-source planning for the Phase 4 mount plan.
+  Explicit source/target pairs are canonicalized and type-checked before
+  namespace entry, staged before hidden parent mounts, and restored in
+  target-depth order; merged-``/usr`` aliases are resolved to canonical targets.
+  Added policy-level ordering and pre-entry failure regressions, and selected
+  non-writable empty mask sources as the next work item.

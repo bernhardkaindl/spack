@@ -42,7 +42,8 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   phases. The broader mount policy is Phase 4.
 * **Phase 4 -- planning increment complete, policy work open:** the current
   narrow mask is represented by an immutable, validated, deterministic mount
-  plan before namespace mutation. Preserved sources, merged-``/usr`` aliases,
+  plan before namespace mutation. Explicit preserved sources are staged before
+  hiding parents, canonical merged-``/usr`` aliases are restored in safe order,
   and policy-derived compiler, tool, and header mounts remain future work.
 * **Phases 5 and 6 -- not started:** full build-phase policy validation and
   concretizer-worker evaluation remain future work.
