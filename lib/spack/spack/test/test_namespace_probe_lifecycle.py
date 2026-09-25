@@ -152,17 +152,29 @@ def test_probe_transports_syscall_failure(monkeypatch):
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
-def test_probe_transports_bind_mount_failure(monkeypatch):
+@pytest.mark.parametrize(
+    "failing_call, operation",
+    [
+        (1, "mount(tmpfs probe)"),
+        (2, "mount(MS_REMOUNT, MS_RDONLY probe)"),
+        (3, "mount(MS_BIND probe)"),
+    ],
+)
+def test_probe_transports_mount_failure(monkeypatch, failing_call, operation):
     class FailingLibc:
+        def __init__(self):
+            self.mount_calls = 0
+
         def mount(self, source, target, filesystemtype, flags, data):
-            ctypes.set_errno(errno.EPERM)
-            return -1
+            self.mount_calls += 1
+            if self.mount_calls == failing_call:
+                ctypes.set_errno(errno.EPERM)
+                return -1
+            return 0
 
     monkeypatch.setattr(ns, "_enter_user_mount_namespace", lambda *args, **kwargs: None)
     capability = ns._probe_namespace_capability(FailingLibc())
-    assert capability == ns.NamespaceCapability(
-        False, "mount(MS_BIND probe)", "Operation not permitted"
-    )
+    assert capability == ns.NamespaceCapability(False, operation, "Operation not permitted")
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")

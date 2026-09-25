@@ -165,26 +165,24 @@ def test_mount_plan_preserves_sources_before_hiding_and_restores_aliases(tmp_pat
 
     assert plan.preserved_mounts == (
         ns.NamespacePreservedMount(
-            str(source.resolve()),
-            str(stage / "spack-preserved-host-paths/0"),
-            False,
+            str(source.resolve()), str(stage / "spack-preserved-host-paths/0"), False
         ),
     )
     assert plan.restoration_mounts == (
         ns.NamespacePreservedMount(
-            str(stage / "spack-preserved-host-paths/0"),
-            str(hidden / "tool"),
-            False,
+            str(stage / "spack-preserved-host-paths/0"), str(hidden / "tool"), False
         ),
     )
 
     libc = FakeLibc()
     assert ns._apply_namespace_mount_plan(plan, libc)
     assert libc.mount_calls == [
+        (os.fsencode(source), os.fsencode(stage / "spack-preserved-host-paths/0"), ns.MS_BIND),
+        (b"tmpfs", os.fsencode(stage / "spack-empty-host-dirs"), ns._EMPTY_SOURCE_FLAGS),
         (
-            os.fsencode(source),
-            os.fsencode(stage / "spack-preserved-host-paths/0"),
-            ns.MS_BIND,
+            None,
+            os.fsencode(stage / "spack-empty-host-dirs"),
+            ns.MS_REMOUNT | ns.MS_RDONLY | ns._EMPTY_SOURCE_FLAGS,
         ),
         (os.fsencode(stage / "spack-empty-host-dirs/0"), os.fsencode(hidden), ns.MS_BIND),
         (
@@ -207,8 +205,10 @@ def test_mount_plan_preserves_directory_trees_recursively(tmp_path):
     libc = FakeLibc()
     assert ns._apply_namespace_mount_plan(plan, libc)
     assert libc.mount_calls[0][2] == ns.MS_BIND | ns.MS_REC
-    assert libc.mount_calls[1][2] == ns.MS_BIND
-    assert libc.mount_calls[2][2] == ns.MS_BIND | ns.MS_REC
+    assert libc.mount_calls[1][2] == ns._EMPTY_SOURCE_FLAGS
+    assert libc.mount_calls[2][2] == ns.MS_REMOUNT | ns.MS_RDONLY | ns._EMPTY_SOURCE_FLAGS
+    assert libc.mount_calls[3][2] == ns.MS_BIND
+    assert libc.mount_calls[4][2] == ns.MS_BIND | ns.MS_REC
 
 
 def test_mount_plan_rejects_preserved_source_relationships(tmp_path):
@@ -219,7 +219,9 @@ def test_mount_plan_rejects_preserved_source_relationships(tmp_path):
 
     with pytest.raises(ns.NamespaceSetupError, match="preserved source does not exist"):
         ns.build_namespace_mount_plan(
-            [str(hidden)], str(tmp_path / "stage"), [(str(tmp_path / "missing"), str(hidden / "x"))]
+            [str(hidden)],
+            str(tmp_path / "stage"),
+            [(str(tmp_path / "missing"), str(hidden / "x"))],
         )
     with pytest.raises(ns.NamespaceSetupError, match="not below a hidden directory"):
         ns.build_namespace_mount_plan(
@@ -248,7 +250,9 @@ def test_preserved_source_validation_precedes_namespace_entry(namespace_setup, t
 
     with pytest.raises(ns.NamespaceSetupError, match="preserved source does not exist"):
         sandbox.prepare_mount_tree(
-            [str(hidden)], str(tmp_path / "stage"), [(str(tmp_path / "missing"), str(hidden / "x"))]
+            [str(hidden)],
+            str(tmp_path / "stage"),
+            [(str(tmp_path / "missing"), str(hidden / "x"))],
         )
     assert libc.unshare_calls == []
 
@@ -282,8 +286,61 @@ def test_mask_existing_directories(tmp_path):
         [str(target), str(tmp_path / "missing")], str(tmp_path), True, libc
     )
     assert libc.mount_calls == [
-        (os.fsencode(tmp_path / "spack-empty-host-dirs/0"), os.fsencode(target), ns.MS_BIND)
+        (b"tmpfs", os.fsencode(tmp_path / "spack-empty-host-dirs"), ns._EMPTY_SOURCE_FLAGS),
+        (
+            None,
+            os.fsencode(tmp_path / "spack-empty-host-dirs"),
+            ns.MS_REMOUNT | ns.MS_RDONLY | ns._EMPTY_SOURCE_FLAGS,
+        ),
+        (os.fsencode(tmp_path / "spack-empty-host-dirs/0"), os.fsencode(target), ns.MS_BIND),
     ]
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
+def test_live_mask_sources_remain_empty_after_stage_write_grant(tmp_path):
+    if not ns.namespace_sandbox_available():
+        pytest.skip("unprivileged namespaces unavailable")
+    target = tmp_path / "host"
+    target.mkdir()
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    code = """
+import errno
+import os
+import sys
+from pathlib import Path
+from spack.sandbox_namespaces import NamespaceSandbox
+
+target = Path(sys.argv[1])
+stage = Path(sys.argv[2])
+sandbox = NamespaceSandbox()
+assert sandbox.prepare_mount_tree([str(target)], str(stage))
+source = stage / "spack-empty-host-dirs" / "0"
+assert not list(source.iterdir())
+assert not list(target.iterdir())
+assert sandbox.drop_mount_authority()
+sandbox.allow_write(stage)
+sandbox.apply()
+for path in (source / "source-write", target / "target-write"):
+    try:
+        path.write_text("must fail")
+    except OSError as error:
+        assert error.errno == errno.EROFS, error
+    else:
+        raise AssertionError("empty mask source is writable: {}".format(path))
+assert not list(source.iterdir())
+os._exit(0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(target), str(stage)],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not list(target.iterdir())
 
 
 def test_mount_failure_is_fatal(namespace_setup, monkeypatch, tmp_path):
