@@ -2,316 +2,338 @@
 #
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 
-"""Unit tests for the namespace sandbox capability probe and mount-tree helpers.
+"""Namespace unit tests never modify the test runner's namespaces or /proc."""
 
-Tests use a fake libc and monkeypatched probes so they never enter a namespace
-in the pytest process itself.  The live test at the bottom runs the real
-``unshare``/``mount`` path in a child process.
-"""
-
+import errno
+import io
 import os
+import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+import spack.error
+import spack.installer.build as build
+import spack.sandbox
 import spack.sandbox_namespaces as ns
 
 
-class FakeLibc:
-    """Minimal fake libc that records ``unshare`` and ``mount`` calls."""
+@pytest.fixture(autouse=True)
+def reset_namespace_probe_result(monkeypatch):
+    monkeypatch.setattr(ns, "_namespace_probe_result", None)
 
+
+class FakeLibc:
     def __init__(self):
         self.unshare_calls = []
         self.mount_calls = []
 
     def unshare(self, flags):
-        self.unshare_calls.append(int(flags))
-        return -1
-
-    def mount(self, source, target, filesystemtype, mountflags, data):
-        self.mount_calls.append((source, target, int(mountflags)))
-        return -1
-
-
-# ---------------------------------------------------------------------------
-# Capability probe (Phase 1)
-# ---------------------------------------------------------------------------
-
-
-def test_namespace_sandbox_available_is_false_off_linux(monkeypatch):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Windows")
-    assert ns.namespace_sandbox_available() is False
-
-
-def test_namespace_sandbox_available_is_false_when_probe_fails(monkeypatch):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    fake = FakeLibc()
-
-    def fake_cdll(*args, **kwargs):
-        return fake
-
-    monkeypatch.setattr(os, "fork", None)  # type: ignore[assignment]
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
-
-    # The probe forks and the child calls unshare; the fake returns -1 so the
-    # child reports failure.  The parent sees b"0" and returns False.
-    assert ns.namespace_sandbox_available() is False
-
-
-def test_namespace_sandbox_available_swallows_oserror(monkeypatch):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    def fake_cdll(*args, **kwargs):
-        raise OSError(1, "Cannot load libc")
-
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
-    assert ns.namespace_sandbox_available() is False
-
-
-def test_namespace_sandbox_available_passes_explicit_libc(monkeypatch):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    fake = FakeLibc()
-
-    def fake_cdll(*args, **kwargs):
-        return fake
-
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
-    monkeypatch.setattr(os, "fork", None)  # type: ignore[assignment]
-
-    # When an explicit libc is supplied it is used instead of the default.
-    assert ns.namespace_sandbox_available(libc=fake) is False
-    assert fake.unshare_calls == []
-    assert fake.mount_calls == []
-
-
-# ---------------------------------------------------------------------------
-# Mount-tree helpers (Phase 2)
-# ---------------------------------------------------------------------------
-
-
-def test_prepare_empty_directory_masking_returns_true_on_empty_paths():
-    assert ns.prepare_empty_directory_masking([]) is True
-
-
-def test_prepare_empty_directory_masking_returns_false_when_namespaces_denied(
-    monkeypatch,
-):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    fake = FakeLibc()
-
-    def fake_cdll(*args, **kwargs):
-        return fake
-
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
-
-    def fake_available(libc=None):
-        return False
-
-    monkeypatch.setattr(ns, "_namespace_available", fake_available)
-    assert ns.prepare_empty_directory_masking(["/usr/include"], libc=fake) is False
-    assert fake.unshare_calls == []
-
-
-def test_prepare_empty_directory_masking_enters_namespace_when_available(
-    monkeypatch, tmp_path,
-):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    fake = FakeLibc()
-    fake.unshare_returns = 0
-
-    def fake_unshare(self, flags):
-        self.unshare_calls.append(int(flags))
+        self.unshare_calls.append(flags.value)
         return 0
 
-    fake.unshare = fake_unshare
+    def mount(self, source, target, filesystemtype, flags, data):
+        self.mount_calls.append((source, target, flags.value))
+        return 0
 
-    def fake_cdll(*args, **kwargs):
-        return fake
 
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
+@pytest.fixture
+def namespace_setup(monkeypatch):
+    libc = FakeLibc()
+    writes = {}
 
-    def fake_available(libc=None):
-        return True
+    class Mapping(io.StringIO):
+        def __init__(self, path):
+            super().__init__()
+            self.path = path
 
-    monkeypatch.setattr(ns, "_namespace_available", fake_available)
-    result = ns.prepare_empty_directory_masking(["/usr/include"], libc=fake)
-    assert result is True
-    assert fake.unshare_calls == [ns.CLONE_NEWUSER | ns.CLONE_NEWNS]
-    assert fake.mount_calls == [
-        (None, b"/", ns.MS_REC | ns.MS_PRIVATE)
+        def close(self):
+            writes[self.path] = self.getvalue()
+            super().close()
+
+    monkeypatch.setattr(ns, "_namespace_entered_pids", set())
+    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(ns.os, "getuid", lambda: 1234, raising=False)
+    monkeypatch.setattr(ns.os, "getgid", lambda: 5678, raising=False)
+    monkeypatch.setattr(ns, "open", lambda path, *a, **kw: Mapping(path), raising=False)
+    monkeypatch.setattr(ns, "_namespace_available", lambda libc: True)
+    return libc, writes
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: capability probe and fallback
+#
+# Process-lifecycle cases live in test_namespace_probe_lifecycle.py.
+# ---------------------------------------------------------------------------
+
+
+def test_namespace_mapping_and_reentry(namespace_setup):
+    libc, writes = namespace_setup
+    ns._enter_user_mount_namespace(libc)
+    ns._enter_user_mount_namespace(libc)
+    assert libc.unshare_calls == [ns.CLONE_NEWUSER | ns.CLONE_NEWNS]
+    assert writes == {
+        "/proc/self/setgroups": "deny",
+        "/proc/self/uid_map": "1234 1234 1",
+        "/proc/self/gid_map": "5678 5678 1",
+    }
+    assert libc.mount_calls == [(None, b"/", ns.MS_REC | ns.MS_PRIVATE)]
+
+
+def test_probe_bypasses_reentry_guard(namespace_setup):
+    libc, _ = namespace_setup
+    ns._namespace_entered_pids.add(os.getpid())
+    ns._enter_user_mount_namespace(libc, _probe_child=True)
+    assert len(libc.unshare_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: mount-tree setup
+# ---------------------------------------------------------------------------
+
+
+def test_empty_mount_tree_enters_namespace(namespace_setup, tmp_path):
+    libc, _ = namespace_setup
+    sandbox = ns.NamespaceSandbox(libc)
+    assert sandbox.prepare_mount_tree([], str(tmp_path))
+    assert sandbox.namespace_ready
+    assert libc.unshare_calls == [ns.CLONE_NEWUSER | ns.CLONE_NEWNS]
+    assert sandbox.prepare_mount_tree([], str(tmp_path))
+    assert len(libc.unshare_calls) == 1
+
+
+def test_prepare_reuses_active_namespace(namespace_setup, monkeypatch):
+    libc, _ = namespace_setup
+    ns._enter_user_mount_namespace(libc)
+    monkeypatch.setattr(ns, "_namespace_available", lambda libc: False)
+    assert ns.prepare_empty_directory_masking(["/unused"], libc)
+    assert len(libc.unshare_calls) == 1
+
+
+def test_unavailable_namespace_is_not_ready(monkeypatch, tmp_path):
+    monkeypatch.setattr(ns, "namespace_sandbox_available", lambda libc=None: False)
+    sandbox = ns.NamespaceSandbox(FakeLibc())
+    assert not sandbox.prepare_mount_tree([], str(tmp_path))
+    assert not sandbox.namespace_ready
+
+
+def test_mask_existing_directories(tmp_path):
+    libc = FakeLibc()
+    target = tmp_path / "host"
+    target.mkdir()
+    assert ns.hide_directories_as_empty(
+        [str(target), str(tmp_path / "missing")], str(tmp_path), True, libc
+    )
+    assert libc.mount_calls == [
+        (os.fsencode(tmp_path / "spack-empty-host-dirs/0"), os.fsencode(target), ns.MS_BIND)
     ]
 
 
-def test_hide_directories_as_empty_returns_true_on_empty_paths():
-    assert ns.hide_directories_as_empty([]) is True
+def test_mount_failure_is_fatal(namespace_setup, monkeypatch, tmp_path):
+    libc, _ = namespace_setup
+    target = tmp_path / "host"
+    target.mkdir()
+
+    def fail(*args):
+        raise OSError(errno.EPERM, "mount denied")
+
+    # Fail after namespace entry, not the harmless availability probe.
+    ns._enter_user_mount_namespace(libc)
+    monkeypatch.setattr(libc, "mount", fail)
+    sandbox = ns.NamespaceSandbox(libc)
+    with pytest.raises(OSError, match="mount denied"):
+        sandbox.prepare_mount_tree([str(target)], str(tmp_path))
+    assert not sandbox.namespace_ready
 
 
-def test_hide_directories_as_empty_binds_only_existing_dirs(tmp_path, monkeypatch):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    fake = FakeLibc()
-    fake.unshare_returns = 0
-
-    def fake_unshare(self, flags):
-        self.unshare_calls.append(int(flags))
-        return 0
-
-    fake.unshare = fake_unshare
-
-    def fake_cdll(*args, **kwargs):
-        return fake
-
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
-
-    def fake_available(libc=None):
-        return True
-
-    monkeypatch.setattr(ns, "_namespace_available", fake_available)
-
-    existing = tmp_path / "existing"
-    existing.mkdir()
-    missing = tmp_path / "missing"
-
-    result = ns.hide_directories_as_empty(
-        [str(existing), str(missing)], str(tmp_path), namespace_ready=True, libc=fake
-    )
-    assert result is True
-    # Only the existing directory should be bind-mounted.
-    assert len(fake.mount_calls) == 1
-    source, target, flags = fake.mount_calls[0]
-    assert flags == ns.MS_BIND
-    assert source.endswith(b"spack-empty-host-dirs/0")
-    assert target == os.fsencode(str(existing))
+@pytest.mark.parametrize("directory", [False, True])
+def test_bind_mount_flags(tmp_path, directory):
+    source = tmp_path / "source"
+    source.mkdir() if directory else source.touch()
+    libc = FakeLibc()
+    sandbox = ns.NamespaceSandbox(libc)
+    assert not sandbox.bind_mount(str(source))
+    sandbox._namespace_ready = True
+    assert sandbox.bind_mount(str(source))
+    assert libc.mount_calls == [
+        (os.fsencode(source), os.fsencode(source), ns.MS_BIND | (ns.MS_REC if directory else 0))
+    ]
 
 
-def test_hide_directories_as_empty_skips_when_namespace_unavailable(
-    tmp_path, monkeypatch,
-):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    def fake_available(libc=None):
-        return False
-
-    monkeypatch.setattr(ns, "_namespace_available", fake_available)
-
-    result = ns.hide_directories_as_empty(
-        ["/usr/include"], str(tmp_path), namespace_ready=False
-    )
-    assert result is False
-
-
-def test_hide_directories_as_empty_uses_explicit_libc(tmp_path, monkeypatch):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    fake = FakeLibc()
-    fake.unshare_returns = 0
-
-    def fake_unshare(self, flags):
-        self.unshare_calls.append(int(flags))
-        return 0
-
-    fake.unshare = fake_unshare
-
-    def fake_cdll(*args, **kwargs):
-        return fake
-
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
-
-    def fake_available(libc=None):
-        return False
-
-    monkeypatch.setattr(ns, "_namespace_available", fake_available)
-
-    # When namespace_ready is True, the probe is skipped and the explicit libc
-    # is used for the bind mount.
-    existing = tmp_path / "existing"
-    existing.mkdir()
-    result = ns.hide_directories_as_empty(
-        [str(existing)], str(tmp_path), namespace_ready=True, libc=fake
-    )
-    assert result is True
-    assert len(fake.mount_calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# Re-entry guard
-# ---------------------------------------------------------------------------
-
-
-def test_enter_namespace_is_idempotent_within_process(tmp_path, monkeypatch):
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    fake = FakeLibc()
-    fake.unshare_returns = 0
-
-    def fake_unshare(self, flags):
-        self.unshare_calls.append(int(flags))
-        return 0
-
-    fake.unshare = fake_unshare
-
-    def fake_cdll(*args, **kwargs):
-        return fake
-
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
-
-    def fake_available(libc=None):
-        return True
-
-    monkeypatch.setattr(ns, "_namespace_available", fake_available)
-
-    ns._enter_user_mount_namespace(fake)
-    assert len(fake.unshare_calls) == 1
-    # Second call should be a no-op.
-    ns._enter_user_mount_namespace(fake)
-    assert len(fake.unshare_calls) == 1
-
-
-def test_probe_child_bypasses_reentry_guard(tmp_path, monkeypatch):
-    """The probe child always runs the full setup, even if the parent already
-    entered a namespace."""
-    monkeypatch.setattr(ns.platform, "system", lambda: "Linux")
-
-    fake = FakeLibc()
-    fake.unshare_returns = 0
-
-    def fake_unshare(self, flags):
-        self.unshare_calls.append(int(flags))
-        return 0
-
-    fake.unshare = fake_unshare
-
-    def fake_cdll(*args, **kwargs):
-        return fake
-
-    monkeypatch.setattr(ns.ctypes, "CDLL", fake_cdll)
-
-    # Pretend the parent already entered a namespace.
-    ns._namespace_entered_pids.add(os.getpid())
-
-    # The probe child should still call unshare.
-    assert ns._namespace_available(fake) is False  # fake returns 0 from unshare
-    # The child called unshare even though the parent's PID is in the guard set.
-    assert len(fake.unshare_calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# Live kernel test
-# ---------------------------------------------------------------------------
-
-
-def test_live_namespace_probe():
-    if sys.platform != "linux":
-        pytest.skip("Linux-only live probe")
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
+def test_live_mask_is_private(tmp_path):
     if not ns.namespace_sandbox_available():
-        pytest.skip("unprivileged user and mount namespaces are unavailable")
-    # The probe succeeded — verify that the namespace constants are defined.
-    assert ns.CLONE_NEWUSER == 0x10000000
-    assert ns.CLONE_NEWNS == 0x00020000
-    assert ns.MS_PRIVATE == 0x00040000
-    assert ns.MS_REC == 0x00004000
-    assert ns.MS_BIND == 0x00001000
+        pytest.skip("unprivileged namespaces unavailable")
+    target = tmp_path / "host"
+    target.mkdir()
+    marker = target / "marker"
+    marker.write_text("host data")
+    code = """
+import sys
+from pathlib import Path
+from spack.sandbox_namespaces import NamespaceSandbox
+sandbox = NamespaceSandbox()
+assert sandbox.prepare_mount_tree([sys.argv[1]], sys.argv[2])
+assert list(Path(sys.argv[1]).iterdir()) == []
+try:
+    (Path(sys.argv[1]) / 'marker').read_text()
+except FileNotFoundError:
+    pass
+else:
+    raise AssertionError('host file remains visible')
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(target), str(tmp_path)],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == "host data"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: install-worker integration (experimental in-process hook)
+# ---------------------------------------------------------------------------
+
+
+def test_landlock_delegation(monkeypatch, tmp_path):
+    calls = []
+    landlock = SimpleNamespace(
+        _allow_read=lambda *args: calls.append(("read", args)),
+        _allow_write=lambda *args: calls.append(("write", args)),
+        apply=lambda **kw: calls.append(("apply", kw)),
+    )
+    monkeypatch.setattr(spack.sandbox, "LandlockSandbox", lambda libc: landlock)
+    sandbox = ns.NamespaceSandbox()
+    sandbox.allow_read(tmp_path)
+    sandbox.allow_write(tmp_path)
+    sandbox.apply(block_network=True)
+    assert calls == [
+        ("read", (tmp_path, tmp_path)),
+        ("write", (tmp_path, tmp_path)),
+        ("apply", {"block_network": True}),
+    ]
+
+
+def test_landlock_initialization_error_is_normalized(monkeypatch, tmp_path):
+    def fail(libc):
+        raise OSError(errno.ENOSYS, "Landlock unavailable")
+
+    monkeypatch.setattr(spack.sandbox, "LandlockSandbox", fail)
+    sandbox = ns.NamespaceSandbox()
+    with pytest.raises(spack.sandbox.SandboxError, match="Landlock is unavailable"):
+        sandbox.allow_read(tmp_path)
+
+
+def test_installer_normalizes_landlock_initialization_error(monkeypatch, tmp_path):
+    def fail(libc):
+        raise OSError(errno.ENOSYS, "Landlock unavailable")
+
+    monkeypatch.setattr(spack.sandbox, "LandlockSandbox", fail)
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: ns.NamespaceSandbox())
+    spec = SimpleNamespace(traverse=lambda **kw: [], prefix=tmp_path / "prefix")
+
+    with pytest.raises(spack.error.InstallError, match="Cannot enable build sandbox"):
+        build._enable_sandbox({"enable": True}, spec, str(tmp_path))
+
+
+def test_namespace_selection_preflights_landlock(monkeypatch):
+    landlock = object()
+    monkeypatch.setattr(spack.sandbox.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(ns, "namespace_sandbox_available", lambda: True)
+    monkeypatch.setattr(spack.sandbox, "LandlockSandbox", lambda: landlock)
+
+    sandbox = spack.sandbox.get_sandbox()
+    assert isinstance(sandbox, ns.NamespaceSandbox)
+    assert sandbox._landlock is landlock
+
+
+def test_worker_enters_namespace_before_tee(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        ns,
+        "prepare_empty_directory_masking",
+        lambda paths, **kwargs: calls.append(("prepare", list(paths), kwargs)) or True,
+    )
+    monkeypatch.setattr(build, "Tee", lambda *args: calls.append(("tee", args)) or object())
+
+    tee = build._start_tee_after_namespace(
+        {"enable": True}, "control-r", "control-w", "parent", "build.log"
+    )
+    assert tee is not None
+    assert calls == [
+        ("prepare", [], {"cache_unavailable": True}),
+        ("tee", ("control-r", "control-w", "parent", "build.log")),
+    ]
+
+
+def test_pre_thread_namespace_failure_is_reported(monkeypatch, tmp_path):
+    class StateStream:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    state_stream = StateStream()
+    monkeypatch.setattr(build, "make_state_stream", lambda state: state_stream)
+
+    def fail(*args):
+        raise OSError(errno.EPERM, "namespace entry denied")
+
+    monkeypatch.setattr(build, "_start_tee_after_namespace", fail)
+    log_path = tmp_path / "build.log"
+
+    with pytest.raises(SystemExit) as error:
+        build._start_worker_output({}, object(), object(), None, object(), str(log_path))
+    assert error.value.code == build.ExitCode.BUILD_ERROR
+    assert state_stream.closed
+    assert "namespace entry denied" in log_path.read_text()
+
+
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("external, hidden_dirs", [(False, ["/usr/share/aclocal"]), (True, [])])
+def test_installer_mounts_before_landlock(monkeypatch, tmp_path, available, external, hidden_dirs):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare", hidden_dirs, stage_path))
+            return available
+
+        def allow_read(self, path):
+            calls.append(("read", str(path)))
+
+        def allow_write(self, path):
+            calls.append(("write", str(path)))
+
+        def apply(self, block_network=False):
+            calls.append(("apply", block_network))
+
+    sandbox = RecordingSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    spec = SimpleNamespace(
+        traverse=lambda **kw: [
+            SimpleNamespace(name="autoconf", external=external, prefix=tmp_path / "autoconf")
+        ],
+        prefix=tmp_path / "prefix",
+    )
+    build._enable_sandbox({"enable": True, "allow_network": False}, spec, str(tmp_path))
+    assert calls[0] == ("prepare", hidden_dirs, str(tmp_path))
+    assert ("write", str(tmp_path)) in calls
+    assert calls[-1] == ("apply", True)
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_default_mask_does_not_hide_tools(external):
+    spec = SimpleNamespace(
+        traverse=lambda **kw: [SimpleNamespace(name="autoconf", external=external)]
+    )
+    assert build.default_hide_as_empty_dirs(spec) == ([] if external else ["/usr/share/aclocal"])
+
+
+# Phases 4-6 have no implementation tests yet. They cover the policy-driven
+# mount tree, build-phase confinement, and concretizer-worker evaluation.
