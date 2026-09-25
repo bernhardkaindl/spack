@@ -42,11 +42,11 @@ compensated for Landlock's inability to hide paths are not ported (see
   metadata. An activated tree must therefore support the whole install child,
   not only build phases. The old Landlock implementation confined only build
   phases, so its grant list is incomplete for this boundary.
-- The dormant `namespace_filesystem_policy_and_plan_from_inputs` requires
-  existing canonical paths, adds the parent of every mount target as a hidden
-  root, and rejects top-level targets. Selecting a runtime path such as the
-  Python standard library below `/usr/lib` would therefore hide `/usr/lib`
-  itself. Selecting a path below `/tmp` hides `/tmp`.
+- The earlier `namespace_filesystem_policy_and_plan_from_inputs` derived hidden
+  roots from mount targets. The selected policy now uses explicit hidden roots:
+  read-only paths outside them remain visible through the recursively read-only
+  inherited view, while explicit writable paths receive writable identity
+  mounts even when they are outside a hidden root.
 - Before staging, the stage directory does not exist, and `PrefixPivoter` has
   not yet moved an existing prefix. `rename(2)` or `rmdir(2)` on a mount point
   fails with `EBUSY`, so identity mounts of the stage or prefix conflict with
@@ -60,23 +60,22 @@ compensated for Landlock's inability to hide paths are not ported (see
   tree and reports the host library search path. The jobserver FIFO is created
   by `tempfile.mkdtemp()` in `spack.installer.posix`, below the temporary
   directory.
-- Policy data copied from the earlier branch: `share/spack/sandbox/sandbox.yaml`
-  (program groups, compiler aliases, compiler files, host and file runtime
-  paths, and a `commands` list for the `df` stub) and
-  `share/spack/sandbox/linux-header-policy.yaml`. Both are untracked copies.
+- Policy data is tracked in `share/spack/sandbox/sandbox.yaml` and
+  `share/spack/sandbox/linux-header-policy.yaml`. The namespace policy excludes
+  the earlier Landlock `commands` list and `df` stub.
 
 ## Case-by-case review
 
 ### Policy data
 
-- [ ] Keep one central, versioned policy source. Move the namespace constants
+- [x] Keep one central, versioned policy source. Move the namespace constants
   (hidden roots, replacement roots, device nodes, stage-tool programs) into
   `sandbox.yaml` instead of adding module constants. Keep the header policy
   in its own file for this series.
-- [ ] Do not port `commands` or `commands/df`; the stub answered
+- [x] Do not port `commands` or `commands/df`; the stub answered
   Landlock-denied filesystem queries. Revisit only if a real build fails under
   the namespace tree.
-- [ ] Treat `host_runtime_read_paths` as candidates, not grants. Library
+- [x] Treat `host_runtime_read_paths` as candidates, not grants. Library
   directories remain visible passthrough trees. `/etc` entries need a mount
   only if a selected root hides their parent.
 
@@ -141,26 +140,26 @@ compensated for Landlock's inability to hide paths are not ported (see
   regardless of where the checkout is hosted; the stage and chosen install
   prefix are separate writable locations, not writable grants to their
   containing repository or store roots.
-- [ ] Keep `/proc`, `/sys`, and network access visible and out of scope. A
+- [x] Keep `/proc`, `/sys`, and network access visible and out of scope. A
   network namespace would have to be created in trusted pre-thread setup,
   before mount authority is dropped; network policy needs its own design.
 
 ### Stage and prefix lifecycle
 
-- [ ] Keep the stage on the host-backed filesystem used by `spack stage` and
+- [x] Keep the stage on the host-backed filesystem used by `spack stage` and
   existing installs. The worker's writes to `spack-src` and `config.log`
   must be visible to the supervisor and user after failure; a successful
   build still removes its stage unless keep-stage is requested. The install
   prefix likewise remains host-backed and visible after successful install,
   with existing keep-prefix and rollback semantics on failure.
-- [ ] Preserve the child-owned stage lifecycle with a stable, host-backed,
+- [x] Preserve the child-owned stage lifecycle with a stable, host-backed,
   per-build parent created by trusted setup. Bind that parent read-write into
   the namespace and place the removable stage directory below it, so
   `Stage.destroy`, restaging, success cleanup, and failure retention operate
   on a child of the mount point rather than on the mount point itself. Keep
   the path visible in the supervisor namespace and avoid granting the shared
   stage root or another build's directory.
-- [ ] Move only prefix pivot and rollback to the supervisor. Before launching
+- [x] Move only prefix pivot and rollback to the supervisor. Before launching
   the worker, pivot any old prefix and create the empty host-backed target;
   the child bind-mounts that exact prefix read-write and never renames or
   removes the mount point. After the worker exits and its namespace is gone,
@@ -168,14 +167,13 @@ compensated for Landlock's inability to hide paths are not ported (see
   BinaryCacheMiss, garbage-removal, and old-prefix restoration rules. Keep
   prefix locking across the transaction and preserve the final path seen by
   build tools, so embedded paths and RPATHs do not change.
-- [ ] Fall back to supervisor-owned stage cleanup only if the stable-parent
-  layout cannot preserve the current stage path and lock semantics. Do not
-  expose a writable whole store, stage root, or Spack checkout to avoid the
-  mount-point constraint.
+- [x] Keep child-owned stage cleanup because the stable-parent layout preserves
+  the current stage path and lock semantics. Do not expose a writable whole
+  store, stage root, or Spack checkout to avoid the mount-point constraint.
 
 ### Mount-plan scratch
 
-- [ ] Distinguish *mount sources* (host files and directories selected as
+- [x] Distinguish *mount sources* (host files and directories selected as
   inputs to bind mounts, including read-only Spack repositories) from build
   *source stages* (`spack-src` and logs). `spack-preserved-host-paths` and
   `spack-empty-host-dirs` are private setup scratch for mount endpoints, not
@@ -367,9 +365,22 @@ grouping: A1-A3, B1-B3, and C1-C4.
   the worker when namespaces are available. Keep Landlock as the existing
   capability fallback only; do not add a config.yaml opt-in or diagnostic
   switch.
-- [ ] Exercise activated policy through a complete install-child lifecycle,
-  including the remaining home, device, writable-inventory, and failure-path
-  evidence gaps.
+- [x] D1, make the production-selected activation policy compilable. Treat
+  visible read-only candidates as inherited passthrough, restore writable
+  paths outside hidden roots after the recursive read-only remount, classify
+  devices only as writable, canonicalize Python runtime paths, and pass the
+  configured fetch cache rather than the misc cache. Focused production-path,
+  planner, and installer tests cover the resulting policy.
+- [ ] D2, configure the scoped worker home and temporary environment at
+  activation. Carry the worker root in the immutable activation payload; set
+  `HOME`, `XDG_CACHE_HOME`, `TMPDIR`, `TMP`, `TEMP`, `tempfile.tempdir`, and
+  Java `user.home`/`java.io.tmpdir` before `Tee` and recipe-controlled setup.
+  Prove all generated paths stay below the scoped worker root and remain
+  writable through the selected policy.
+
+After D2, complete `/dev` construction and then exercise the whole writable
+inventory plus stage/prefix success and failure semantics through a complete
+install-child lifecycle.
 
 ## Accepted improvements
 
@@ -514,3 +525,16 @@ grouping: A1-A3, B1-B3, and C1-C4.
   fallback. Added a project-wide directive against new config.yaml options
   because older Spack versions reject unknown bootstrap keys. Selected full
   install-child lifecycle evidence as the next work item.
+- 2026-09-26: Completed D1 after the first production-path activation test
+  exposed that `/dev/null` was selected both read-only and writable, the
+  configured misc cache was passed as the fetch cache, `sys.executable` could
+  be non-canonical, and visible read-only candidates were compiled as invalid
+  restoration mounts. Read-only passthrough now relies on the recursively
+  read-only inherited view, explicit writable identity mounts may be outside
+  hidden roots, an exact read-only selection cancels the matching hidden-root
+  candidate, a narrower writable mount may override a selected read-only
+  ancestor, and duplicate runtime/device selections resolve to writable device
+  access. `/usr/lib*` remain policy candidates pending real-install evidence,
+  while their exact runtime selections currently keep them as read-only
+  passthrough trees. Selected
+  D2 worker-local home and temporary environment setup next.
