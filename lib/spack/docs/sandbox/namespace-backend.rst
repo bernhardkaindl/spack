@@ -104,7 +104,9 @@ The capability probe must test:
   UID and GID; and
 * mount propagation containment ability, including ``MS_PRIVATE`` on the
   root mount and the directory bind mount required by the current masking
-  backend.
+  backend; and
+* dropping the user-namespace capability sets required after trusted mount
+  setup.
 
 The Phase 4 probe must additionally test tmpfs and every other mount operation
 introduced by the policy-driven mount tree before selecting that backend.
@@ -132,13 +134,20 @@ Process model
 
 The internal Linux namespace backend reuses the existing forked install child.
 The trusted installer supervisor creates that child through the existing
-``multiprocessing.Process`` launch path. Only the child calls
+``multiprocessing.Process`` launch path. Before starting its logging thread,
+the child freezes namespace availability, calls
 ``unshare(CLONE_NEWUSER | CLONE_NEWNS)``, configures UID and GID mappings,
-makes the root mount private, prepares the mount tree, and applies Landlock.
-The supervisor remains in the host namespaces and is not restricted.
+makes the root mount private, prepares the narrow mount tree, and drops all
+capabilities in the new user namespace. The supervisor remains in the host
+namespaces and is not restricted.
 
-Namespace entry happens before the child starts its logging thread. Landlock
-is applied later, immediately before the existing package build-phase loop.
+This closes the :term:`mount-authority window`: no recipe-controlled Python
+runs while the child holds the capability needed to create mounts. The child
+then starts logging and performs recipe-controlled staging, patching, and
+builder setup. Landlock grants and application still happen immediately before
+the existing package build-phase loop. Landlock's deny-by-default policy also
+does not grant the ``/proc`` UID/GID mapping writes required to turn a later
+nested user namespace into renewed mount authority.
 This is the same self-restriction pattern used by the Landlock-only backend:
 neither ``unshare()`` nor ``landlock_restrict_self()`` requires an intervening
 ``exec``.
@@ -349,10 +358,11 @@ by the existing install child.
 Phase 3: Integration with the install worker
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Integrate the namespace backend into the install worker's launch path. When
-the namespace backend is available, the existing Linux install child enters
-the namespace before starting child-local threads. It prepares the selected
-mount view and then applies Landlock immediately before the build phases.
+Integrate the namespace backend into the install worker's launch path. When the
+namespace backend is available, the existing Linux install child performs the
+trusted mount setup and drops namespace capabilities before starting
+child-local threads. It later applies Landlock immediately before the build
+phases.
 
 This phase does not require a second worker protocol or ``exec``. An external
 sandboxing tool may be added later as an alternate launcher, and a future
