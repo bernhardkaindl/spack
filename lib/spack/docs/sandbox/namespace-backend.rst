@@ -7,14 +7,17 @@ Namespace Backend Plan
 ======================
 
 This page plans a Linux user and mount namespace based sandbox backend that
-provides stronger isolation than Landlock alone and serves as the preferred
-confinement backend when available for the install worker and build-phase
-confinement.
+serves as the preferred confinement backend when available for the install
+worker and build-phase confinement. Its default filesystem policy hides host
+trees behind empty mounts and bind-mounts only allowlisted content, so normal
+negative lookups return ``ENOENT`` instead of Landlock's ``EPERM``.
 
-The existing Landlock stack is additive to this backend, not a replacement.
-Landlock continues to deny writes and restricts read and execute access to
-selected roots. The namespace backend adds the ability to truly hide host
-filesystem content rather than only denying access to it.
+Landlock inside the namespace is an optional diagnostic mode for testing how
+installations behave under permission-denied errors. It is not part of the
+target default namespace policy. The current narrow implementation still
+layers Landlock while the policy-driven mount tree is incomplete; removing it
+before every required read, write, and execute path has a namespace mapping
+would weaken confinement.
 
 Seccomp is not part of the current develop branch's sandbox implementation.
 It exists in an earlier exploratory sandbox branch
@@ -24,11 +27,10 @@ provides features that Landlock and namespaces alone cannot: seccomp user
 notifications and the ability to selectively intercept and mediate network
 syscalls, enabling an enforced proxy that performs hostname-based HTTP/HTTPS
 filtering through a CONNECT proxy. These capabilities would sit as an
-additional inner layer inside the Landlock and namespace confinement, not as
-a replacement for either. Seccomp should be treated as a late-stage
-enhancement to pursue only after the install-worker sandbox — with the
-namespace backend, Landlock, and the mount-tree helpers — is fully working and
-reliable.
+additional inner layer inside namespace confinement, not as a replacement for
+the mount policy. Seccomp should be treated as a late-stage enhancement to
+pursue only after the install-worker namespace and mount-tree helpers are fully
+working and reliable.
 
 Motivation
 ----------
@@ -57,10 +59,12 @@ Mount namespaces solve a different problem than Landlock:
      - User and mount namespaces
    * - Write denial
      - Yes, explicit rules deny writes to selected paths.
-     - Yes, inherited from the Landlock policy applied inside the namespace.
+     - Writable content is exposed only through planned writable mounts;
+       hidden and read-only trees are not writable.
    * - Read and execute restriction
      - Yes, explicit allow rules grant access to selected roots.
-     - Yes, inherited from the Landlock policy applied inside the namespace.
+     - Host trees are hidden and only allowlisted programs, libraries,
+       headers, and data are bind-mounted into the visible tree.
    * - File visibility
      - Denied paths produce ``-EPERM``. Directory entries remain visible.
      - Mount points can replace directory trees with empty tmpfs or other
@@ -84,8 +88,9 @@ Mount namespaces solve a different problem than Landlock:
        containment, and cleanup. User namespaces require UID and GID
        mapping setup.
 
-The namespace backend is therefore preferred when available because it can
-provide both Landlock's deny capabilities and true filesystem hiding.
+The namespace backend is therefore preferred when available because its
+filesystem view can express absence naturally instead of relying on
+permission-denied errors.
 
 Availability
 ------------
@@ -108,8 +113,9 @@ The capability probe must test:
 * dropping the user-namespace capability sets required after trusted mount
   setup.
 
-The Phase 4 probe must additionally test tmpfs and every other mount operation
-introduced by the policy-driven mount tree before selecting that backend.
+The probe tests tmpfs creation, read-only remounting, directory bind mounts,
+and capability dropping. Every additional mount operation introduced by the
+policy-driven tree must also be probed before selecting that backend.
 
 The probe returns a structured capability result with availability, the failed
 operation, and its reason. Completed child results are cached and inherited by
@@ -144,18 +150,16 @@ namespaces and is not restricted.
 This closes the :term:`mount-authority window`: no recipe-controlled Python
 runs while the child holds the capability needed to create mounts. The child
 then starts logging and performs recipe-controlled staging, patching, and
-builder setup. Landlock grants and application still happen immediately before
-the existing package build-phase loop. Landlock's deny-by-default policy also
-does not grant the ``/proc`` UID/GID mapping writes required to turn a later
-nested user namespace into renewed mount authority.
-This is the same self-restriction pattern used by the Landlock-only backend:
-neither ``unshare()`` nor ``landlock_restrict_self()`` requires an intervening
-``exec``.
+builder setup. The current transitional implementation applies Landlock before
+the build-phase loop because the mount policy is incomplete. The target
+namespace-only default must separately prevent writes to ``/proc`` UID/GID
+mapping files and exposure of tools that could create another namespace.
 
-On Landlock ABI 8 and newer, ``LANDLOCK_RESTRICT_SELF_TSYNC`` applies the
-Landlock domain to the child-local logging thread as well. On older ABIs that
-trusted thread is outside the Landlock domain, although it remains inside the
-mount namespace; it must not execute package recipe or build-tool code.
+When opt-in Landlock diagnostic mode is enabled, ABI 8 and newer apply the
+Landlock domain to the child-local logging thread with
+``LANDLOCK_RESTRICT_SELF_TSYNC``. On older ABIs that trusted thread remains
+outside the Landlock domain and must not execute package recipe or build-tool
+code.
 
 The forked child inherits loaded modules, Python objects, environment state,
 and open descriptors from the supervisor. The current boundary therefore
@@ -286,13 +290,15 @@ privileged capabilities. The namespace is unprivileged.
 Relationship to Landlock (and future seccomp)
 ----------------------------------------------
 
-The namespace backend does not replace Landlock. It complements it:
+The completed namespace backend replaces Landlock as the default filesystem
+policy for namespaced workers:
 
-* Landlock is applied inside the namespace after the mount tree is prepared.
-  It denies writes to paths that should not be writable and restricts read
-  and execute access to the selected roots. Inside the namespace, Landlock
-  operates on the visible mount tree, so its deny rules apply to the
-  bind-mounted content as well.
+* Empty mounts hide non-allowlisted host content. Read-only and writable bind
+  mounts expose only the content and mutation points required by the build.
+  Missing content therefore produces ``ENOENT`` instead of ``EPERM``.
+* Landlock may be enabled explicitly inside the namespace to test installation
+  behavior under permission-denied errors or to evaluate defense in depth. It
+  is not enabled by default once the mount policy is complete.
 
 * Seccomp is not part of the current develop branch's sandbox implementation.
   It exists in an earlier exploratory sandbox branch
@@ -302,15 +308,9 @@ The namespace backend does not replace Landlock. It complements it:
   notifications and the ability to selectively intercept and mediate network
   syscalls, enabling an enforced proxy that performs hostname-based HTTP/HTTPS
   filtering through a CONNECT proxy. When added, seccomp would sit as an
-  additional inner layer inside the Landlock and namespace confinement, not as
-  a replacement for either. It should be pursued only after the install-worker
-  sandbox — with the namespace backend, Landlock, and the mount-tree helpers —
-  is fully working and reliable.
-
-* The combination of the namespace backend and Landlock already provides
-  defense in depth: the mount tree limits what the worker can see, and Landlock
-  denies writes and restricts access to what it can see. Seccomp would add
-  further syscall-level mediation on top of that foundation.
+  additional inner layer inside namespace confinement, not as a replacement
+  for the mount policy. It should be pursued only after the install-worker
+  namespace and mount-tree helpers are fully working and reliable.
 
 Differences from the current narrow namespace usage
 ----------------------------------------------------
@@ -385,18 +385,17 @@ Phase 3: Integration with the install worker
 Integrate the namespace backend into the install worker's launch path. When the
 namespace backend is available, the existing Linux install child performs the
 trusted mount setup and drops namespace capabilities before starting
-child-local threads. It later applies Landlock immediately before the build
-phases.
+child-local threads. The current narrow integration later applies Landlock
+immediately before the build phases as a transitional constraint until the
+complete namespace filesystem policy is implemented.
 
 This phase does not require a second worker protocol or ``exec``. An external
 sandboxing tool may be added later as an alternate launcher, and a future
 fresh-exec boundary may harden inherited-state and recipe-import isolation.
 
-The existing Landlock policies remain valid inside the namespace.
-They operate on the visible mount tree, so their rules apply to the
-bind-mounted content. Seccomp policies from the earlier exploratory branch
-may be added later as a further inner layer; see `Relationship to Landlock
-(and future seccomp)`_.
+Landlock remains available as an opt-in diagnostic mode inside the namespace.
+Seccomp policies from the earlier exploratory branch may be added later as a
+further inner layer; see `Relationship to Landlock (and future seccomp)`_.
 
 Phase 4: Policy-driven mount tree
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -411,11 +410,12 @@ list. The policy derives from:
 * The package-repository roots and Spack source tree.
 * The stage, prefix, and temporary directories.
 
-The policy is the same source as the existing Landlock allow rules, but it
-now drives both Landlock grants and mount-tree setup. A path that appears in
-the Landlock allow set may also appear as a bind mount in the namespace
-backend. A path that is not in the allow set is hidden by a tmpfs mount if
-it is in a directory that the namespace backend hides.
+The policy initially derives from the paths represented by the existing
+Landlock grants, but it must classify them as hidden roots, read-only bind
+mounts, writable bind mounts, or generated namespace-local paths. A path that
+is not allowlisted is absent below a hidden root. Once every required path is
+represented and validated, the namespaced worker stops applying Landlock by
+default.
 
 Phase 5: Build-phase confinement
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -451,8 +451,8 @@ Decision gates
 * [ ] A future Windows worker that confines recipe Python is created directly
   inside AppContainer; this platform-specific requirement does not constrain
   Linux launch design.
-* [ ] Landlock remains in force inside the namespace; seccomp is a later-stage
-  addition not yet in the develop branch.
+* [ ] Namespace mounts provide the complete default filesystem policy;
+  Landlock is opt-in for permission-denied behavior testing.
 * [x] The capability probe reports specific reasons when the namespace backend
   is unavailable.
 * [x] The command never launches an unconstrained worker when the namespace

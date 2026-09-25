@@ -24,8 +24,8 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   logging thread, the existing forked Linux install child completes trusted
   namespace mount setup and drops mount authority. It applies Landlock before
   build phases. The supervisor remains unaffected.
-- [ ] Phase 4, policy-driven mount tree (immutable plan validation is complete;
-  source preservation and policy-derived mounts remain open).
+- [ ] Phase 4, policy-driven mount tree (immutable plan validation and
+  non-writable mask sources are complete; policy-derived mounts remain open).
 - [ ] Phase 5, complete build-phase policy validation and hardening.
 - [ ] Phase 6, concretizer-worker evaluation.
 
@@ -67,9 +67,9 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   aliases, validates source/target types and target containment below a hidden
   directory, stages sources before masks, and restores them by increasing
   target depth. Recursive binds are limited to preserved directory trees.
-- [ ] Use mask sources that remain non-writable after confinement. The current
-  stage-owned source hides host content but can be populated through the
-  writable stage path, so it is not a permanent-empty foundation for Phase 4.
+- [x] Use mask sources that remain non-writable after confinement. Mask sources
+  are populated in a private tmpfs and remounted read-only before mask binds
+  are exposed. Landlock write grants to the stage cannot populate the source.
 
 ### Landlock composition and installer errors
 
@@ -111,10 +111,10 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   preservation and restoration order. Plan-level regressions prove invalid
   plans fail before namespace entry.
 
-- [ ] Use non-writable empty mask sources. Replace the current writable
-  stage-owned mask directory with an immutable source that remains empty after
-  Landlock write grants, and add a real-kernel regression for attempted source
-  modification.
+- [x] Use non-writable empty mask sources. The mask-source root is a private
+  tmpfs remounted read-only after planned endpoints are created. The capability
+  probe checks tmpfs creation and remounting, and a real-kernel regression
+  grants stage write access before attempting source and target modifications.
 
 ### Tests and documentation structure
 
@@ -161,6 +161,11 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   for files.
 - The integration test checks actual `ENOENT` visibility and parent isolation
   without masking system directories.
+- Mask sources live on a read-only tmpfs, so writable stage grants cannot
+  populate the empty view through either the source or target alias.
+- The namespace filesystem policy is intended to be the default confinement;
+  Landlock is retained in the current narrow integration only as a transitional
+  constraint and should become opt-in for permission-denied behavior tests.
 - The status page is candid about the narrow `/usr/share/aclocal` policy and the
   optional inherited-state and pre-import hardening that Phase 3 does not claim.
 
@@ -245,3 +250,12 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   target-depth order; merged-``/usr`` aliases are resolved to canonical targets.
   Added policy-level ordering and pre-entry failure regressions, and selected
   non-writable empty mask sources as the next work item.
+- 2026-09-26: Replaced writable stage-owned mask directories with a private
+  tmpfs source root. Planned endpoints are created before the root is remounted
+  read-only, then mask binds and preserved-source restoration proceed from that
+  immutable view. Extended the disposable capability probe to cover tmpfs and
+  read-only remount operations, and added a real-kernel regression that grants
+  stage writes before attempting source and target modification. The current
+  namespace backend still layers Landlock until policy-derived allowlist mounts
+  are complete; selected that policy and the explicit Landlock diagnostic mode
+  as the next work.
