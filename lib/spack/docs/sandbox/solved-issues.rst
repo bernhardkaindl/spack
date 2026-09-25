@@ -34,7 +34,7 @@ The build worker now enters a private user and mount namespace before starting w
 The build observes an empty directory instead of a ``-EPERM`` failure and cannot use host Autoconf macros.
 The mask is skipped when the concrete DAG provides an external ``autoconf`` dependency, because a host Autoconf legitimately uses its own system macro directory.
 
-This Linux-specific workaround demonstrates masking selected host directories as empty without granting them access or returning ``-EPERM``. It is a narrow instance of the Linux user and mount namespace backend described in :doc:`namespace-backend`, which generalizes the approach to hiding host ``bin``, ``include``, and other directories by mounting empty tmpfs over them and bind-mounting only whitelisted content.
+This Linux-specific workaround demonstrates masking selected host directories as empty without granting their host content or returning ``-EPERM``. It is a narrow instance of the Linux user and mount namespace backend described in :doc:`namespace-backend`; Phase 4 will generalize the approach to hiding host ``bin``, ``include``, and other directories and bind-mounting only whitelisted content.
 It requires unprivileged user and mount namespaces; when they are unavailable, Spack warns and preserves the existing Landlock behavior.
 A focused real-kernel test verifies that the bind mount appears empty, and ``isa-l`` completes with the mask enabled.
 
@@ -57,17 +57,17 @@ Missing policy paths are ignored, which lets one relative-path inventory cover g
 The selected compiler reports its GCC installation through ``-print-libgcc-file-name``.
 GCC receives the matching libstdc++ version.
 Other C++ compilers receive the newest installed libstdc++ version no newer than the policy's compatibility ceiling, currently GCC 15.
-The worker masks competing host GCC installation candidates so Clang's GCC detector selects the same version that Landlock permits.
+The planned worker policy masks competing host GCC installation candidates so Clang's GCC detector selects the same version that Landlock permits.
 Both target-first and version-first multiarch libstdc++ layouts are supported.
 It does not change compiler selection recorded in the concrete spec.
 
-This compatibility policy uses the Linux user and mount namespace backend described in :doc:`namespace-backend` to mask competing host GCC installation candidates so Clang's GCC detector selects the same version that Landlock permits.
-If unprivileged user and mount namespaces are unavailable, Spack emits the existing masking warning.
-Landlock still denies non-allowlisted header paths, but Clang may select a masked-out GCC installation and fail instead of falling back.
-Other namespace and mount errors still fail before recipe-controlled build phases run.
+Phase 4 of the Linux user and mount namespace backend described in :doc:`namespace-backend` will use this compatibility policy to mask competing host GCC installation candidates so Clang's GCC detector selects the same version that Landlock permits. The current narrow namespace integration does not yet implement those policy-driven masks.
+When implemented, unavailable namespaces will select constrained Landlock fallback.
+Landlock will still deny non-allowlisted header paths, but Clang may select a masked-out GCC installation and fail instead of falling back.
+Other namespace and mount errors will remain fatal after namespace setup starts.
 
-Focused policy tests prove that the ``/usr/include`` parent is absent, required libc and Linux roots are present, only the selected libstdc++ version is granted, GCC 16 receives its own headers, and competing GCC installations are selected for masking.
-The existing real-kernel masking test proves that every selected directory appears empty inside the private namespace.
+The development-branch policy tests prove that the ``/usr/include`` parent is absent, required libc and Linux roots are present, only the selected libstdc++ version is granted, GCC 16 receives its own headers, and competing GCC installations are selected for masking.
+The current real-kernel namespace test proves only that its selected temporary directory initially appears empty inside the private namespace and remains unchanged in the parent.
 
 .. _sandbox-solved-stage-git-mirror-fallback:
 

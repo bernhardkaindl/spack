@@ -13,11 +13,15 @@ fallback.
 """
 
 import ctypes
+import enum
 import errno
+import json
 import os
 import platform
+import shutil
+import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, List, Optional
+from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Optional
 
 from spack.sandbox import Sandbox, SandboxError
 
@@ -32,11 +36,51 @@ MS_PRIVATE = 0x00040000
 MS_REC = 0x00004000
 
 
+class NamespaceCapability(NamedTuple):
+    """Result of probing unprivileged user and mount namespaces."""
+
+    available: bool
+    operation: Optional[str]
+    reason: Optional[str]
+
+
+class NamespaceSandboxBackend(enum.Enum):
+    """Backend selected after the namespace capability probe."""
+
+    NAMESPACE = "namespace"
+    LANDLOCK = "landlock"
+    UNCONSTRAINED = "unconstrained"
+
+
+class NamespaceSandboxDecision(NamedTuple):
+    """Namespace preference and its constrained fallback decision."""
+
+    backend: NamespaceSandboxBackend
+    capability: NamespaceCapability
+
+    @property
+    def is_fallback(self) -> bool:
+        return self.backend is not NamespaceSandboxBackend.NAMESPACE
+
+    @property
+    def is_constrained(self) -> bool:
+        return self.backend is not NamespaceSandboxBackend.UNCONSTRAINED
+
+
+class NamespaceSetupError(OSError):
+    """Failure of a specific namespace setup operation."""
+
+    def __init__(self, error_number: int, operation: str, reason: str) -> None:
+        super().__init__(error_number, f"{operation}: {reason}")
+        self.operation = operation
+        self.reason = reason
+
+
 def _check_syscall(result: int, name: str) -> int:
     """Raise OSError if a libc syscall returned a negative value."""
     if result < 0:
         err = ctypes.get_errno()
-        raise OSError(err, f"{name}: {os.strerror(err)}")
+        raise NamespaceSetupError(err, name, os.strerror(err))
     return result
 
 
@@ -46,7 +90,12 @@ _namespace_entered_pids: set = set()
 
 # The installer probes before launching build workers. POSIX workers inherit
 # this result, avoiding a second fork after their logging thread has started.
-_namespace_probe_result: Optional[bool] = None
+_namespace_probe_result: Optional[NamespaceCapability] = None
+
+
+def _raise_namespace_setup_error(operation: str, error: OSError) -> NoReturn:
+    reason = error.strerror or str(error)
+    raise NamespaceSetupError(error.errno or errno.EIO, operation, reason) from error
 
 
 def _enter_user_mount_namespace(libc, _probe_child: bool = False) -> None:
@@ -75,11 +124,17 @@ def _enter_user_mount_namespace(libc, _probe_child: bool = False) -> None:
             stream.write("deny")
     except OSError as error:
         if error.errno != errno.ENOENT:
-            raise
-    with open("/proc/self/uid_map", "w", encoding="ascii") as stream:
-        stream.write("{0} {0} 1".format(user_id))
-    with open("/proc/self/gid_map", "w", encoding="ascii") as stream:
-        stream.write("{0} {0} 1".format(group_id))
+            _raise_namespace_setup_error("write /proc/self/setgroups", error)
+    try:
+        with open("/proc/self/uid_map", "w", encoding="ascii") as stream:
+            stream.write("{0} {0} 1".format(user_id))
+    except OSError as error:
+        _raise_namespace_setup_error("write /proc/self/uid_map", error)
+    try:
+        with open("/proc/self/gid_map", "w", encoding="ascii") as stream:
+            stream.write("{0} {0} 1".format(group_id))
+    except OSError as error:
+        _raise_namespace_setup_error("write /proc/self/gid_map", error)
     _check_syscall(
         libc.mount(None, b"/", None, ctypes.c_ulong(MS_REC | MS_PRIVATE), None),
         "mount(MS_PRIVATE)",
@@ -87,22 +142,59 @@ def _enter_user_mount_namespace(libc, _probe_child: bool = False) -> None:
     _namespace_entered_pids.add(my_pid)
 
 
-def _namespace_available(libc) -> bool:
+def _encode_capability(capability: NamespaceCapability) -> bytes:
+    return json.dumps(capability._asdict(), sort_keys=True).encode("utf-8")
+
+
+def _decode_capability(payload: bytes) -> NamespaceCapability:
+    if not payload:
+        return NamespaceCapability(False, "namespace setup", "probe child returned no result")
+    try:
+        result = json.loads(payload.decode("utf-8"))
+        return NamespaceCapability(
+            bool(result["available"]), result.get("operation"), result.get("reason")
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError) as error:
+        return NamespaceCapability(False, "decode probe result", str(error))
+
+
+def _probe_namespace_capability(libc) -> NamespaceCapability:
     """Probe namespace setup in a disposable child process.
 
     Forks, runs ``_enter_user_mount_namespace`` in the child, and reports
-    the result through a pipe. The parent is never affected.
+    a structured result through a pipe. The parent is never affected.
     """
 
     fork_fn = getattr(os, "fork", None)
     if fork_fn is None:
-        return False
-    read_fd, write_fd = os.pipe()
+        return NamespaceCapability(False, "fork", "os.fork is unavailable")
+    probe_root = None
+    try:
+        probe_root = tempfile.mkdtemp(prefix="spack-namespace-probe-")
+        bind_source = os.path.join(probe_root, "source")
+        bind_target = os.path.join(probe_root, "target")
+        os.mkdir(bind_source)
+        os.mkdir(bind_target)
+    except OSError as error:
+        if probe_root is not None:
+            shutil.rmtree(probe_root, ignore_errors=True)
+        _raise_namespace_setup_error("prepare directory bind probe", error)
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError as error:
+        shutil.rmtree(probe_root, ignore_errors=True)
+        _raise_namespace_setup_error("create namespace probe pipe", error)
     try:
         pid = fork_fn()
+    except OSError as error:
+        os.close(read_fd)
+        os.close(write_fd)
+        shutil.rmtree(probe_root, ignore_errors=True)
+        _raise_namespace_setup_error("fork namespace probe", error)
     except BaseException:
         os.close(read_fd)
         os.close(write_fd)
+        shutil.rmtree(probe_root, ignore_errors=True)
         raise
     if pid == 0:
         # Never unwind into the caller in the forked child, even when setup
@@ -111,21 +203,77 @@ def _namespace_available(libc) -> bool:
             os.close(read_fd)
             try:
                 _enter_user_mount_namespace(libc, _probe_child=True)
-            except OSError:
-                result = b"0"
+                _check_syscall(
+                    libc.mount(
+                        os.fsencode(bind_source),
+                        os.fsencode(bind_target),
+                        None,
+                        ctypes.c_ulong(MS_BIND),
+                        None,
+                    ),
+                    "mount(MS_BIND probe)",
+                )
+            except NamespaceSetupError as error:
+                result = NamespaceCapability(False, error.operation, error.reason)
+            except OSError as error:
+                result = NamespaceCapability(False, "namespace setup", str(error))
+            except BaseException as error:
+                result = NamespaceCapability(
+                    False, "namespace setup", f"{type(error).__name__}: {error}"
+                )
             else:
-                result = b"1"
-            os.write(write_fd, result)
+                result = NamespaceCapability(True, None, None)
+            os.write(write_fd, _encode_capability(result))
         finally:
             os._exit(0)
 
     os.close(write_fd)
     try:
-        result = os.read(read_fd, 1)
-        return result == b"1"
+        chunks = []
+        try:
+            while True:
+                chunk = os.read(read_fd, 4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        except OSError as error:
+            _raise_namespace_setup_error("read namespace probe result", error)
+        return _decode_capability(b"".join(chunks))
     finally:
         os.close(read_fd)
-        os.waitpid(pid, 0)
+        try:
+            os.waitpid(pid, 0)
+        finally:
+            shutil.rmtree(probe_root, ignore_errors=True)
+
+
+def namespace_sandbox_capability(libc: Optional[ctypes.CDLL] = None) -> NamespaceCapability:
+    """Return structured availability for unprivileged user and mount namespaces.
+
+    Completed default-libc probes are cached. Parent-side operational failures
+    remain retryable until a worker explicitly freezes its pre-thread result.
+    """
+    global _namespace_probe_result
+
+    if platform.system() != "Linux":
+        return NamespaceCapability(False, "platform", "Linux is required")
+    use_cache = libc is None
+    if use_cache and _namespace_probe_result is not None:
+        return _namespace_probe_result
+    try:
+        if libc is None:
+            try:
+                libc = ctypes.CDLL(None, use_errno=True)
+            except OSError as error:
+                _raise_namespace_setup_error("load libc", error)
+        result = _probe_namespace_capability(libc)
+    except NamespaceSetupError as error:
+        return NamespaceCapability(False, error.operation, error.reason)
+    except OSError as error:
+        return NamespaceCapability(False, "run namespace probe", str(error))
+    if use_cache:
+        _namespace_probe_result = result
+    return result
 
 
 def namespace_sandbox_available(libc: Optional[ctypes.CDLL] = None) -> bool:
@@ -134,22 +282,18 @@ def namespace_sandbox_available(libc: Optional[ctypes.CDLL] = None) -> bool:
     Returns ``False`` off Linux or when the probe fails. Returns ``True`` when
     such a namespace can be created.
     """
-    global _namespace_probe_result
+    return namespace_sandbox_capability(libc).available
 
-    if platform.system() != "Linux":
-        return False
-    use_cache = libc is None
-    if use_cache and _namespace_probe_result is not None:
-        return _namespace_probe_result
-    try:
-        if libc is None:
-            libc = ctypes.CDLL(None, use_errno=True)
-        result = _namespace_available(libc)
-    except OSError:
-        return False
-    if use_cache:
-        _namespace_probe_result = result
-    return result
+
+def namespace_sandbox_decision() -> NamespaceSandboxDecision:
+    """Prefer namespaces and otherwise select the constrained Landlock fallback."""
+    capability = namespace_sandbox_capability()
+    backend = (
+        NamespaceSandboxBackend.NAMESPACE
+        if capability.available
+        else NamespaceSandboxBackend.LANDLOCK
+    )
+    return NamespaceSandboxDecision(backend, capability)
 
 
 def prepare_empty_directory_masking(
@@ -171,10 +315,10 @@ def prepare_empty_directory_masking(
         return False
     if os.getpid() in _namespace_entered_pids:
         return True
-    available = namespace_sandbox_available(libc)
+    capability = namespace_sandbox_capability(libc)
     if cache_unavailable and libc is None and _namespace_probe_result is None:
-        _namespace_probe_result = available
-    if not available:
+        _namespace_probe_result = capability
+    if not capability.available:
         return False
     if libc is None:
         libc = ctypes.CDLL(None, use_errno=True)
