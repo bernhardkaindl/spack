@@ -682,3 +682,10 @@ not close that lifecycle gap.
   selection; noncanonical spellings fail closed. The production assembler
   regression starts with an absent cache and passes. Selected E1.2, retry the
   real install and address the next concrete worker failure.
+- 2026-09-26: The first E1.2 retry passed fetch-cache selection, then failed
+  while preparing `compiler-wrapper`: its concrete spec has no compiler
+  virtual dependencies, and its install method only copies Spack's wrapper
+  script and creates links. Policy selection now permits empty compiler and
+  compiler-header inputs while retaining required tools, runtime, and temporary
+  paths; a focused regression proves no compiler executable is exposed. Retry
+  the real install after this fix.
