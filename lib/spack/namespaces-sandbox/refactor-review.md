@@ -226,7 +226,7 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
   devices are not duplicated across access categories; Python runtime paths
   are canonical; and installer setup supplies the configured fetch cache.
 
-- [ ] D2, configure worker-local home and temporary state during automatic
+- [x] D2, configure worker-local home and temporary state during automatic
   activation. Carry the scoped worker root in the immutable payload and set
   home, XDG cache, POSIX temporary, Python temporary, and Java home/temporary
   settings before threads or recipe-controlled setup. Add focused environment
@@ -238,11 +238,19 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
     after authority drop, and the pre-`Tee` ordering regression.
   2. [x] D2.2: containment, setup-failure/fallback isolation, parent-state
     preservation, environment cleaning, and real-namespace write evidence.
-  3. [ ] D2.3: final backend documentation and ledger reconciliation; close D2
+  3. [x] D2.3: final backend documentation and ledger reconciliation; close D2
     and select D3 private `/dev` construction.
 
-After D2, complete the private `/dev` view and run the whole writable inventory
-and stage/prefix failure semantics through a complete install-child lifecycle.
+- [ ] D3, complete the private `/dev` view. Preserve selected device binds,
+  add fresh per-worker `/dev/shm` tmpfs and the fd/stdin/stdout/stderr links,
+  validate the immutable plan, and probe the additional operations before
+  activation. Require disposable-kernel device/link/shared-memory behavior,
+  host and concurrent-worker isolation, authority-drop ordering, and fatal
+  failure tests. Add no config settings or broad host-device grants.
+
+After D3, run the whole writable inventory and stage/prefix success and failure
+semantics through a complete install-child lifecycle. D2 is focused activation
+evidence, not completion of that deferred integration work.
 
 - [x] Materialize the complete trusted input selection in trusted installer
   setup. Select the complete hidden host/device roots; resolve the concrete
@@ -552,3 +560,10 @@ and stage/prefix failure semantics through a complete install-child lifecycle.
   the authority-drop boundary and fail-closed behavior; the accepted same-UID
   pre-bind race remains. All 161 affected tests and Ruff pass. D2.3 final
   documentation is next, not full install-child lifecycle certification.
+- 2026-09-26: Completed D2.3, reconciled the backend documentation and both
+  ledgers, and closed D2. Recorded environment defaults versus mount-enforced
+  access, Java override limitations, and the distinction between disposable
+  activation evidence and full install-child lifecycle proof. Isolated Sphinx
+  validation avoids the repository's update and API-generation hooks. Selected
+  D3 private `/dev` construction with fresh shared memory, descriptor links,
+  capability coverage, isolation, and fatal-failure tests as the next item.

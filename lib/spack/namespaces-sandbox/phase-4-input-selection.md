@@ -121,7 +121,7 @@ compensated for Landlock's inability to hide paths are not ported (see
   prove recursive setup, `EROFS` for inherited passthrough writes, and writes
   through selected writable mounts. The live worker activates the selected
   policy when namespace capability probing succeeds.
-- [ ] Hide `/home`, `/root`, and `/run/user`; restore the Spack source, store,
+- [x] Hide `/home`, `/root`, and `/run/user`; restore the Spack source, store,
   repository, configuration, and cache paths located there. Point `HOME`,
   `XDG_CACHE_HOME`, and Java `user.home`/`java.io.tmpdir` at the scoped
   worker tree, alongside `TMPDIR`, `TMP`, `TEMP`, and `tempfile.tempdir`.
@@ -349,6 +349,15 @@ once. Port behavior, not implementation details.
 - [x] C1, `installer: preserve host-visible stage and prefix lifecycles`,
   using a stable per-build stage parent and supervisor-owned prefix pivot.
 
+- [ ] D3, complete private `/dev` construction. Keep the existing selected
+  device bind mounts, including `/dev/urandom`; add a fresh per-worker tmpfs
+  at `/dev/shm` and generated `/dev/fd`, `/dev/stdin`, `/dev/stdout`, and
+  `/dev/stderr` links. First extend and validate the immutable mount plan,
+  then update capability probing and trusted pre-thread activation, and prove
+  descriptor-link behavior, writable shared memory, worker/host isolation,
+  and fail-closed setup in disposable namespaces. Do not broaden host device
+  exposure or add config settings. Whole-install lifecycle proof is separate.
+
 ## Proposed sequence
 
 Each item is one commit with focused tests and documentation. Suggested PR
@@ -371,7 +380,7 @@ grouping: A1-A3, B1-B3, and C1-C4.
   devices only as writable, canonicalize Python runtime paths, and pass the
   configured fetch cache rather than the misc cache. Focused production-path,
   planner, and installer tests cover the resulting policy.
-- [ ] D2, configure the scoped worker home and temporary environment at
+- [x] D2, configure the scoped worker home and temporary environment at
   activation. Carry the worker root in the immutable activation payload; set
   `HOME`, `XDG_CACHE_HOME`, `TMPDIR`, `TMP`, `TEMP`, `tempfile.tempdir`, and
   Java `user.home`/`java.io.tmpdir` before `Tee` and recipe-controlled setup.
@@ -380,7 +389,7 @@ grouping: A1-A3, B1-B3, and C1-C4.
 
   ### D2 commit steps
 
-  Each step is a separate commit; D2 stays open until all three are verified.
+  Each step is a separate commit; all three are now verified.
 
   1. [x] D2.1, carry the worker root and configure the confined child. Validate
     writable identity-mount coverage before mounting; create private home,
@@ -390,13 +399,13 @@ grouping: A1-A3, B1-B3, and C1-C4.
   2. [x] D2.2, prove containment and failure isolation. Cover invalid roots,
     pre-existing child paths, setup failures, unchanged fallback and parent
     state, environment cleaning, and real-namespace writable state.
-  3. [ ] D2.3, reconcile the backend documentation and both review ledgers with
+  3. [x] D2.3, reconcile the backend documentation and both review ledgers with
     verified evidence and limitations. Close D2 and select private `/dev`
     construction as D3, keeping full install-child lifecycle proof separate.
 
-After D2, complete `/dev` construction and then exercise the whole writable
-inventory plus stage/prefix success and failure semantics through a complete
-install-child lifecycle.
+Next is D3 `/dev` construction, followed by the whole writable inventory and
+stage/prefix success and failure semantics through a complete install-child
+lifecycle. D2's disposable activation test does not close that lifecycle gap.
 
 ## Accepted improvements
 
@@ -585,3 +594,12 @@ install-child lifecycle.
   same-UID pre-bind substitution limitation is unchanged. All 161 affected
   tests and Ruff checks pass. D2.3 documentation reconciliation is next;
   complete install-child lifecycle evidence remains deferred.
+- 2026-09-26: Completed D2.3 and closed D2 after its three separately
+  committed steps. Documented the activation sequence, inherited Java option
+  handling, parent/fallback isolation, and focused real-kernel/JVM evidence in
+  `namespace-backend.rst`. Environment values are defaults, not confinement:
+  recipes and other Java option channels can override them while mounts still
+  enforce access. Isolated Sphinx validation checks this page without running
+  repository-update or generated-API hooks. Selected D3 private `/dev`
+  construction next; retained the full install-child lifecycle gap and the
+  accepted same-UID pre-bind substitution limitation.
