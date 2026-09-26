@@ -13,7 +13,7 @@ Shared user and mount namespaces
 
 Evaluate a per-invocation unprivileged user and mount namespace shared by the proxy and worker, as described in :doc:`namespace-backend`. This can hide the proxy loopback listener from unrelated host-namespace processes and replace host ``bin``, ``include``, and other directories with empty tmpfs mounts, bind-mounting only whitelisted content into the visible tree.
 
-The namespace backend is the preferred Linux confinement backend when available. Its completed mount policy is the default filesystem confinement and exposes only allowlisted content, avoiding Landlock ``EPERM`` failures for paths that should appear absent. Landlock inside the namespace is an opt-in diagnostic mode. The current narrow integration still layers Landlock until that mount policy is complete. When namespaces are unavailable, the existing Landlock-only backend is selected as a constrained fallback. The shared ``config:sandbox:allow_fallback`` setting applies only when no sandbox worker is available and trusted direct execution is considered.
+The namespace backend is the preferred Linux confinement backend when available. Its completed mount policy is the default filesystem confinement and exposes only allowlisted content, avoiding Landlock ``EPERM`` failures for paths that should appear absent. Landlock is not layered into an active namespace policy. When namespaces are unavailable, the existing Landlock-only backend is selected as a constrained fallback. The shared ``config:sandbox:allow_fallback`` setting applies only when no sandbox worker is available and trusted direct execution is considered.
 
 The internal Linux backend self-restricts the existing forked install child, leaving the trusted installer supervisor outside the namespace. A future external launcher such as Bubblewrap may use a fresh executed worker. A future Windows worker that confines recipe Python must be created inside AppContainer, but that platform-specific requirement does not determine the Linux process model.
 
@@ -29,8 +29,8 @@ The internal Linux backend self-restricts the existing forked install child, lea
    * - Process layout
      - Before starting child-local threads, the existing forked Linux install
        child completes trusted namespace mount setup and drops namespace
-       capabilities. The current transition applies Landlock before build
-       phases; the completed mount policy does not enable it by default.
+       capabilities before recipe-controlled install work begins. The
+       completed mount policy replaces Landlock for that worker.
        External launcher backends may instead execute a fresh worker.
    * - Supervisor
      - The seccomp supervisor can remain outside the shared namespace while it

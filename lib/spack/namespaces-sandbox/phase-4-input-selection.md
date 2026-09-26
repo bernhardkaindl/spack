@@ -126,10 +126,10 @@ compensated for Landlock's inability to hide paths are not ported (see
   `XDG_CACHE_HOME`, and Java `user.home`/`java.io.tmpdir` at the scoped
   worker tree, alongside `TMPDIR`, `TMP`, `TEMP`, and `tempfile.tempdir`.
   Apply environment changes only at activation.
-- [ ] Hide `/dev`; restore `null`, `zero`, `full`, `random`, `urandom`, and
+- [x] Hide `/dev`; restore `null`, `zero`, `full`, `random`, `urandom`, and
   `tty` as device bind mounts. Mount a fresh tmpfs at `/dev/shm`, and generate
   the `/dev/fd`, `/dev/stdin`, `/dev/stdout`, and `/dev/stderr` symlinks.
-- [ ] Inventory the whole-child writable set: stage, install prefix,
+- [x] Inventory the whole-child writable set: stage, install prefix,
   `request.log_path`, jobserver FIFO, fetch cache, scoped worker tree, and the
   explicitly configured `allow_write` paths. Inventory the read-only set:
   dependency prefixes, repositories and their Python paths, partitioned Spack
@@ -419,7 +419,7 @@ Next is E1, the whole writable inventory and full install-child lifecycle,
 starting with a real sandboxed `spack install m4`. D2/D3 activation tests do
 not close that lifecycle gap.
 
-- [ ] E1, inventory all paths touched by the complete install child and make
+- [x] E1, inventory all paths touched by the complete install child and make
   `spack install m4` succeed under automatic namespace activation. Start with a
   real constrained install and record exact missing/read-only/writable paths;
   repair only trusted selectors and mount-plan semantics required by those
@@ -433,11 +433,11 @@ not close that lifecycle gap.
 1. [x] E1.1, prepare narrowly selected persistent roots that Spack normally
    creates lazily before immutable writable-path validation; reject
    noncanonical roots and test fresh-install assembly.
-2. [-] E1.2, repeatedly run real sandboxed `spack install m4`, record each
+2. [x] E1.2, repeatedly run real sandboxed `spack install m4`, record each
    production selection/lifecycle failure, and fix the smallest trusted
    boundary responsible. Keep complete install-child evidence separate from
    synthetic planner tests.
-3. [ ] E1.3, verify successful prefix/log/store visibility and failure-stage
+3. [x] E1.3, verify successful prefix/log/store visibility and failure-stage
    retention, prefix rollback/keep behavior, then reconcile both ledgers and
    select the next outstanding sandbox-docs item.
 
@@ -761,4 +761,13 @@ not close that lifecycle gap.
   most of its support library, then its build script failed on missing `ar`.
   `ar` was already in `binutils_programs`; that group now participates in the
   install-tool union. Compiler-internal helpers remain selected by exact
-  compiler queries. Retry the real install.
+  compiler queries.
+- 2026-09-26: The next real sandboxed install completed `m4@1.4.21` in the
+  isolated `/tmp/spack-m4-worktree-install` store. `spack find -p m4` reports
+  the installed prefix; `bin/m4` and `.spack/spack-build-out.txt.gz` are
+  present there, and the successful m4 stage parent is absent. The gmake
+  failure logs remain in the stage root. `TestBuildLifecycle` passes its
+  success cleanup, keep-stage, failure-stage retention, and prefix rollback
+  cases; the live namespace worker test confirms a stage nested below the
+  temporary-root replacement remains visible. E1.1-E1.3 are complete. Select
+  Phase 5 build-phase policy validation and hardening as the next work item.

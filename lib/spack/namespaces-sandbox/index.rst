@@ -37,36 +37,18 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   empty-directory masking, and bind-mount primitives are implemented. The
   policy-driven tmpfs tree, preserved mount sources, namespace handle, and
   explicit cleanup interface remain open.
-* **Phase 3 -- complete for the narrow integration:** before starting its
-  logging thread, the current build worker performs trusted namespace mount
-  setup and drops mount authority. The installer applies Landlock before build
-  phases. The broader mount policy is Phase 4.
-* **Phase 4 -- selected-tree compiler complete, whole-host policy open:** the current narrow
-  mask is represented by an immutable, validated, deterministic mount plan
-  before namespace mutation. Its empty sources are private tmpfs mounts
-  remounted read-only before exposure, so stage write grants cannot populate
-  them. Explicit preserved sources declare read-only or read-write access, are
-  staged before hiding parents, and are restored through canonical
-  merged-``/usr`` aliases in safe order. Read-only file and recursive directory
-  mounts are kernel-enforced without Landlock. An immutable filesystem policy
-  now classifies hidden roots, read-only and writable mounts, and generated
-  namespace-local paths; rejects duplicate, overlapping, and access-conflicting
-  entries; and can be built from current trusted installer grants. Compilation
-  rejects classified paths outside its hidden roots and a scratch directory
-  below a hidden root. Preserved sources are rechecked and never recreated if
-  they disappear. A separate dormant compiler now requires explicit trusted
-  hidden roots plus canonical compiler, tool, header, runtime, and scoped
-  temporary paths; adds concrete dependency prefixes, active repository roots,
-  required ``sbang`` paths, and partitioned Spack source trees; derives
-  non-overlapping parent masks; proves every requested path is mounted or
-  covered by a mounted ancestor; and rejects hidden-root overlap with reserved
-  scratch. Representative synthetic-host policies compile and missing,
-  symlinked, or top-level selected paths fail closed. The live worker does not
-  call this helper. Unrelated host trees remain visible unless explicitly
-  hidden, so the complete host/device policy and production input discovery are
-  still open.
-* **Phases 5 and 6 -- not started:** full build-phase policy validation and
-  concretizer-worker evaluation remain future work.
+* **Phase 3 -- complete:** trusted setup prepares the namespace before the
+  worker's logging thread and drops mount authority before recipe-controlled
+  work.
+* **Phase 4 -- complete:** the immutable policy selects hidden host and device
+  roots, exact compiler/tool/header/runtime inputs, read-only source and
+  repository trees, writable install state, and scoped worker directories.
+  The worker activates it automatically when namespace capability is
+  available; Landlock remains the constrained fallback. A real sandboxed
+  ``spack install m4`` and lifecycle tests verify install, log, prefix, and
+  stage behavior.
+* **Phase 5 -- next:** complete build-phase policy validation and hardening.
+  **Phase 6** concretizer-worker evaluation remains future work.
 
 The case-by-case findings, acceptance criteria, and worklog are tracked in
 ``lib/spack/namespaces-sandbox/refactor-review.md``. The Phase 4 input
@@ -195,12 +177,13 @@ deduplication, and produces a deterministic mount plan only when its scratch
 and reserved source subtrees do not overlap hidden roots. Selected paths must
 already be canonical; preserving symlink aliases remains open.
 
-The remaining Phase 4 work is to select every host and device root that must be
-hidden, materialize the exact trusted compiler, tool, interpreter, runtime, and
-header paths and aliases used by a concrete build, replace the broad system
-temporary-directory grant with scoped worker scratch, exercise the resulting
-tree against representative real builds, and only then activate it in the
-installer.
+Phase 4 is complete for the existing install worker. Trusted setup selects the
+host and device roots, materializes exact compiler, tool, interpreter, runtime,
+and header inputs, replaces broad temporary-directory access with scoped worker
+scratch, and activates the immutable policy before package-controlled work.
+Real compiler/source builds and a complete sandboxed m4 install exercise the
+selected tree. Phase 5 covers further build-phase policy validation and
+hardening.
 
 Phase 5: build-phase confinement
 --------------------------------

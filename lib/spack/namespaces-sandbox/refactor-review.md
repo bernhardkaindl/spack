@@ -35,11 +35,10 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
   namespace mount setup and drops mount authority. It activates the selected
   filesystem policy when namespaces are available and uses Landlock only for
   the capability fallback. The supervisor remains unaffected.
-- [ ] Phase 4, policy-driven mount tree (immutable plan and policy validation,
-  non-writable mask sources, access enforcement, and installer-policy
-  activation are complete; complete install-child lifecycle evidence remains
-  open).
-- [ ] Phase 5, complete build-phase policy validation and hardening.
+- [x] Phase 4, policy-driven mount tree and complete install-child lifecycle
+  evidence.
+- [ ] Phase 5, complete build-phase policy validation and hardening (next
+  selected work).
 - [ ] Phase 6, concretizer-worker evaluation.
 
 ## Case-by-case review
@@ -257,7 +256,7 @@ coverage; D3.3 disposable-kernel isolation evidence and final documentation.
 D2 is focused activation evidence, not completion of those deferred lifecycle
 checks.
 
-- [ ] E1, prove the whole install-child writable/read-only inventory and make
+- [x] E1, prove the whole install-child writable/read-only inventory and make
   an actual `spack install m4` succeed with automatic namespace activation.
   Record failures before repairs; verify fetch, stage, configure/build, logs,
   prefix visibility/finalization, and failure cleanup. Keep stage and core
@@ -679,4 +678,12 @@ checks.
   selected, gmake configured and compiled its support library but stopped
   because `ar` was missing. `ar` already belongs to `binutils_programs`; the
   install-tool selector now includes that curated group as well. Compiler
-  internals remain selected through compiler-reported paths. E1 remains open.
+  internals remain selected through compiler-reported paths.
+- 2026-09-26: The next real sandboxed install completed `m4@1.4.21` in the
+  isolated worktree store. The installed prefix, executable, and compressed
+  build log are visible; the successful stage parent was removed. The
+  `TestBuildLifecycle` tests cover successful cleanup, requested stage
+  retention, failed-stage retention, and prefix restoration, while the live
+  namespace worker test confirms nested-stage visibility beneath the temporary
+  replacement. E1 is complete; Phase 5 build-phase policy validation and
+  hardening is the next selected work.

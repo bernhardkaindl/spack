@@ -196,10 +196,14 @@ real-namespace test uses a synthetic hidden home and temporary replacement to
 prove writable worker state, Python temporary allocation, hidden host data,
 inherited read-only denial, and parent-visible worker files. When Java is
 available, it verifies actual JVM properties with spaces and both quote types
-in the path. These checks passed with Java on the development host; they are
-not full install-child lifecycle evidence. Private ``/dev`` construction and
-whole-install success/failure verification remain pending. The accepted
-same-UID source-substitution window before bind mounts is unchanged.
+in the path. The full selected policy, including private ``/dev``, now activates
+for the install child when namespace capability is available. A real sandboxed
+``spack install m4`` installed ``m4@1.4.21`` in an isolated store; its prefix,
+executable, and compressed build log were visible, and its successful stage
+parent was removed. Lifecycle tests cover failure-stage retention and prefix
+rollback/keep behavior, and a live namespace test verifies nested-stage
+visibility beneath the temporary-root replacement. The accepted same-UID
+source-substitution window before bind mounts is unchanged.
 
 External Linux launchers such as Bubblewrap have a different interface: they
 construct confinement while starting another command. Supporting one naturally
@@ -473,16 +477,17 @@ anchoring against a concurrent same-type source substitution remains future
 hardening; policy construction and application therefore remain trusted,
 single-threaded installer work.
 
-The selected-tree compiler makes the next boundary explicit. Trusted
-setup must provide nonempty selections of hidden host roots, exact host
-compiler executables, build tools, header trees, runtime paths, and scoped
-temporary directories. Non-external compiler and tool packages already appear
-as concrete dependency prefixes and remain read-only. Active
-package-repository roots come from the repository search path. Spack's
-``bin``, ``lib``, ``share/spack``, and ``etc/spack`` trees are separate
-read-only grants so the store and writable state below the Spack prefix are not
-accidentally exposed. Spack and upstream ``sbang`` paths are required when
-selected rather than silently omitted.
+Trusted setup supplies nonempty selections of hidden host and device roots,
+exact host compiler executables, build tools, header trees, runtime paths, and
+scoped temporary directories. Non-external compiler and tool packages appear
+as concrete dependency prefixes and remain read-only. Active package-repository
+roots come from the repository search path. Spack's ``bin``, ``lib``,
+``share/spack``, and ``etc/spack`` trees are separate read-only grants so the
+store and writable state below the Spack prefix are not accidentally exposed.
+Spack and upstream ``sbang`` paths are required when selected rather than
+silently omitted. Install execution selects the curated compiler-support,
+binutils, coreutils, build-utility, and script-interpreter groups as well as
+compiler-reported helpers; staging tools remain a separate selection.
 
 The policy data for this selection is loaded lazily from the versioned,
 read-only files ``share/spack/sandbox/sandbox.yaml`` and
@@ -626,18 +631,17 @@ derives from:
 * The package-repository roots and Spack source tree.
 * The stage, prefix, and temporary directories.
 
-A path that is not allowlisted is absent below a hidden root. Once every
-required path is materialized, represented, compilable, and validated against
-real builds, the namespaced worker can activate this tree and stop applying
-Landlock by default.
+A path that is not allowlisted is absent below a hidden root. The worker
+activates the compiled tree automatically and uses Landlock only when namespace
+capability probing reports that the namespace backend is unavailable.
 
 Phase 5: Build-phase confinement
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Extend the namespace backend to the build-phase confinement described in
-:ref:`install-worker-build-phase`. The build worker uses the same namespace
-backend with build-specific policy for compilers, build tools, dependency
-prefixes, and the install prefix.
+The complete selected policy now covers the existing install child, including
+staging and build execution. Phase 5 is the next work item for build-phase
+policy validation and hardening; it does not add a second launcher or layer
+Landlock into an active namespace policy.
 
 Phase 6: Concretizer worker
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -657,7 +661,7 @@ Decision gates
   fallback, not the default.
 * [x] The current narrow mask is represented by an immutable, validated,
   deterministic mount plan before namespace mutation.
-* [ ] The complete mount tree is derived from policy, not a fixed list.
+* [x] The complete mount tree is derived from policy, not a fixed list.
 * [x] The internal Linux backend confines only the existing forked install
   child; the trusted installer supervisor remains outside the namespace.
 * [ ] External Linux sandbox tools use a separate launcher without changing
