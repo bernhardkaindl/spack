@@ -39,6 +39,9 @@ MS_NOSUID = 0x00000002
 MS_NODEV = 0x00000004
 MS_NOEXEC = 0x00000008
 MS_REMOUNT = 0x00000020
+AT_FDCWD = -100
+AT_RECURSIVE = 0x00008000
+MOUNT_ATTR_RDONLY = 0x00000001
 LINUX_CAPABILITY_VERSION_3 = 0x20080522
 
 _EMPTY_SOURCE_FLAGS = MS_NOSUID | MS_NODEV | MS_NOEXEC
@@ -91,12 +94,28 @@ class NamespaceMount(NamedTuple):
     target: str
 
 
+class NamespaceMountAccess(enum.Enum):
+    """Access exposed through a preserved namespace mount."""
+
+    READ_ONLY = "read-only"
+    READ_WRITE = "read-write"
+
+
+class NamespaceMountRequest(NamedTuple):
+    """One source-to-target mount requested by namespace policy."""
+
+    source: str
+    target: str
+    access: NamespaceMountAccess
+
+
 class NamespacePreservedMount(NamedTuple):
     """A preserved bind mount with the source type needed at application time."""
 
     source: str
     target: str
     source_is_directory: bool
+    access: NamespaceMountAccess
 
 
 class NamespaceMountPlan(NamedTuple):
@@ -117,6 +136,15 @@ class _CapabilityData(ctypes.Structure):
         ("effective", ctypes.c_uint32),
         ("permitted", ctypes.c_uint32),
         ("inheritable", ctypes.c_uint32),
+    ]
+
+
+class _MountAttr(ctypes.Structure):
+    _fields_ = [
+        ("attr_set", ctypes.c_uint64),
+        ("attr_clr", ctypes.c_uint64),
+        ("propagation", ctypes.c_uint64),
+        ("userns_fd", ctypes.c_uint64),
     ]
 
 
@@ -146,16 +174,38 @@ def _mount_plan_error(operation: str, reason: str, error_number: int = errno.EIN
     raise NamespaceSetupError(error_number, operation, reason)
 
 
+def _set_mount_read_only(libc: ctypes.CDLL, target: str, recursive: bool) -> None:
+    """Make one bind mount or mount tree read-only without changing its source mount."""
+    try:
+        mount_setattr = libc.mount_setattr
+    except AttributeError:
+        _mount_plan_error(
+            "mount_setattr(MOUNT_ATTR_RDONLY)", "libc does not expose mount_setattr", errno.ENOSYS
+        )
+    attributes = _MountAttr(attr_set=MOUNT_ATTR_RDONLY)
+    _check_syscall(
+        mount_setattr(
+            ctypes.c_int(AT_FDCWD),
+            os.fsencode(target),
+            ctypes.c_uint(AT_RECURSIVE if recursive else 0),
+            ctypes.byref(attributes),
+            ctypes.sizeof(attributes),
+        ),
+        "mount_setattr(MOUNT_ATTR_RDONLY)",
+    )
+
+
 def build_namespace_mount_plan(
-    paths: Iterable[str], stage_path: str, preserved_sources: Iterable[Tuple[str, str]] = ()
+    paths: Iterable[str], stage_path: str, preserved_sources: Iterable[NamespaceMountRequest] = ()
 ) -> NamespaceMountPlan:
     """Validate and deterministically plan namespace bind mounts.
 
     Missing targets retain the narrow masking helper's no-op behavior. Existing
     targets must be directories. Canonical targets are sorted before assigning
-    stage-owned sources. Preserved sources are mounted to stage-owned locations
-    before masks and restored into their canonical targets afterward. Duplicate
-    or conflicting relationships are rejected before entering a namespace or
+    stage-owned sources. Preserved requests explicitly declare read-only or
+    read-write access. Sources are mounted to stage-owned locations before masks
+    and restored into their canonical targets afterward. Duplicate or
+    conflicting relationships are rejected before entering a namespace or
     creating a source directory.
     """
     resolved_stage = os.path.realpath(os.path.abspath(stage_path))
@@ -194,7 +244,11 @@ def build_namespace_mount_plan(
 
     hidden_targets = tuple(sorted_targets)
     preserved_requests = []
-    for source, target in preserved_sources:
+    for source, target, access in preserved_sources:
+        if not isinstance(access, NamespaceMountAccess):
+            _mount_plan_error(
+                "validate preserved access", f"invalid preserved mount access: {access!r}"
+            )
         resolved_source = os.path.realpath(os.path.abspath(source))
         if not os.path.exists(resolved_source):
             _mount_plan_error(
@@ -228,10 +282,10 @@ def build_namespace_mount_plan(
                 "validate preserved relationship",
                 f"preserved target is not below a hidden directory: {target}",
             )
-        preserved_requests.append((resolved_source, resolved_target, source_is_directory))
+        preserved_requests.append((resolved_source, resolved_target, source_is_directory, access))
 
     preserved_requests.sort(key=lambda item: (item[1], item[0]))
-    for index, (_, target, _) in enumerate(preserved_requests):
+    for index, (_, target, _, _) in enumerate(preserved_requests):
         if index and target == preserved_requests[index - 1][1]:
             _mount_plan_error(
                 "validate preserved targets", f"duplicate preserved target: {target}"
@@ -245,15 +299,18 @@ def build_namespace_mount_plan(
     preserved_root = os.path.join(resolved_stage, "spack-preserved-host-paths")
     preserved_mounts = tuple(
         NamespacePreservedMount(
-            source, os.path.join(preserved_root, str(index)), source_is_directory
+            source, os.path.join(preserved_root, str(index)), source_is_directory, access
         )
-        for index, (source, _, source_is_directory) in enumerate(preserved_requests)
+        for index, (source, _, source_is_directory, access) in enumerate(preserved_requests)
     )
     restoration_mounts = tuple(
         NamespacePreservedMount(
-            preserved_mount.target, target, preserved_mount.source_is_directory
+            preserved_mount.target,
+            target,
+            preserved_mount.source_is_directory,
+            preserved_mount.access,
         )
-        for preserved_mount, (_, target, _) in sorted(
+        for preserved_mount, (_, target, _, _) in sorted(
             zip(preserved_mounts, preserved_requests),
             key=lambda item: (item[1][1].count(os.sep), item[1][1]),
         )
@@ -268,12 +325,19 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
 
     os.makedirs(plan.stage_path, exist_ok=True)
 
-    def apply_mount(source: str, target: str, source_is_directory: bool, recursive: bool) -> None:
-        if source_is_directory:
-            os.makedirs(source, exist_ok=True)
-        else:
-            os.makedirs(os.path.dirname(source), exist_ok=True)
-            Path(source).touch(exist_ok=True)
+    def apply_mount(
+        source: str,
+        target: str,
+        source_is_directory: bool,
+        recursive: bool,
+        access: NamespaceMountAccess = NamespaceMountAccess.READ_WRITE,
+    ) -> None:
+        if not os.path.exists(source):
+            if source_is_directory:
+                os.makedirs(source)
+            else:
+                os.makedirs(os.path.dirname(source), exist_ok=True)
+                Path(source).touch()
         if not os.path.exists(target):
             if source_is_directory:
                 os.makedirs(target)
@@ -294,10 +358,16 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
             ),
             "mount(MS_BIND)",
         )
+        if access is NamespaceMountAccess.READ_ONLY:
+            _set_mount_read_only(libc, target, recursive)
 
     for mount in plan.preserved_mounts:
         apply_mount(
-            mount.source, mount.target, mount.source_is_directory, mount.source_is_directory
+            mount.source,
+            mount.target,
+            mount.source_is_directory,
+            mount.source_is_directory,
+            mount.access,
         )
 
     if plan.mounts:
@@ -342,7 +412,11 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
         apply_mount(mount.source, mount.target, True, False)
     for mount in plan.restoration_mounts:
         apply_mount(
-            mount.source, mount.target, mount.source_is_directory, mount.source_is_directory
+            mount.source,
+            mount.target,
+            mount.source_is_directory,
+            mount.source_is_directory,
+            mount.access,
         )
     return True
 
@@ -496,6 +570,7 @@ def _probe_namespace_capability(libc) -> NamespaceCapability:
                     ),
                     "mount(MS_BIND probe)",
                 )
+                _set_mount_read_only(libc, bind_target, True)
                 _drop_namespace_capabilities(libc)
             except NamespaceSetupError as error:
                 result = NamespaceCapability(False, error.operation, error.reason)
@@ -630,7 +705,7 @@ def hide_directories_as_empty(
     stage_path: str,
     namespace_ready: bool = False,
     libc: Optional[ctypes.CDLL] = None,
-    preserved_sources: Iterable[Tuple[str, str]] = (),
+    preserved_sources: Iterable[NamespaceMountRequest] = (),
 ) -> bool:
     """Mask each existing host directory with a read-only empty tmpfs directory.
 
@@ -706,7 +781,7 @@ class NamespaceSandbox(Sandbox):
         self,
         hidden_dirs: Iterable[str],
         stage_path: str,
-        preserved_sources: Iterable[Tuple[str, str]] = (),
+        preserved_sources: Iterable[NamespaceMountRequest] = (),
     ) -> bool:
         """Enter the private namespace and mask *hidden_dirs* as empty.
 
