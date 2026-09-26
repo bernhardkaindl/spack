@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Platform-agnostic unit tests for the abstract Sandbox interface and installer wiring."""
 
+import copy
+import io
 import os
 import pathlib
 import sys
@@ -17,6 +19,7 @@ import spack.repo
 import spack.sandbox
 import spack.sandbox_namespaces
 import spack.store
+import spack.util.spack_yaml as syaml
 from spack.installer.build import _enable_sandbox
 
 
@@ -34,6 +37,67 @@ class MockSandbox(spack.sandbox.Sandbox):
 
     def apply(self, block_network=False):
         self.apply_calls.append(block_network)
+
+
+def _write_yaml(path: pathlib.Path, data: dict) -> None:
+    stream = io.StringIO()
+    syaml.dump(data, stream)
+    path.write_text(stream.getvalue(), encoding="utf-8")
+
+
+def test_namespace_policy_data_is_loaded_from_yaml():
+    from spack.installer import build
+
+    policy = build._load_sandbox_policy(build.SANDBOX_POLICY_PATH)
+    header_policy = build._load_linux_header_policy(build.LINUX_HEADER_POLICY_PATH)
+
+    assert "commands" not in policy
+    assert policy["hidden_roots"]
+    assert policy["replacement_roots"] == ["/tmp", "/var/tmp"]
+    assert "/dev/urandom" in policy["device_nodes"]
+    assert "tar" in policy["stage_programs"]
+    assert header_policy["version"] == 1
+    assert header_policy["system_include_root"] == "/usr/include"
+
+
+@pytest.mark.parametrize(
+    "mutation, expected_key",
+    [
+        (lambda policy: policy.update(version=2), "version"),
+        (lambda policy: policy.update(hidden_roots="/usr/bin"), "hidden_roots"),
+        (
+            lambda policy: policy["compiler_driver_aliases"].update(cxx="g++"),
+            "compiler_driver_aliases",
+        ),
+    ],
+)
+def test_namespace_policy_rejects_malformed_data(tmp_path: pathlib.Path, mutation, expected_key):
+    from spack.installer import build
+
+    policy = copy.deepcopy(build._load_sandbox_policy(build.SANDBOX_POLICY_PATH))
+    mutation(policy)
+    policy_path = tmp_path / "sandbox.yaml"
+    _write_yaml(policy_path, policy)
+
+    with pytest.raises(spack.error.InstallError, match=str(policy_path)) as error:
+        build._load_sandbox_policy(str(policy_path))
+    assert expected_key in str(error.value)
+
+
+@pytest.mark.parametrize("unsafe_path", ["../stdio.h", "/etc/passwd", "foo\\..\\bar.h"])
+def test_linux_header_policy_rejects_unsafe_relative_paths(
+    tmp_path: pathlib.Path, unsafe_path: str
+):
+    from spack.installer import build
+
+    policy = copy.deepcopy(build._load_linux_header_policy(build.LINUX_HEADER_POLICY_PATH))
+    policy["glibc"]["files"][0] = unsafe_path
+    policy_path = tmp_path / "linux-header-policy.yaml"
+    _write_yaml(policy_path, policy)
+
+    with pytest.raises(spack.error.InstallError, match=str(policy_path)) as error:
+        build._load_linux_header_policy(str(policy_path))
+    assert "glibc.files" in str(error.value)
 
 
 def test_allow_read_reports_both_the_requested_and_resolved_path(tmp_path: pathlib.Path):

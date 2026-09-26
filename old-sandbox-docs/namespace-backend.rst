@@ -454,6 +454,18 @@ read-only grants so the store and writable state below the Spack prefix are not
 accidentally exposed. Spack and upstream ``sbang`` paths are required when
 selected rather than silently omitted.
 
+The policy data for this selection is loaded lazily from the versioned,
+read-only files ``share/spack/sandbox/sandbox.yaml`` and
+``share/spack/sandbox/linux-header-policy.yaml``. The first file contains the
+runtime and compiler vocabulary plus the namespace hidden roots, replacement
+roots, device nodes, and stage programs. It deliberately has no Landlock
+``commands`` or ``df`` stub. The second file contains only safe relative
+entries below its absolute system include root for the glibc, Linux UAPI, and
+libstdc++ header policy. Loaders validate versions, list and alias structure,
+namespace path types, and header path traversal before any later selection
+work consumes the data. Loading is currently dormant: this commit does not
+activate the policy or change the live worker.
+
 The compiler requires every selected spelling to be an existing canonical
 path. Symlink spellings fail until the policy can preserve both the selected
 name and its resolved source. It collapses a same-access descendant only when
