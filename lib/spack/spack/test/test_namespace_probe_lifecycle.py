@@ -158,6 +158,8 @@ def test_probe_transports_syscall_failure(monkeypatch):
         (1, "mount(tmpfs probe)"),
         (2, "mount(MS_REMOUNT, MS_RDONLY probe)"),
         (3, "mount(MS_BIND probe)"),
+        (4, "mount(tmpfs shared memory)"),
+        (5, "mount(MS_BIND device probe)"),
     ],
 )
 def test_probe_transports_mount_failure(monkeypatch, failing_call, operation):

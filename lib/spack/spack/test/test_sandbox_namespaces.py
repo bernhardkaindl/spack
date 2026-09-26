@@ -1482,6 +1482,56 @@ def test_namespace_selection_does_not_preflight_landlock(monkeypatch):
     assert sandbox._landlock is None
 
 
+@pytest.mark.parametrize("failure", ["symlink", "tmpfs"])
+def test_private_device_setup_failure_stops_before_tee(
+    namespace_setup, monkeypatch, tmp_path, failure
+):
+    libc, _ = namespace_setup
+    hidden = tmp_path / "dev"
+    hidden.mkdir()
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    policy = ns.build_namespace_filesystem_policy(
+        [str(hidden)],
+        read_write_mounts=[(str(worker), str(worker))],
+        generated_symlinks=[ns.NamespaceGeneratedSymlink(str(hidden / "fd"), "/proc/self/fd")],
+        tmpfs_paths=[str(hidden / "shm")],
+        read_only_view=True,
+    )
+    sandbox = ns.NamespaceSandbox(cast(ns.ctypes.CDLL, libc))
+    acquisitions = []
+    monkeypatch.setattr(
+        spack.sandbox, "get_sandbox", lambda: acquisitions.append(sandbox) or sandbox
+    )
+    monkeypatch.setattr(
+        sandbox, "drop_mount_authority", lambda: pytest.fail("drop after failed setup")
+    )
+    monkeypatch.setattr(build, "Tee", lambda *args: pytest.fail("Tee after failed setup"))
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EPERM, "D3 setup denied")
+
+    if failure == "symlink":
+        monkeypatch.setattr(ns.os, "symlink", fail)
+    else:
+        monkeypatch.setattr(ns, "_mount_private_tmpfs", fail)
+    inherited_environment = dict(os.environ)
+    inherited_tempdir = build.tempfile.tempdir
+    activation = build.NamespaceActivation(policy, str(tmp_path / "scratch"), str(worker))
+    channel = cast(build.IpcChannel, None)
+    with pytest.raises(OSError, match="D3 setup denied"):
+        build._start_tee_after_namespace(
+            {"enable": True}, channel, None, channel, "build.log", spack.spec.Spec(),
+            str(tmp_path), activation,
+        )
+    assert acquisitions == [sandbox]
+    assert not sandbox.filesystem_policy_active
+    assert not sandbox.namespace_ready
+    assert os.environ == inherited_environment
+    assert build.tempfile.tempdir == inherited_tempdir
+    assert not list(worker.iterdir())
+
+
 @pytest.mark.parametrize("failure", [None, "policy", "authority"])
 def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path, failure):
     calls = []
