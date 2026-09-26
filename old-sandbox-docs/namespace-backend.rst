@@ -95,7 +95,7 @@ permission-denied errors.
 Availability
 ------------
 
-Unprivileged user and mount namespaces are optional on some distributions.
+Unprivileged user, mount, and network namespaces are optional on some distributions.
 Some distributions disable them entirely, restrict ``uid_map`` and
 ``gid_map`` writes, or require additional sysctl settings.
 
@@ -111,11 +111,14 @@ The capability probe must test:
   root mount and the directory bind mount required by the current masking
   backend; and
 * dropping the user-namespace capability sets required after trusted mount
-  setup.
+  setup; and
+* creating a network namespace, raising ``lo``, and using loopback and Unix
+  domain sockets.
 
 The probe tests tmpfs creation, read-only remounting, directory bind mounts,
-and capability dropping. Every additional mount operation introduced by the
-policy-driven tree must also be probed before selecting that backend.
+network namespace setup, loopback, Unix domain sockets, and capability
+drops. Every additional mount operation introduced by the policy-driven tree
+must also be probed before selecting that backend.
 
 The probe returns a structured capability result with availability, the failed
 operation, and its reason. Completed child results are cached and inherited by
@@ -152,6 +155,26 @@ then starts logging and performs recipe-controlled staging, patching, and
 builder setup against the selected namespace policy. Landlock is not applied
 inside an active namespace policy; it is used only by the fallback backend
 when namespace capability probing fails.
+
+Network isolation and loopback
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The default configuration enables the sandbox and sets
+``config:sandbox:allow_network`` to ``false``. After the selected mount policy
+has been applied, but before namespace capabilities are dropped, the Linux
+install child also enters ``CLONE_NEWNET``. The new network namespace has no
+host interfaces or routes. Spack raises its ``lo`` interface and verifies the
+kernel-provided IPv4 ``127.0.0.1/8`` and, when IPv6 is available, IPv6
+``::1/128`` loopback addresses before package-controlled work begins.
+
+Unix domain sockets continue to work inside the network namespace, including
+filesystem-path sockets; abstract Unix sockets are scoped to that network
+namespace. The setup probe and a disposable live-namespace test cover loopback
+and Unix socket operation after capabilities have been dropped. Setting
+``config:sandbox:allow_network: true`` skips ``CLONE_NEWNET`` and retains the
+host network view. On systems where the required namespace setup is unavailable,
+the existing constrained Landlock fallback is selected; it restricts TCP
+access but does not provide network-namespace isolation for other socket types.
 
 The forked child inherits loaded modules, Python objects, environment state,
 and open descriptors from the supervisor. The current boundary therefore
