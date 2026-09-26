@@ -141,8 +141,9 @@ The trusted installer supervisor creates that child through the existing
 ``multiprocessing.Process`` launch path. Before starting its logging thread,
 the child freezes namespace availability, calls
 ``unshare(CLONE_NEWUSER | CLONE_NEWNS)``, configures UID and GID mappings,
-makes the root mount private, prepares the narrow mount tree, and drops all
-capabilities in the new user namespace. The supervisor remains in the host
+makes the root mount private, applies the selected mount tree, and drops all
+capabilities in the new user namespace. It then configures scoped worker state
+before starting logging. The supervisor remains in the host
 namespaces and is not restricted.
 
 This closes the :term:`mount-authority window`: no recipe-controlled Python
@@ -158,6 +159,47 @@ protects build phases; it is not confinement-before-recipe-import and does not
 claim that inherited descriptors have been minimized. A future fresh-executed
 worker may provide that additional hardening, but it is not required to use
 the internal namespace backend.
+
+Worker home and temporary state
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Trusted parent setup allocates a unique worker root below the stable,
+host-backed stage parent and carries it in the immutable activation payload.
+Preparation does not change the supervisor's environment or Python temporary
+directory cache. Complete namespace activation performs these steps before
+``Tee`` and recipe-controlled setup:
+
+1. Require an existing canonical absolute worker directory covered by a
+   selected writable identity mount, which may be the stage-parent mount.
+2. Apply the mount policy and drop mount authority. Replacement sources are
+   preserved in durable scratch before masks, including when their original
+   paths lie below a hidden home or temporary root.
+3. Create fresh mode-0700 ``home``, ``cache``, and ``tmp`` children of the
+   worker root. Existing entries, including symlinks, are rejected.
+4. Set ``HOME`` to ``home``, ``XDG_CACHE_HOME`` to ``cache``, and ``TMPDIR``,
+   ``TMP``, ``TEMP``, and ``tempfile.tempdir`` to ``tmp``. Append quoted
+   ``-Duser.home`` and ``-Djava.io.tmpdir`` settings to ``JAVA_TOOL_OPTIONS``,
+   preserving unrelated inherited options and overriding earlier values in
+   that variable.
+
+Setup errors abort the child before logging or recipe setup; they do not
+trigger fallback. Disabled sandboxing, capability-based Landlock fallback,
+and the legacy narrow namespace path do not receive this environment setup.
+The standard build-environment cleaner preserves these defaults. Recipes,
+external modules, Java command-line options, or other Java option variables
+can still override defaults; environment values are not an access-control
+boundary. The selected mounts continue to enforce filesystem access.
+
+Focused tests cover activation order, invalid roots, pre-existing child paths,
+failure and fallback isolation, and unchanged parent state. A disposable
+real-namespace test uses a synthetic hidden home and temporary replacement to
+prove writable worker state, Python temporary allocation, hidden host data,
+inherited read-only denial, and parent-visible worker files. When Java is
+available, it verifies actual JVM properties with spaces and both quote types
+in the path. These checks passed with Java on the development host; they are
+not full install-child lifecycle evidence. Private ``/dev`` construction and
+whole-install success/failure verification remain pending. The accepted
+same-UID source-substitution window before bind mounts is unchanged.
 
 External Linux launchers such as Bubblewrap have a different interface: they
 construct confinement while starting another command. Supporting one naturally
