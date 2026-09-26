@@ -734,22 +734,26 @@ not close that lifecycle gap.
   a live namespace test proves a stage nested beneath a replacement root is
   visible. All 138 sandbox tests, Ruff, and whitespace checks pass; retry m4.
 - 2026-09-26: Restoring the shell alias let gmake enter `configure`, which then
-  failed because `sed` was absent from the hidden `/usr/bin`. The shipped
-  stage-tool policy now selects `sed` through the existing canonical tool
-  resolver; the YAML policy test asserts its presence. Retry the real install.
+  failed because `sed` was absent from the hidden `/usr/bin`. `sed` was already
+  listed under `script_interpreter_programs`; activation had only selected
+  `stage_programs`. The installer now unions the coreutils, build-utility, and
+  interpreter groups for install execution while keeping stage tools separate.
 - 2026-09-26: Selecting `sed` advanced gmake's configure phase to a missing
-  `chmod` command. Added `chmod` to the shipped stage-tool policy and asserted
-  it in the policy-data test; retry the real install.
+  `chmod` command. `chmod` was already listed under
+  `coreutils_install_programs`; the new install-tool selector includes that
+  group instead of expanding `stage_programs`.
 - 2026-09-26: Selecting `chmod` advanced configure, but it emitted repeated
   `eval: expr: not found` errors and remained active. Stopped the runaway retry
-  with the host stage and log intact. Added canonical host `expr` to the
-  stage-tool policy and asserted it in the policy-data test; retry m4.
+  with the host stage and log intact. `expr` was already in
+  `coreutils_util_programs`; the install-tool union now selects it.
 - 2026-09-26: Selecting `expr` let configure progress further; it then reported
-  `rm: not found` and `ls: not found`. Added both observed utilities to the
-  shipped stage-tool policy and asserted them in the policy-data test. Retry m4.
+  `rm: not found` and `ls: not found`. Those commands were already in
+  `coreutils_install_programs` and `coreutils_file_programs`; both are now
+  selected by the install-tool union.
 - 2026-09-26: With `rm` and `ls` available, configure reported missing `cat`
   and `sort`; its C compiler check also showed `collect2` could not find `ld`.
   The canonical linker source was selected, but its `/usr/bin/ld` PATH alias
   was not regenerated. Tool alias assembly now includes compiler-support
-  entries, and the policy selects `cat`, `sort`, and `make` for configure and
-  the build phase. A production-assembly regression covers the linker alias.
+  entries. `cat`, `sort`, and `make` were already listed in the coreutils and
+  build-utility groups, now selected for the whole install child. A
+  production-assembly regression covers the linker alias.
