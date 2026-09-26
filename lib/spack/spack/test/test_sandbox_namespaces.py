@@ -9,6 +9,7 @@ import io
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -328,6 +329,94 @@ def test_filesystem_policy_rejects_replacement_outside_hidden_root(tmp_path):
         ns.build_namespace_filesystem_policy(
             [str(hidden)], replacement_mounts=[(str(replacement), str(tmp_path))]
         )
+
+
+def test_mount_plan_scratch_is_private_and_concurrent(tmp_path):
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    stage = tmp_path / "stage"
+    prefix = tmp_path / "prefix"
+    writable = tmp_path / "writable"
+    policy = ns.build_namespace_filesystem_policy(
+        [str(hidden)],
+        [(str(source), str(hidden / "selected"))],
+        replacement_mounts=[(str(replacement), str(hidden))],
+    )
+
+    def allocate():
+        return ns.allocate_namespace_mount_plan_scratch(
+            policy, str(stage), [str(prefix), str(writable)], str(tmp_path)
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        scratches = list(executor.map(lambda _: allocate(), range(2)))
+
+    assert scratches[0].path != scratches[1].path
+    for scratch in scratches:
+        assert scratch.path.startswith(str(tmp_path) + os.sep)
+        assert os.stat(scratch.path).st_mode & 0o777 == 0o700
+        for excluded in (hidden, source, replacement, stage, prefix, writable):
+            assert os.path.commonpath((scratch.path, str(excluded))) not in (
+                scratch.path,
+                str(excluded),
+            )
+        scratch.cleanup()
+
+
+def test_mount_plan_scratch_rejects_symlinked_base_and_collisions(tmp_path, monkeypatch):
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    real_base = tmp_path / "real-base"
+    real_base.mkdir()
+    symlinked_base = tmp_path / "symlinked-base"
+    symlinked_base.symlink_to(real_base, target_is_directory=True)
+    policy = ns.build_namespace_filesystem_policy([str(hidden)])
+
+    with pytest.raises(ns.NamespaceSetupError, match="scratch base is symlinked"):
+        ns.allocate_namespace_mount_plan_scratch(
+            policy, str(tmp_path / "stage"), base_path=str(symlinked_base)
+        )
+
+    scratch = ns.allocate_namespace_mount_plan_scratch(
+        policy, str(tmp_path / "stage"), base_path=str(real_base)
+    )
+    monkeypatch.setattr(ns.tempfile, "mkdtemp", lambda **kwargs: scratch.path)
+    with pytest.raises(ns.NamespaceSetupError, match="scratch allocation collision"):
+        ns.allocate_namespace_mount_plan_scratch(
+            policy, str(tmp_path / "stage"), base_path=str(real_base)
+        )
+    scratch.cleanup()
+
+
+def test_mount_plan_scratch_cleanup_rejects_live_worker_and_replacement(tmp_path):
+    (tmp_path / "hidden").mkdir()
+    policy = ns.build_namespace_filesystem_policy([str(tmp_path / "hidden")])
+    scratch = ns.allocate_namespace_mount_plan_scratch(
+        policy, str(tmp_path / "stage"), base_path=str(tmp_path)
+    )
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import os; os.read(0, 1)"], stdin=subprocess.PIPE
+    )
+    try:
+        scratch.attach_worker(worker.pid)
+        with pytest.raises(ns.NamespaceSetupError, match="worker is still alive"):
+            scratch.cleanup()
+    finally:
+        worker.terminate()
+        worker.wait()
+
+    moved = tmp_path / "moved-scratch"
+    os.rename(scratch.path, moved)
+    os.symlink(moved, scratch.path)
+    with pytest.raises(ns.NamespaceSetupError, match="scratch path changed type"):
+        scratch.cleanup()
+    os.unlink(scratch.path)
+    os.rmdir(moved)
+    scratch.cleanup()
 
 
 def test_mount_plan_does_not_recreate_disappeared_preserved_source(tmp_path):

@@ -19,7 +19,9 @@ import json
 import os
 import platform
 import shutil
+import stat
 import tempfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, List, NamedTuple, NoReturn, Optional, Tuple
 
@@ -155,6 +157,88 @@ class NamespaceMountPlan(NamedTuple):
     generated_symlinks: Tuple[NamespaceGeneratedSymlink, ...] = ()
 
 
+_active_namespace_mount_plan_scratch = set()
+_namespace_mount_plan_scratch_lock = threading.Lock()
+
+
+class NamespaceMountPlanScratch:
+    """Supervisor-owned durable scratch for one namespace mount plan."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._owner_pid = os.getpid()
+        identity = os.stat(path)
+        self._identity = (identity.st_dev, identity.st_ino)
+        self._worker_pid: Optional[int] = None
+
+    @property
+    def worker_pid(self) -> Optional[int]:
+        return self._worker_pid
+
+    def attach_worker(self, worker_pid: int) -> None:
+        """Associate a launched worker so cleanup can reject live processes."""
+        if os.getpid() != self._owner_pid:
+            _mount_plan_error(
+                "attach namespace mount-plan worker", "only the scratch owner may attach a worker"
+            )
+        if not isinstance(worker_pid, int) or worker_pid <= 0 or worker_pid == self._owner_pid:
+            _mount_plan_error(
+                "attach namespace mount-plan worker", f"invalid worker PID: {worker_pid!r}"
+            )
+        if self._worker_pid is not None and self._worker_pid != worker_pid:
+            _mount_plan_error(
+                "attach namespace mount-plan worker",
+                f"worker already attached: {self._worker_pid}",
+            )
+        self._worker_pid = worker_pid
+
+    def cleanup(self) -> None:
+        """Remove scratch after setup failure or after the attached worker exits."""
+        if os.getpid() != self._owner_pid:
+            _mount_plan_error(
+                "cleanup namespace mount-plan scratch", "only the scratch owner may clean up"
+            )
+        if self._worker_pid is not None and _namespace_process_is_alive(self._worker_pid):
+            _mount_plan_error(
+                "cleanup namespace mount-plan scratch",
+                f"worker is still alive: {self._worker_pid}",
+                errno.EBUSY,
+            )
+        try:
+            current = os.lstat(self.path)
+        except FileNotFoundError:
+            with _namespace_mount_plan_scratch_lock:
+                _active_namespace_mount_plan_scratch.discard(self.path)
+            return
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISDIR(current.st_mode):
+            _mount_plan_error(
+                "cleanup namespace mount-plan scratch",
+                f"scratch path changed type: {self.path}",
+                errno.EEXIST,
+            )
+        if (current.st_dev, current.st_ino) != self._identity:
+            _mount_plan_error(
+                "cleanup namespace mount-plan scratch",
+                f"scratch path was replaced: {self.path}",
+                errno.EEXIST,
+            )
+        shutil.rmtree(self.path)
+        with _namespace_mount_plan_scratch_lock:
+            _active_namespace_mount_plan_scratch.discard(self.path)
+
+
+def _namespace_process_is_alive(process_id: int) -> bool:
+    try:
+        os.kill(process_id, 0)
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return False
+        if error.errno == errno.EPERM:
+            return True
+        raise
+    return True
+
+
 class _CapabilityHeader(ctypes.Structure):
     _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
 
@@ -243,6 +327,90 @@ def _validate_non_overlapping_paths(paths: Iterable[Tuple[str, str]], operation:
                     f"overlapping {previous_category} and {category} paths: "
                     f"{previous_path} and {path}",
                 )
+
+
+def allocate_namespace_mount_plan_scratch(
+    policy: NamespaceFilesystemPolicy,
+    stage_path: str,
+    excluded_paths: Iterable[str] = (),
+    base_path: Optional[str] = None,
+) -> NamespaceMountPlanScratch:
+    """Allocate private mount endpoints outside the policy's writable roots.
+
+    The caller owns the returned lease and must clean it up after any worker
+    using it has been reaped. The directory is ordinary host-backed scratch;
+    it is not the build stage and does not change stage or prefix lifecycle.
+    """
+    policy = _validated_namespace_filesystem_policy(policy)
+    forbidden_paths = list(policy.hidden_roots)
+    for mount in policy.read_only_mounts + policy.read_write_mounts:
+        forbidden_paths.extend((mount.source, mount.target))
+    for mount in policy.replacement_mounts:
+        forbidden_paths.extend((mount.source, mount.target))
+    forbidden_paths.append(stage_path)
+    forbidden_paths.extend(excluded_paths)
+    resolved_forbidden = tuple(
+        sorted({os.path.realpath(os.path.abspath(path)) for path in forbidden_paths})
+    )
+
+    requested_base = tempfile.gettempdir() if base_path is None else base_path
+    absolute_base = os.path.abspath(requested_base)
+    resolved_base = os.path.realpath(absolute_base)
+    if absolute_base != resolved_base:
+        _mount_plan_error(
+            "allocate namespace mount-plan scratch", f"scratch base is symlinked: {requested_base}"
+        )
+    if not os.path.isdir(resolved_base):
+        _mount_plan_error(
+            "allocate namespace mount-plan scratch",
+            f"scratch base is not a directory: {requested_base}",
+            errno.ENOTDIR,
+        )
+    if any(
+        root == resolved_base or _path_contains(root, resolved_base) for root in resolved_forbidden
+    ):
+        _mount_plan_error(
+            "allocate namespace mount-plan scratch",
+            f"scratch base overlaps a policy root: {resolved_base}",
+            errno.EEXIST,
+        )
+
+    scratch_path = os.path.abspath(
+        tempfile.mkdtemp(prefix="spack-namespace-mount-", dir=resolved_base)
+    )
+    if scratch_path != os.path.realpath(scratch_path) or os.path.islink(scratch_path):
+        _mount_plan_error(
+            "allocate namespace mount-plan scratch",
+            f"allocated scratch is symlinked: {scratch_path}",
+            errno.EEXIST,
+        )
+    if any(
+        root == scratch_path
+        or _path_contains(root, scratch_path)
+        or _path_contains(scratch_path, root)
+        for root in resolved_forbidden
+    ):
+        _mount_plan_error(
+            "allocate namespace mount-plan scratch",
+            f"allocated scratch collides with a policy root: {scratch_path}",
+            errno.EEXIST,
+        )
+    if not os.path.isdir(scratch_path):
+        _mount_plan_error(
+            "allocate namespace mount-plan scratch",
+            f"allocated scratch is not a real directory: {scratch_path}",
+            errno.ENOTDIR,
+        )
+    with _namespace_mount_plan_scratch_lock:
+        if scratch_path in _active_namespace_mount_plan_scratch:
+            _mount_plan_error(
+                "allocate namespace mount-plan scratch",
+                f"scratch allocation collision: {scratch_path}",
+                errno.EEXIST,
+            )
+        _active_namespace_mount_plan_scratch.add(scratch_path)
+    os.chmod(scratch_path, 0o700)
+    return NamespaceMountPlanScratch(scratch_path)
 
 
 def build_namespace_filesystem_policy(
