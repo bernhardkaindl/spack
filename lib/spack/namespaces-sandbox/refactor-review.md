@@ -664,3 +664,6 @@ checks.
   `eval: expr: not found` and did not exit, so the retry was stopped while
   preserving its host stage and log. Added `expr` to the selected stage-tool
   policy and asserted the shipped entry. Retry the real install.
+- 2026-09-26: With `expr` selected, configure progressed further and then
+  reported `rm: not found` and `ls: not found`. Added both utilities to
+  `sandbox.yaml` and the shipped policy test; retry the actual install.
