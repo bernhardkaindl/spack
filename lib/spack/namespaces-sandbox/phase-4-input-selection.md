@@ -340,7 +340,8 @@ once. Port behavior, not implementation details.
   explicitly restore writable bind mounts. Capability, fake-libc, installer,
   and real-namespace tests cover `MOUNT_ATTR_RDONLY`, `EROFS`, and writable
   restoration without changing the live worker.
-- [ ] C1, `installer: preserve host-visible stage and prefix lifecycles`,
+
+- [x] C1, `installer: preserve host-visible stage and prefix lifecycles`,
   using a stable per-build stage parent and supervisor-owned prefix pivot.
 
 ## Proposed sequence
@@ -455,3 +456,13 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   installer-plan checks, and disposable real-namespace test prove recursive
   setup, `EROFS` passthrough denial, and writable restoration. Selected C1,
   host-visible stage and prefix lifecycle preservation.
+- 2026-09-26: Completed C1 by adding a unique host-backed stage parent for
+  each build, moving any existing named stage below that parent, and passing
+  the parent as the writable sandbox view. The child retains stage contents on
+  failure while the supervisor removes successful stages after reaping it;
+  cache-miss retries discard unused stage parents. The supervisor now prepares
+  an empty exact prefix target, owns prefix pivot and rollback finalization,
+  preserves keep-prefix and BinaryCacheMiss behavior, and keeps the prefix
+  lock across the transaction. Focused lifecycle, installer, and prefix
+  integration tests passed; C2 host/device and worker-state input selection is
+  now selected.

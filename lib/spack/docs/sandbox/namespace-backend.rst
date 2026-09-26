@@ -518,6 +518,23 @@ that recursive inherited mounts can be made read-only, passthrough writes
 return ``EROFS``, and selected writable mounts remain writable. The live
 worker still uses the narrow mask and transitional Landlock.
 
+C1 preserves the host-visible lifecycle of build stages and install prefixes
+when the selected-tree policy is eventually activated. Trusted supervisor
+setup gives each build a unique host-backed parent below the configured stage
+root and places the removable stage directory below that parent. The child
+can therefore restage and write ``spack-src`` and ``config.log`` without
+making the stage itself a mount point. The supervisor removes successful
+stages after the child is reaped, retains failed stages for inspection, and
+discards unused stage parents for binary-cache retries.
+
+The supervisor also performs the prefix pivot before launch and creates the
+empty target at the exact path used by build tools. Prefix rollback, garbage
+removal, ``keep-prefix``, and ``BinaryCacheMiss`` handling happen only after
+the child namespace is gone, while the per-prefix write lock remains held
+through the transaction. The live worker still uses the narrow mask and
+transitional Landlock; this lifecycle boundary prepares it for the complete
+policy without activating that policy.
+
 The resulting policy must compile with allocated mount-plan scratch outside
 every hidden root, and hidden roots may not overlap the planner's reserved
 source subtrees. Representative synthetic-host tests cover explicit masks,

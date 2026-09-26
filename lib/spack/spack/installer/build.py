@@ -638,6 +638,7 @@ class ChildInfo:
         "notifier",
         "log_path",
         "prefix_lock",
+        "lifecycle",
         "state_buffer",
     )
 
@@ -650,6 +651,7 @@ class ChildInfo:
         control_w_conn: IpcChannel,
         notifier: ProcessExitNotifier,
         log_path: str,
+        lifecycle: Optional["BuildLifecycle"] = None,
     ) -> None:
         self.proc = proc
         self.spec = spec
@@ -659,6 +661,7 @@ class ChildInfo:
         self.notifier = notifier
         self.log_path = log_path
         self.prefix_lock: Optional[spack.util.lock.Lock] = None
+        self.lifecycle = lifecycle
         # Buffer for partially received state data from this child. Kept as raw bytes and split on
         # b"\n": the newline byte cannot occur inside a multi-byte UTF-8 sequence, so framing is
         # safe without decoding partial reads.
@@ -671,6 +674,10 @@ class ChildInfo:
             except Exception:
                 pass
         self.prefix_lock = None
+
+    def finalize_lifecycle(self, exitcode: int) -> None:
+        if self.lifecycle is not None:
+            self.lifecycle.finalize(exitcode)
 
     def register_with_selector(self, selector: selectors.BaseSelector, build_id: str) -> None:
         """Register output, state, and sentinel channels with the selector."""
@@ -894,19 +901,27 @@ class PrefixPivoter:
 
     def __enter__(self) -> "PrefixPivoter":
         """Enter the context: move existing prefix to temporary location if needed."""
-        if not self._lexists(self.prefix):
-            return self
-        # Move the existing prefix to a temporary location so the build starts fresh
-        self.tmp_prefix = self._mkdtemp(
-            dir=self.parent, prefix=".", suffix=OVERWRITE_BACKUP_SUFFIX
-        )
-        self._rename(self.prefix, self.tmp_prefix)
+        self.prepare()
         return self
+
+    def prepare(self, create_target: bool = False) -> None:
+        """Move an existing prefix aside and optionally create the new target."""
+        if self._lexists(self.prefix):
+            self.tmp_prefix = self._mkdtemp(
+                dir=self.parent, prefix=".", suffix=OVERWRITE_BACKUP_SUFFIX
+            )
+            self._rename(self.prefix, self.tmp_prefix)
+        if create_target:
+            fs.mkdirp(self.prefix)
 
     def __exit__(
         self, exc_type: Optional[type], exc_val: Optional[BaseException], exc_tb: Optional[object]
     ) -> None:
         """Exit the context: cleanup on success, restore on failure."""
+        self.finalize(exc_type)
+
+    def finalize(self, exc_type: Optional[type]) -> None:
+        """Finalize the pivot after the worker has stopped using the prefix."""
         if exc_type is None:
             # Success: remove the backup
             if self.tmp_prefix is not None:
@@ -949,6 +964,59 @@ class PrefixPivoter:
         shutil.rmtree(path, ignore_errors=True)
 
 
+class BuildLifecycle:
+    """Own host-backed stage and prefix transitions for one build."""
+
+    def __init__(self, spec: spack.spec.Spec, keep_stage: bool, keep_prefix: bool = False) -> None:
+        self.spec = spec
+        self.keep_stage = keep_stage
+        self.stage = spec.package.stage
+        self.stage_parent: Optional[str] = None
+        self.stage_path: Optional[str] = None
+        self.prefix_pivoter = PrefixPivoter(str(spec.prefix), keep_prefix=keep_prefix)
+        self._prepared = False
+        self._finalized = False
+
+    def prepare(self, create_prefix_target: bool = False) -> None:
+        """Allocate a private stage parent and prepare the empty install target."""
+        stage_root = self.stage[0].stage_root
+        fs.mkdirp(stage_root)
+        self.stage_parent = tempfile.mkdtemp(dir=stage_root, prefix=f".{self.stage[0].name}-")
+        previous_stage = None
+        previous_stage_path = os.path.join(stage_root, self.stage[0].name)
+        if os.path.lexists(previous_stage_path):
+            previous_stage = tempfile.mkdtemp(dir=stage_root, prefix=".spack-stage-previous-")
+            os.rmdir(previous_stage)
+            fs.rename(previous_stage_path, previous_stage)
+        for stage in self.stage:
+            stage.path = os.path.join(self.stage_parent, stage.name)
+        if previous_stage is not None:
+            fs.rename(previous_stage, self.stage.path)
+        self.stage_path = self.stage.path
+        try:
+            self.prefix_pivoter.prepare(create_target=create_prefix_target)
+        except BaseException:
+            shutil.rmtree(self.stage_parent, ignore_errors=True)
+            raise
+        self._prepared = True
+
+    def finalize(self, exitcode: int) -> None:
+        """Finalize host paths after the child namespace and process are gone."""
+        if not self._prepared or self._finalized:
+            return
+        if exitcode == ExitCode.SUCCESS:
+            self.prefix_pivoter.finalize(None)
+        elif exitcode == ExitCode.BUILD_CACHE_MISS:
+            self.prefix_pivoter.finalize(BinaryCacheMiss)
+        else:
+            self.prefix_pivoter.finalize(RuntimeError)
+        if exitcode in (ExitCode.SUCCESS, ExitCode.BUILD_CACHE_MISS) and not self.keep_stage:
+            assert self.stage_parent is not None
+            self.stage[0].path = os.path.join(self.stage[0].stage_root, self.stage[0].name)
+            shutil.rmtree(self.stage_parent, ignore_errors=True)
+        self._finalized = True
+
+
 class BuildRequest(NamedTuple):
     """Plain data describing a single build to be launched: the input of a build launcher."""
 
@@ -968,6 +1036,8 @@ class BuildRequest(NamedTuple):
     log_path: str
     stop_before: Optional[str]
     stop_at: Optional[str]
+    stage_parent: Optional[str] = None
+    stage_path: Optional[str] = None
 
 
 def worker_function(
@@ -1047,7 +1117,7 @@ def worker_function(
         parent,
         log_path,
         spec=spec,
-        stage_path=spec.package.stage.path,
+        stage_path=request.stage_parent or request.stage_path or spec.package.stage.path,
     )
 
     # Use closefd=False because of the connection objects. Use line buffering.
@@ -1064,8 +1134,7 @@ def worker_function(
     exit_code = ExitCode.SUCCESS
 
     try:
-        with PrefixPivoter(spec.prefix, request.keep_prefix):
-            _install(request, state_stream, spack.store.STORE, sandbox=sandbox)
+        _install(request, state_stream, spack.store.STORE, sandbox=sandbox)
     except spack.error.StopPhase:
         exit_code = ExitCode.STOPPED_AT_PHASE
     except ProcessError as e:
@@ -1546,7 +1615,9 @@ def _install(
     store.layout.create_install_directory(spec)
 
     stage = pkg.stage
-    stage.keep = request.keep_stage
+    # The supervisor removes successful stages after the child namespace is gone. Keeping the
+    # stage here also leaves failed stages untouched for inspection.
+    stage.keep = True
 
     # Then try a source build.
     with stage:
@@ -1602,7 +1673,10 @@ def _install(
             raise spack.error.InstallError(f"'{stop_at}' is not a valid phase for {pkg.name}")
 
         _enable_sandbox(
-            spack.config.CONFIG.get("config:sandbox", {}), spec, stage.path, sandbox=sandbox
+            spack.config.CONFIG.get("config:sandbox", {}),
+            spec,
+            request.stage_parent or stage.path,
+            sandbox=sandbox,
         )
 
         try:
