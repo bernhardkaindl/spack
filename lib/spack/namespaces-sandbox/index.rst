@@ -40,15 +40,22 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   logging thread, the current build worker performs trusted namespace mount
   setup and drops mount authority. The installer applies Landlock before build
   phases. The broader mount policy is Phase 4.
-* **Phase 4 -- planning increment complete, policy work open:** the current
-  narrow mask is represented by an immutable, validated, deterministic mount
-  plan before namespace mutation. Its empty sources are private tmpfs mounts
+* **Phase 4 -- policy model complete, derived tree open:** the current narrow
+  mask is represented by an immutable, validated, deterministic mount plan
+  before namespace mutation. Its empty sources are private tmpfs mounts
   remounted read-only before exposure, so stage write grants cannot populate
   them. Explicit preserved sources declare read-only or read-write access, are
   staged before hiding parents, and are restored through canonical
   merged-``/usr`` aliases in safe order. Read-only file and recursive directory
-  mounts are kernel-enforced without Landlock. Policy-derived compiler, tool,
-  header, runtime, and writable mounts remain future work.
+  mounts are kernel-enforced without Landlock. An immutable filesystem policy
+  now classifies hidden roots, read-only and writable mounts, and generated
+  namespace-local paths; rejects duplicate, overlapping, and access-conflicting
+  entries; and can be built from current trusted installer grants. Compilation
+  rejects classified paths outside its hidden roots and a scratch directory
+  below a hidden root. Preserved sources are rechecked and never recreated if
+  they disappear. The installer-derived policy is not activated:
+  policy-derived compiler, tool, header, runtime, and writable trees remain
+  future work.
 * **Phases 5 and 6 -- not started:** full build-phase policy validation and
   concretizer-worker evaluation remain future work.
 

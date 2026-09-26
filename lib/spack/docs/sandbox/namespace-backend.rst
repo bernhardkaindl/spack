@@ -410,21 +410,54 @@ Phase 4: Policy-driven mount tree
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The immutable mount-plan validation, preserved-source ordering, immutable mask
-source, and read-only/read-write enforcement increments are complete. Extend
-them so the set of hidden directories and bind-mounted content is driven by
-one validated policy rather than a fixed list. The policy derives from:
+source, read-only/read-write enforcement, and filesystem-policy model are
+complete. ``NamespaceFilesystemPolicy`` classifies canonical hidden roots,
+read-only mounts, read-write mounts, and namespace-local generated files or
+directories in immutable tuples. Its builder rejects duplicate, nested, and
+cross-access targets before namespace entry. Generated paths must be below a
+hidden root. Preserved mounts may be below a hidden root because they are the
+explicit content restored after that root is hidden. Requested hidden roots
+must exist and be directories; the installer's optional default mask filters
+an absent host directory before policy construction.
+
+The installer can construct this policy from the paths represented by its
+current Landlock grants: non-external dependency prefixes, the install prefix,
+stage and temporary directories, ``/dev/null``, Spack and upstream ``sbang``,
+and user ``allow_read`` or ``allow_write`` entries. Missing paths retain the
+existing grant behavior and are omitted. Redundant same-access descendants are
+collapsed before policy validation; read-only/read-write conflicts remain
+errors. This construction is trusted installer work and does not mutate the
+filesystem.
+
+Policy construction and mount-plan compilation are deliberately separate. A
+complete policy may classify a trusted path before a suitable hidden root has
+been selected. Compilation refuses such an uncontained path rather than
+silently omitting it. For contained paths, compilation uses the existing
+preservation/restoration plan and creates generated endpoints in the private
+tmpfs before remounting it read-only. ``NamespaceSandbox`` validates and
+compiles the entire policy before ``unshare``. The mount-plan staging directory
+must be outside every hidden root so applying a mask cannot shadow its own
+sources. Preserved sources are rechecked for existence and type immediately
+before mounting and are never recreated if they disappear. File-descriptor
+anchoring against a concurrent same-type source substitution remains future
+hardening; policy construction and application therefore remain trusted,
+single-threaded installer work.
+
+The worker does not activate the installer-derived policy yet. It continues to
+use only the narrow ``/usr/share/aclocal`` mask and transitional Landlock. The
+next policy-driven increment must select hidden roots that make every required
+installer path compilable and cover the selected compilers, build tools,
+headers, package repositories, and Spack source tree. The complete policy
+derives from:
 
 * The concrete spec's selected compilers and build tools.
 * The host's available header trees and compiler installations.
 * The package-repository roots and Spack source tree.
 * The stage, prefix, and temporary directories.
 
-The policy initially derives from the paths represented by the existing
-Landlock grants, but it must classify them as hidden roots, read-only bind
-mounts, writable bind mounts, or generated namespace-local paths. A path that
-is not allowlisted is absent below a hidden root. Once every required path is
-represented and validated, the namespaced worker stops applying Landlock by
-default.
+A path that is not allowlisted is absent below a hidden root. Once every
+required path is represented, compilable, and validated, the namespaced worker
+stops applying Landlock by default.
 
 Phase 5: Build-phase confinement
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

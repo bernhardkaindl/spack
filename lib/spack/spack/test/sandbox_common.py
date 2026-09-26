@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: (Apache-2.0 OR MIT)
 """Platform-agnostic unit tests for the abstract Sandbox interface and installer wiring."""
 
+import os
 import pathlib
 import sys
 import tempfile
@@ -177,3 +178,59 @@ def test_default_hide_as_empty_dirs_skips_external_autoconf():
 
     not_external = types.SimpleNamespace(name="autoconf", external=False)
     assert default_hide_as_empty_dirs(fake_spec([not_external])) == ["/usr/share/aclocal"]
+
+
+def test_namespace_filesystem_policy_from_installer_inputs(monkeypatch, tmp_path: pathlib.Path):
+    from types import SimpleNamespace
+
+    from spack.installer.build import namespace_filesystem_policy_from_inputs
+
+    dependency_prefix = tmp_path / "dependency"
+    dependency_prefix.mkdir()
+    external_prefix = tmp_path / "external"
+    external_prefix.mkdir()
+    install_prefix = tmp_path / "prefix"
+    install_prefix.mkdir()
+    stage_path = tmp_path / "stage"
+    stage_path.mkdir()
+    temporary_path = tmp_path / "temporary"
+    temporary_path.mkdir()
+    custom_read = tmp_path / "custom-read"
+    custom_read.mkdir()
+    custom_write = tmp_path / "custom-write"
+    custom_write.mkdir()
+    store_root = tmp_path / "store"
+    sbang = store_root / "bin" / "sbang"
+    sbang.parent.mkdir(parents=True)
+    sbang.touch()
+
+    dependencies = [
+        SimpleNamespace(name="dependency", external=False, prefix=dependency_prefix),
+        SimpleNamespace(name="external", external=True, prefix=external_prefix),
+    ]
+    spec = SimpleNamespace(prefix=install_prefix, traverse=lambda root=True: iter(dependencies))
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(store_root))
+    monkeypatch.setattr(spack.store.STORE, "upstreams", None)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temporary_path))
+
+    policy = namespace_filesystem_policy_from_inputs(
+        {"allow_read": [str(custom_read)], "allow_write": [str(custom_write)]},
+        spec,
+        str(stage_path),
+    )
+
+    read_only_targets = {pathlib.Path(mount.target) for mount in policy.read_only_mounts}
+    assert read_only_targets == {
+        dependency_prefix.resolve(),
+        custom_read.resolve(),
+        sbang.resolve(),
+    }
+    read_write_targets = {pathlib.Path(mount.target) for mount in policy.read_write_mounts}
+    assert read_write_targets == {
+        stage_path.resolve(),
+        install_prefix.resolve(),
+        temporary_path.resolve(),
+        custom_write.resolve(),
+        pathlib.Path(os.devnull).resolve(),
+    }
+    assert external_prefix.resolve() not in read_only_targets
