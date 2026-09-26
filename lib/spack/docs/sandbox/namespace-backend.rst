@@ -545,6 +545,14 @@ inputs and fail closed when missing or non-canonical. Optional host candidates
 are omitted when unavailable. Selection does not mutate the worker or activate
 the broader policy; pre-thread validation is the next boundary.
 
+C3 makes validation a configuration-free boundary. Whenever selected paths
+and mount-plan scratch are supplied, the immutable selected policy and mount
+plan are always compiled before capability freezing, sandbox acquisition, or
+namespace mutation. Invalid paths therefore abort worker setup rather than
+falling back to an unconstrained worker. The dormant live worker still supplies
+neither input, so it remains on the narrow mask until disposable real compiler
+and source-build evidence is recorded.
+
 The resulting policy must compile with allocated mount-plan scratch outside
 every hidden root, and hidden roots may not overlap the planner's reserved
 source subtrees. Representative synthetic-host tests cover explicit masks,
