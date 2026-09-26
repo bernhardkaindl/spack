@@ -592,11 +592,18 @@ checks.
   post-drop link/device/shared-memory access. Actual application failures stop
   before `Tee` and never fall back after mutation. All 198 affected tests and
   Ruff pass with live namespace evidence enabled. D3.3 concurrent private
-  `/dev` verification is next. Sphinx builds are skipped by user request.
+  `/dev` verification is next. The focused namespace backend Sphinx build was
+  subsequently resumed and passed.
 - 2026-09-26: Completed D3.3 and selected E1. Concurrent disposable namespace
   workers prove private `/dev/shm`, host and cross-worker isolation, literal
   descriptor links, selected-device identity/I/O, `/dev/null` redirection, and
   capability removal. The full D3-affected suite passes 199 tests with live
-  tests enabled; Ruff and whitespace checks pass. Sphinx was skipped as
-  requested. Next is real whole-child install evidence and `spack install m4`;
+  tests enabled; Ruff and whitespace checks pass. Next is real whole-child
+  install evidence and `spack install m4`;
   full lifecycle semantics must not be inferred from the D3 activation test.
+- 2026-09-26: E1.1 addressed the first real m4 blocker: a fresh checkout has no
+  configured fetch-cache directory, which lazy fetch code usually creates
+  only after namespace activation. Trusted setup now creates only that
+  canonical configured root before compiling the policy; symlinked/noncanonical
+  spellings fail closed. A production assembly regression proves the cache
+  starts absent and is writable-selected. E1.2 m4 retry is next.
