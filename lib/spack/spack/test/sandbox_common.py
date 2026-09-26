@@ -63,6 +63,8 @@ def test_namespace_policy_data_is_loaded_from_yaml():
     assert "tar" in policy["stage_programs"]
     assert "chmod" in policy["stage_programs"]
     assert "expr" in policy["stage_programs"]
+    assert "ls" in policy["stage_programs"]
+    assert "rm" in policy["stage_programs"]
     assert "sed" in policy["stage_programs"]
     assert header_policy["version"] == 1
     assert header_policy["system_include_root"] == "/usr/include"
