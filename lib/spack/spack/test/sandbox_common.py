@@ -209,6 +209,14 @@ def test_compiler_driver_paths_preserve_alias_spellings(tmp_path: pathlib.Path, 
         build.ResolvedSandboxPath(str(compiler.parent / "cc"), str(compiler)),
         build.ResolvedSandboxPath(str(compiler.parent / "gcc"), str(compiler)),
     ]
+    assert build.compiler_alias_symlink_paths(spec, policy) == [
+        spack.sandbox_namespaces.NamespaceGeneratedSymlink(
+            str(compiler.parent / "cc"), str(compiler)
+        ),
+        spack.sandbox_namespaces.NamespaceGeneratedSymlink(
+            str(compiler.parent / "gcc"), str(compiler)
+        ),
+    ]
 
 
 def test_executable_support_paths_select_file_magic_and_cpp_cc1(
@@ -607,7 +615,15 @@ def test_complete_namespace_policy_from_installer_inputs(monkeypatch, tmp_path: 
         Any, SimpleNamespace(prefix=install_prefix, traverse=lambda root=True: iter(dependencies))
     )
     selected_paths = NamespacePolicyInputPaths(
-        hidden_roots=(str(hidden_host_state),),
+        hidden_roots=(
+            str(hidden_host_state),
+            str(host / "usr"),
+            str(host / "repos-python"),
+            str(host / "store"),
+            str(host / "build"),
+            str(spack_prefix),
+            str(pathlib.Path(os.devnull).parent),
+        ),
         compiler_paths=(str(compiler),),
         tool_paths=(str(tool),),
         header_paths=(str(headers), str(compiler_headers)),
@@ -643,7 +659,7 @@ def test_complete_namespace_policy_from_installer_inputs(monkeypatch, tmp_path: 
         str(pathlib.Path(os.devnull).resolve().parent),
         str((host / "build").resolve()),
         str(hidden_host_state.resolve()),
-        str(repository_composition_root.resolve()),
+        str(repository_python_path.resolve()),
         str(spack_prefix.resolve()),
         str((host / "store").resolve()),
         str((host / "usr").resolve()),
@@ -671,29 +687,33 @@ def test_complete_namespace_policy_rejects_missing_selected_path(
 
     existing = tmp_path / "existing"
     existing.mkdir()
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    source_root = tmp_path / "source"
+    source_root.mkdir()
     missing = tmp_path / "missing-compiler"
     spec = cast(Any, SimpleNamespace(prefix=existing, traverse=lambda root=True: iter(())))
     selected_paths = NamespacePolicyInputPaths(
-        hidden_roots=(str(existing),),
+        hidden_roots=(str(hidden),),
         compiler_paths=(str(missing),),
-        tool_paths=(str(existing),),
-        header_paths=(str(existing),),
-        runtime_paths=(str(existing),),
+        tool_paths=(str(source_root),),
+        header_paths=(str(source_root),),
+        runtime_paths=(str(source_root),),
         temporary_paths=(str(existing),),
     )
     monkeypatch.setattr(
         spack.repo,
         "PATH",
-        SimpleNamespace(repos=[SimpleNamespace(root=str(existing), python_path=None)]),
+        SimpleNamespace(repos=[SimpleNamespace(root=str(source_root), python_path=None)]),
     )
-    monkeypatch.setattr(spack.paths, "bin_path", str(existing))
-    monkeypatch.setattr(spack.paths, "lib_path", str(existing))
-    monkeypatch.setattr(spack.paths, "share_path", str(existing))
-    monkeypatch.setattr(spack.paths, "etc_path", str(existing))
-    sbang = tmp_path / "store" / "bin" / "sbang"
+    monkeypatch.setattr(spack.paths, "bin_path", str(source_root))
+    monkeypatch.setattr(spack.paths, "lib_path", str(source_root))
+    monkeypatch.setattr(spack.paths, "share_path", str(source_root))
+    monkeypatch.setattr(spack.paths, "etc_path", str(source_root))
+    sbang = source_root / "store" / "bin" / "sbang"
     sbang.parent.mkdir(parents=True)
     sbang.touch()
-    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(tmp_path / "store"))
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(source_root / "store"))
     monkeypatch.setattr(spack.store.STORE, "upstreams", None)
 
     with pytest.raises(spack.sandbox_namespaces.NamespaceSetupError, match=str(missing)):
@@ -717,14 +737,17 @@ def test_complete_namespace_policy_rejects_missing_selected_path(
         )
 
     with pytest.raises(
-        spack.sandbox_namespaces.NamespaceSetupError, match="without hiding the filesystem root"
+        spack.sandbox_namespaces.NamespaceSetupError,
+        match="classified path is not below a hidden root",
     ):
+        uncovered_temporary = tmp_path / "uncovered-temporary"
+        uncovered_temporary.mkdir()
         namespace_filesystem_policy_and_plan_from_inputs(
             {},
             spec,
             str(existing),
             str(tmp_path / "mount-plan"),
             selected_paths._replace(
-                compiler_paths=(str(compiler),), temporary_paths=(tempfile.gettempdir(),)
+                compiler_paths=(str(compiler),), temporary_paths=(str(uncovered_temporary),)
             ),
         )
