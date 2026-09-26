@@ -656,3 +656,7 @@ checks.
   reported `sed: not found` because `sed` was not selected in `sandbox.yaml`.
   Added `sed` to the stage-tool policy and asserted the shipped policy contains
   it. The next real m4 retry will test the production selector and mount.
+- 2026-09-26: With `sed` selected, gmake configure advanced but reported
+  `chmod: not found`. Added `chmod` to the stage-tool policy and its shipped
+  policy test. Retry m4 to continue measuring the install child's actual tool
+  needs.
