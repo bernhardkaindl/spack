@@ -192,18 +192,25 @@ sources. A missing target remains a no-op for the narrow mask. An existing
 stage path must be a directory; a not-yet-created stage path is created only
 when the validated plan is applied.
 
-The plan also accepts explicitly selected source-to-target pairs for the
-policy-driven tree. Source paths and targets are canonicalized, source and
-target file types are checked, and a target must be below a hidden directory.
-The plan creates stage-owned preservation endpoints before hiding parents,
-then restores those endpoints into the hidden tree in increasing target-depth
-order. This handles merged-``/usr`` aliases by planning against their resolved
-targets and uses recursive bind mounts only for preserved directory trees.
+The plan also accepts explicitly selected source-to-target requests for the
+policy-driven tree. Every request declares read-only or read-write access.
+Source paths and targets are canonicalized, source and target file types are
+checked, and a target must be below a hidden directory. The plan creates
+stage-owned preservation endpoints before hiding parents, then restores those
+endpoints into the hidden tree in increasing target-depth order. This handles
+merged-``/usr`` aliases by planning against their resolved targets and uses
+recursive bind mounts only for preserved directory trees.
+
+Read-only requests use ``mount_setattr(MOUNT_ATTR_RDONLY)`` on both the
+preserved and restored aliases. Directory requests use ``AT_RECURSIVE`` so
+nested mounts cannot retain write access. Read-write requests do not receive
+that attribute. This access distinction is enforced by the mount namespace and
+does not depend on Landlock.
 
 This is the planning and validation boundary for Phase 4, not the complete
-policy-driven mount tree. Selecting the compiler, tool, and header source set
-and replacing writable stage-owned mask sources with immutable empty sources
-remain open.
+policy-driven mount tree. Immutable empty sources and mount access modes are
+implemented; selecting the compiler, tool, header, runtime, and writable path
+set remains open.
 
 Base mounts
 ~~~~~~~~~~~
@@ -244,9 +251,11 @@ content the worker needs into the visible tree:
   are bind-mounted or remained accessible through the mount tree.
 
 The bind mounts use ``MS_REC`` where needed to expose directory trees, but
-each bind mount targets a specific resolved path. The worker never sees the
-host ``/usr/bin`` or ``/usr/include`` parent; it sees only the bind-mounted
-content the trusted parent selected.
+each bind mount targets a specific resolved path. Tool, header, runtime, and
+dependency mounts are read-only. Stage, prefix, and selected temporary mounts
+are read-write. The worker never sees the host ``/usr/bin`` or
+``/usr/include`` parent; it sees only the bind-mounted content the trusted
+parent selected.
 
 This is the key improvement over Landlock alone: a build tool that searches
 ``/usr/include`` for a header sees either an empty directory or the
@@ -400,10 +409,10 @@ further inner layer; see `Relationship to Landlock (and future seccomp)`_.
 Phase 4: Policy-driven mount tree
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The immutable mount-plan validation and preserved-source ordering increments
-are complete for the current narrow mask. Extend them so the set of hidden
-directories and bind-mounted content is driven by policy rather than a fixed
-list. The policy derives from:
+The immutable mount-plan validation, preserved-source ordering, immutable mask
+source, and read-only/read-write enforcement increments are complete. Extend
+them so the set of hidden directories and bind-mounted content is driven by
+one validated policy rather than a fixed list. The policy derives from:
 
 * The concrete spec's selected compilers and build tools.
 * The host's available header trees and compiler installations.
