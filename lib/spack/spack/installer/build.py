@@ -1696,7 +1696,13 @@ def prepare_namespace_activation(
 
     scratch = None
     last_error = None
-    for base_path in (tempfile.gettempdir(), spack.paths.var_path, "/var", "/opt"):
+    for base_path in (
+        tempfile.gettempdir(),
+        spack.paths.var_path,
+        "/run/lock",
+        "/var",
+        "/opt",
+    ):
         try:
             scratch = spack.sandbox_namespaces.allocate_namespace_mount_plan_scratch(
                 policy,
