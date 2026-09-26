@@ -43,7 +43,9 @@ stage_programs:
 - git
 - gunzip
 - gzip
+- ls
 - patch
+- rm
 - sed
 - sh
 - tar
