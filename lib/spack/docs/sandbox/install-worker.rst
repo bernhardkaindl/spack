@@ -49,12 +49,11 @@ The user interface is a worker option for the existing installer, not a new comm
 Build-phase confinement is a later, separate milestone.
 Compiler selection and build-tool access are recorded now, but must not delay staging integration.
 
-When build-phase confinement is enabled, Spack enters a private user and mount namespace, prepares the selected mount view, and drops namespace capabilities before starting the logging thread. Landlock is then applied before build phases, using the Linux user and mount namespace backend described in :doc:`namespace-backend`.
+When automatic namespace activation is available, the install child enters a private user and mount namespace, prepares the complete selected mount view, and drops namespace capabilities before starting the logging thread. Landlock is used only as the constrained fallback when namespace capability probing fails. The Linux user and mount namespace backend is described in :doc:`namespace-backend`.
 The namespace maps the invoking user's numeric UID and GID to the same values, so programs do not mistake the unprivileged worker for UID 0.
-The current narrow integration bind-mounts an empty stage-owned directory over ``/usr/share/aclocal`` unless the concrete spec has an external ``autoconf`` dependency. Phase 4 will hide selected host ``bin``, ``include``, and other directories and bind-mount only the whitelisted programs, headers, and paths the concrete spec needs.
-This prevents sandboxed builds from scanning host Autoconf macros while preserving the host macro directory for a host-provided Autoconf.
+The selected policy hides configured host roots, including executable, header, home, temporary, and device paths, and restores only selected tools, headers, runtime files, repositories, and source trees. The stage and install prefix are separate writable mounts; Spack sources and package recipes remain read-only. An empty stage-owned directory is mounted over ``/usr/share/aclocal`` unless the concrete spec has an external ``autoconf`` dependency. This prevents sandboxed builds from scanning host Autoconf macros while preserving the host macro directory for a host-provided Autoconf.
 When unprivileged user and mount namespaces are unavailable, Spack falls back to the existing Landlock-only behavior instead of failing unrelated builds.
-Other namespace or mount setup failures fail the build before recipe-controlled build phases run.
+Other namespace or mount setup failures fail the build before recipe-controlled work runs.
 
 Trust Boundary
 --------------
@@ -236,7 +235,7 @@ It grants only the listed glibc and Linux UAPI files and directories that exist 
 The listed glibc-compatible files include ``crypt.h`` because Perl requires the libxcrypt interface while bootstrapping, and making libxcrypt a build dependency would introduce a dependency cycle.
 It never grants the ``/usr/include`` parent.
 The runtime policy uses compiler-reported paths and filesystem presence checks without querying a distribution package manager.
-For non-GCC C++ compilers, the planned policy selects the newest installed libstdc++ version at or below its compatibility ceiling. Phase 4 of the Linux user and mount namespace backend described in :doc:`namespace-backend` will mask competing GCC installation candidates.
+For non-GCC C++ compilers, the selected policy uses the newest installed libstdc++ version at or below its compatibility ceiling and masks competing GCC installation candidates through the Linux user and mount namespace backend described in :doc:`namespace-backend`.
 
 The build worker exposes allowlisted host tools and static compatibility commands from ``share/spack/sandbox/commands`` through persistent symlinks in ``config:install_tree:root/bin``.
 It uses the resolved, unpadded store root, alongside ``sbang``, so interpreter paths embedded in installed scripts survive stage cleanup.
@@ -250,7 +249,7 @@ Existing matching host links are reused; conflicting links or regular files fail
 Concurrent creation of the same link is safe, and confined build code receives no write grant to the shared directory.
 Store owners must keep host targets available and manage intentional tool changes; these links do not make host interpreters portable to another machine or repair previously installed stage-local shebangs.
 PATH filtering controls ordinary discovery, not filesystem visibility or absolute-path execution.
-Landlock alone grants individual selected executable paths and cannot hide directory entries in ``/usr/bin``. Phase 4 of the Linux user and mount namespace backend described in :doc:`namespace-backend` will hide host ``bin`` and ``include`` directories and bind-mount only whitelisted content; the current narrow integration does not yet provide that policy-driven view.
+The Linux user and mount namespace backend described in :doc:`namespace-backend` hides host ``bin`` and ``include`` directories and bind-mounts only selected content. Landlock remains the constrained fallback and cannot hide directory entries in ``/usr/bin``.
 Future portable host-tool support would require managed tool dependencies rather than host symlinks.
 Only command names registered by trusted Spack code are granted read and execute access.
 The initial ``df`` command accepts only ``df -P -B1 .`` and returns a fixed synthetic filesystem row with one pebibyte available.

@@ -50,15 +50,13 @@ Before launching a worker, the parent selects:
 * the concrete-spec-selected compilers, build tools, headers, and dependency
   prefixes.
 
-When available, the parent prefers a Linux user and mount namespace backend
-described in :doc:`namespace-backend`.  The current narrow integration masks
-``/usr/share/aclocal`` when an external Autoconf does not require it. Phase 4
-will hide host ``bin``, ``include``, and other directories and bind-mount only
-the whitelisted programs, headers, and paths the worker needs. The completed
-namespace policy is the default filesystem confinement and makes unavailable
-paths naturally return ``ENOENT``. Landlock inside the namespace is reserved
-for opt-in testing of permission-denied behavior. The current narrow
-integration still applies it until the policy-driven mount tree is complete.
+When available, the parent selects the Linux user and mount namespace backend
+described in :doc:`namespace-backend`. The selected policy hides host
+``bin``, ``include``, home, temporary, and device roots and restores only the
+whitelisted programs, headers, runtime files, and worker paths. It also masks
+``/usr/share/aclocal`` when an external Autoconf does not require it. Unlisted
+paths below hidden roots naturally return ``ENOENT``. Landlock is used only as
+the constrained fallback when namespace capability probing fails.
 
 When unprivileged user and mount namespaces are unavailable, the parent uses
 the existing Landlock-only backend.  Landlock grants read and execute access
