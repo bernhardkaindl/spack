@@ -643,3 +643,12 @@ checks.
   prefixes at `/usr` claiming host `/usr/bin` tools and suppressing narrower
   compiler/runtime paths. `tool_runtime_paths` now excludes external owners;
   the full sandbox-common suite passes 30 tests and Ruff is clean. Retry m4.
+- 2026-09-26: The next m4 attempt installed `gcc-runtime` but gmake could not
+  execute its host-present `spack-src/configure` (`ENOENT`). The script's
+  `#!/bin/sh` interpreter was absent because stage-tool selection retained
+  `sh` as a logical spelling, mounted canonical `/usr/bin/dash`, and did not
+  generate `/usr/bin/sh` beneath the hidden `/usr/bin`. Trusted activation now
+  restores selected stage-tool aliases when their canonical executable is
+  already selected. A focused alias regression and live nested-stage namespace
+  test pass; the two sandbox suites pass 138 tests, with Ruff and whitespace
+  checks clean. E1 remains open pending the next real m4 install.
