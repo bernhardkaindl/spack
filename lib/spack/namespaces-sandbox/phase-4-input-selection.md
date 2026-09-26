@@ -716,3 +716,11 @@ not close that lifecycle gap.
   absent header candidates while retaining existing selected paths; the
   production regression covers this behavior. All 30 sandbox-common tests and
   Ruff pass. Retry the real install next.
+- 2026-09-26: The next worker run exposed two distinct issues. Launching from
+  the primary checkout caused cleanup to return to its now-hidden `/home`
+  cwd; rerunning from the disposable worktree fixed that harness issue, and
+  `compiler-wrapper` installed. `gcc-runtime` still failed importing
+  `sysconfig`: policy tracing showed `tool_runtime_paths` attributing host
+  `/usr/bin` tools to external GCC/glibc prefixes at `/usr`, collapsing the
+  narrower compiler and Python runtime selections. Tool ownership now excludes
+  external package prefixes. All 30 sandbox-common tests and Ruff pass; retry m4.

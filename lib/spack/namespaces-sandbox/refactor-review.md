@@ -636,3 +636,10 @@ checks.
   them to required-path validation. Activation now filters missing header
   candidates while preserving present paths, with production-assembler test
   coverage. All 30 sandbox-common tests and Ruff pass; retry m4.
+- 2026-09-26: The next worker run also reported a cwd cleanup error because it
+  was launched from the primary checkout under hidden `/home`; rerunning from
+  the disposable worktree installed `compiler-wrapper`. `gcc-runtime` then
+  failed importing `sysconfig`. Policy tracing found external GCC/glibc
+  prefixes at `/usr` claiming host `/usr/bin` tools and suppressing narrower
+  compiler/runtime paths. `tool_runtime_paths` now excludes external owners;
+  the full sandbox-common suite passes 30 tests and Ruff is clean. Retry m4.
