@@ -1916,8 +1916,14 @@ def _prepare_namespace_sandbox_before_threads(
                 spack.util.tty.warn(
                     "Build sandbox could not mask host directories; kernel namespaces unavailable"
                 )
-        if prepared and not sandbox.drop_mount_authority():
-            raise spack.error.InstallError("Cannot drop namespace mount authority")
+        if prepared:
+            if (
+                isinstance(sandbox, spack.sandbox_namespaces.NamespaceSandbox)
+                and not config.get("allow_network", False)
+            ):
+                sandbox.prepare_network_namespace()
+            if not sandbox.drop_mount_authority():
+                raise spack.error.InstallError("Cannot drop namespace mount authority")
         if prepared and namespace_activation is not None:
             _configure_namespace_worker_environment(namespace_activation.worker_root)
     return sandbox
@@ -2015,8 +2021,11 @@ def _enable_sandbox(
             spack.util.tty.warn(
                 "Build sandbox could not mask host directories; kernel namespaces unavailable"
             )
-        elif not sandbox.drop_mount_authority():
-            raise spack.error.InstallError("Cannot drop namespace mount authority")
+        else:
+            if not config.get("allow_network", False):
+                sandbox.prepare_network_namespace()
+            if not sandbox.drop_mount_authority():
+                raise spack.error.InstallError("Cannot drop namespace mount authority")
 
     try:
         for dep in spec.traverse(root=False):
@@ -2042,7 +2051,7 @@ def _enable_sandbox(
         for p in config.get("allow_write", []):
             sandbox.allow_write(p)
 
-        sandbox.apply(block_network=not config.get("allow_network", True))
+        sandbox.apply(block_network=not config.get("allow_network", False))
     except spack.sandbox.SandboxError as e:
         raise spack.error.InstallError(f"Cannot enable build sandbox: {e}") from e
 

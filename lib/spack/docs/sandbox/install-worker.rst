@@ -11,13 +11,13 @@ It does not propose another install command, scheduler, UI, source plan, provena
 
 The trusted command parent keeps command parsing, concretization, install scheduling, locks, build-cache policy, database writes, terminal UI, and final presentation.
 The worker uses existing staging and build operations under confinement.
-Source downloads use the existing network supervisor and proxy; the worker never receives direct network access.
+Source downloads use the existing network supervisor and proxy. Direct worker networking is disabled by default; setting ``config:sandbox:allow_network: true`` opts out of network-namespace isolation on Linux.
 
 Status and Scope
 ----------------
 
 The capability-selection, bounded native-spec request, ``spack stage`` worker, and existing-installer staging integration are implemented.
-Build-phase confinement remains a separate milestone.
+The install sandbox is enabled by default on supported platforms; further build-phase policy hardening remains a separate milestone.
 
 Checklist notation is intentionally text-based for now:
 
@@ -271,7 +271,7 @@ Learned entries use package-name selectors and individually resolved executable 
 Learning mode also routes build-phase TCP through an invocation-scoped proxy owned by the trusted installer parent.
 It permits public HTTP, HTTPS, and FTP destinations for discovery, warns immediately for each new canonical destination, and prints a deduplicated package summary after the build attempt.
 The parent records each destination in a reusable ``network-allow-<host>`` group and adds the package-name selector.
-Outside learning mode, only matching network groups may use the proxy; builds never receive direct socket access unless the explicit legacy ``allow_network`` option is enabled.
+Outside learning mode, only matching network groups may use the proxy. Builds do not receive direct network access unless ``config:sandbox:allow_network`` is enabled.
 
 The trusted installer parent supplies invocation-scoped proxy credentials to Maven Wrapper through ``MAVEN_OPTS`` and writes Maven Resolver settings below the isolated build home.
 Basic proxy authentication is enabled only for that build, and Resolver 1.x downloads are serialized because parallel initial CONNECT requests can race its shared authentication cache and fail with HTTP 407.
