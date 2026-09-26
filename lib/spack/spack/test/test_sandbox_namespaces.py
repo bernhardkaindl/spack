@@ -7,6 +7,7 @@
 import errno
 import io
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -1687,6 +1688,129 @@ def test_namespace_worker_environment_unchanged_for_fallback(tmp_path, monkeypat
     assert os.environ == inherited_environment
     assert build.tempfile.tempdir == "/inherited-temp"
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
+def test_live_private_devices_and_concurrent_shared_memory(tmp_path):
+    if not ns.namespace_sandbox_available():
+        pytest.skip("unprivileged namespaces unavailable")
+    code = """
+import errno
+import os
+import stat
+import sys
+from pathlib import Path
+from spack.installer import build
+import spack.spec
+import spack.sandbox_namespaces as ns
+
+worker, scratch, host_shm, token = sys.argv[1:]
+data = build._load_sandbox_policy()
+devices = [(path, path) for path in data['device_nodes'] if os.path.exists(path)]
+device_ids = {path: os.stat(path).st_rdev for path, _ in devices}
+policy = ns.build_namespace_filesystem_policy(
+    ['/dev'], read_write_mounts=devices + [(worker, worker)],
+    generated_symlinks=[ns.NamespaceGeneratedSymlink(path, target)
+                        for path, target in data['device_symlinks'].items()],
+    tmpfs_paths=data['tmpfs_paths'], read_only_view=True,
+)
+sandbox = build._prepare_namespace_sandbox_before_threads(
+    {'enable': True}, spack.spec.Spec(), worker,
+    namespace_activation=build.NamespaceActivation(policy, scratch, worker),
+)
+assert sandbox.filesystem_policy_active
+assert set(os.listdir('/dev')) == {
+    Path(path).name for path, _ in devices
+} | {'shm', 'fd', 'stdin', 'stdout', 'stderr'}
+for path, device_id in device_ids.items():
+    assert stat.S_ISCHR(os.stat(path).st_mode)
+    assert os.stat(path).st_rdev == device_id
+assert stat.S_IMODE(os.stat('/dev/shm').st_mode) == 0o1777
+assert not os.path.exists(host_shm)
+for path, target in data['device_symlinks'].items():
+    assert os.readlink(path) == target
+with open('/dev/null', 'wb') as stream:
+    stream.write(b'discard')
+with open('/dev/null', 'rb') as stream:
+    assert stream.read(1) == b''
+with open('/dev/zero', 'rb') as stream:
+    assert stream.read(16) == bytes(16)
+for path in ('/dev/random', '/dev/urandom'):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        assert len(os.read(descriptor, 16)) == 16
+    finally:
+        os.close(descriptor)
+descriptor = os.open('/dev/full', os.O_WRONLY)
+try:
+    try:
+        os.write(descriptor, b'full')
+    except OSError as error:
+        assert error.errno == errno.ENOSPC
+    else:
+        raise AssertionError('/dev/full accepted write')
+finally:
+    os.close(descriptor)
+with open('/dev/shm/spack-concurrent', 'x+') as stream:
+    stream.write(token)
+    stream.flush()
+    with open('/dev/fd/' + str(stream.fileno())) as alias:
+        assert alias.read() == token
+    with open('/dev/stdout', 'w') as output:
+        output.write('ready\\n')
+    with open('/dev/stderr', 'w') as output:
+        output.write('descriptor stderr\\n')
+    with open('/dev/stdin') as input_stream:
+        assert input_stream.readline() == 'release\\n'
+    stream.seek(0)
+    assert stream.read() == token
+status = Path('/proc/self/status').read_text().splitlines()
+assert all(int(line.split()[1], 16) == 0 for line in status
+           if line.startswith(('CapEff:', 'CapPrm:', 'CapInh:')))
+try:
+    sandbox.bind_mount(worker)
+except ns.SandboxError:
+    pass
+else:
+    raise AssertionError('mount authority retained')
+os._exit(0)
+"""
+    processes = []
+    with build.tempfile.NamedTemporaryFile(prefix="spack-host-shm-", dir="/dev/shm") as host:
+        host.write(b"host-private")
+        host.flush()
+        try:
+            for index in range(2):
+                worker = tmp_path / f"worker-{index}"
+                worker.mkdir()
+                scratch = tmp_path / f"scratch-{index}"
+                scratch.mkdir()
+                processes.append(
+                    subprocess.Popen(
+                        [sys.executable, "-c", code, str(worker), str(scratch),
+                         host.name, str(index)],
+                        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        universal_newlines=True,
+                    )
+                )
+            for process in processes:
+                assert select.select([process.stdout], [], [], 20)[0], "worker never became ready"
+                ready = process.stdout.readline()
+                if ready != "ready\n":
+                    _, errors = process.communicate(timeout=10)
+                    pytest.fail(errors)
+            for process in processes:
+                _, errors = process.communicate("release\n", timeout=20)
+                assert process.returncode == 0, errors
+                assert errors == "descriptor stderr\n"
+            host.seek(0)
+            assert host.read() == b"host-private"
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=10)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
