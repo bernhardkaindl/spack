@@ -134,6 +134,7 @@ class NamespaceFilesystemPolicy(NamedTuple):
     generated_paths: Tuple[NamespaceGeneratedPath, ...] = ()
     replacement_mounts: Tuple[NamespaceMountRequest, ...] = ()
     generated_symlinks: Tuple[NamespaceGeneratedSymlink, ...] = ()
+    read_only_view: bool = False
 
 
 class NamespacePreservedMount(NamedTuple):
@@ -155,6 +156,7 @@ class NamespaceMountPlan(NamedTuple):
     generated_paths: Tuple[NamespaceGeneratedPath, ...] = ()
     replacement_mounts: Tuple[NamespacePreservedMount, ...] = ()
     generated_symlinks: Tuple[NamespaceGeneratedSymlink, ...] = ()
+    read_only_view: bool = False
 
 
 _active_namespace_mount_plan_scratch = set()
@@ -286,15 +288,18 @@ def _mount_plan_error(operation: str, reason: str, error_number: int = errno.EIN
     raise NamespaceSetupError(error_number, operation, reason)
 
 
-def _set_mount_read_only(libc: ctypes.CDLL, target: str, recursive: bool) -> None:
-    """Make one bind mount or mount tree read-only without changing its source mount."""
+def _set_mount_access(libc: ctypes.CDLL, target: str, recursive: bool, read_only: bool) -> None:
+    """Set one mount's access without changing its source mount."""
     try:
         mount_setattr = libc.mount_setattr
     except AttributeError:
         _mount_plan_error(
             "mount_setattr(MOUNT_ATTR_RDONLY)", "libc does not expose mount_setattr", errno.ENOSYS
         )
-    attributes = _MountAttr(attr_set=MOUNT_ATTR_RDONLY)
+    attributes = _MountAttr(
+        attr_set=MOUNT_ATTR_RDONLY if read_only else 0,
+        attr_clr=0 if read_only else MOUNT_ATTR_RDONLY,
+    )
     _check_syscall(
         mount_setattr(
             ctypes.c_int(AT_FDCWD),
@@ -305,6 +310,16 @@ def _set_mount_read_only(libc: ctypes.CDLL, target: str, recursive: bool) -> Non
         ),
         "mount_setattr(MOUNT_ATTR_RDONLY)",
     )
+
+
+def _set_mount_read_only(libc: ctypes.CDLL, target: str, recursive: bool) -> None:
+    """Make one bind mount or mount tree read-only without changing its source mount."""
+    _set_mount_access(libc, target, recursive, True)
+
+
+def _set_mount_writable(libc: ctypes.CDLL, target: str, recursive: bool) -> None:
+    """Clear read-only access on one bind mount without changing its source mount."""
+    _set_mount_access(libc, target, recursive, False)
 
 
 def _path_contains(parent: str, child: str) -> bool:
@@ -420,6 +435,7 @@ def build_namespace_filesystem_policy(
     generated_paths: Iterable[NamespaceGeneratedPath] = (),
     replacement_mounts: Iterable[Tuple[str, str]] = (),
     generated_symlinks: Iterable[NamespaceGeneratedSymlink] = (),
+    read_only_view: bool = False,
 ) -> NamespaceFilesystemPolicy:
     """Canonicalize and validate namespace filesystem intent.
 
@@ -566,6 +582,7 @@ def build_namespace_filesystem_policy(
         canonical_generated,
         canonical_replacement,
         canonical_symlinks,
+        read_only_view,
     )
 
 
@@ -574,6 +591,11 @@ def _validated_namespace_filesystem_policy(
 ) -> NamespaceFilesystemPolicy:
     if not isinstance(policy, NamespaceFilesystemPolicy):
         _mount_plan_error("validate namespace policy", f"invalid policy: {policy!r}")
+    if not isinstance(policy.read_only_view, bool):
+        _mount_plan_error(
+            "validate namespace policy read-only view",
+            f"invalid read-only view: {policy.read_only_view!r}",
+        )
     read_only_mounts = []
     read_write_mounts = []
     for mount in policy.read_only_mounts:
@@ -608,6 +630,7 @@ def _validated_namespace_filesystem_policy(
         policy.generated_paths,
         replacement_mounts,
         policy.generated_symlinks,
+        policy.read_only_view,
     )
     if policy != validated:
         _mount_plan_error("validate namespace policy", "policy is not canonical")
@@ -660,6 +683,7 @@ def build_namespace_mount_plan_from_policy(
         policy.generated_paths,
         plan.replacement_mounts,
         policy.generated_symlinks,
+        policy.read_only_view,
     )
 
 
@@ -844,10 +868,35 @@ def _build_namespace_mount_plan(
 
 def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> bool:
     """Create and apply a previously validated namespace mount plan."""
-    if not plan.mounts and not plan.preserved_mounts and not plan.replacement_mounts:
+    if (
+        not plan.mounts
+        and not plan.preserved_mounts
+        and not plan.replacement_mounts
+        and not plan.read_only_view
+    ):
         return True
 
     os.makedirs(plan.stage_path, exist_ok=True)
+
+    for preserved in plan.preserved_mounts + plan.replacement_mounts:
+        if not os.path.exists(preserved.source):
+            _mount_plan_error(
+                "apply mount plan source",
+                f"mount source disappeared: {preserved.source}",
+                errno.ENOENT,
+            )
+        if os.path.isdir(preserved.source) != preserved.source_is_directory:
+            _mount_plan_error(
+                "apply mount plan source",
+                f"mount source type changed: {preserved.source}",
+                errno.ENOTDIR,
+            )
+    for preserved in plan.preserved_mounts:
+        if preserved.source_is_directory:
+            os.makedirs(preserved.target, exist_ok=True)
+        else:
+            os.makedirs(os.path.dirname(preserved.target), exist_ok=True)
+            Path(preserved.target).touch()
 
     def apply_mount(
         source: str,
@@ -886,15 +935,18 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
         )
         if access is NamespaceMountAccess.READ_ONLY:
             _set_mount_read_only(libc, target, recursive)
+        elif plan.read_only_view:
+            _set_mount_writable(libc, target, recursive)
 
-    for mount in plan.preserved_mounts:
-        apply_mount(
-            mount.source,
-            mount.target,
-            mount.source_is_directory,
-            mount.source_is_directory,
-            mount.access,
-        )
+    if not plan.read_only_view:
+        for mount in plan.preserved_mounts:
+            apply_mount(
+                mount.source,
+                mount.target,
+                mount.source_is_directory,
+                mount.source_is_directory,
+                mount.access,
+            )
 
     if plan.mounts:
         empty_root = os.path.join(plan.stage_path, "spack-empty-host-dirs")
@@ -951,8 +1003,28 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
             "mount(MS_REMOUNT, MS_RDONLY mask source)",
         )
 
+    if plan.read_only_view:
+        _set_mount_read_only(libc, "/", True)
+
+    if plan.read_only_view:
+        for mount in plan.preserved_mounts:
+            apply_mount(
+                mount.source,
+                mount.target,
+                mount.source_is_directory,
+                mount.source_is_directory,
+                mount.access,
+            )
     for mount in plan.mounts:
-        apply_mount(mount.source, mount.target, True, False)
+        apply_mount(
+            mount.source,
+            mount.target,
+            True,
+            False,
+            NamespaceMountAccess.READ_ONLY
+            if plan.read_only_view
+            else NamespaceMountAccess.READ_WRITE,
+        )
     for replacement in plan.replacement_mounts:
         apply_mount(
             replacement.source,
@@ -1121,7 +1193,9 @@ def _probe_namespace_capability(libc) -> NamespaceCapability:
                     ),
                     "mount(MS_BIND probe)",
                 )
+                _set_mount_read_only(libc, "/", True)
                 _set_mount_read_only(libc, bind_target, True)
+                _set_mount_writable(libc, bind_target, False)
                 _drop_namespace_capabilities(libc)
             except NamespaceSetupError as error:
                 result = NamespaceCapability(False, error.operation, error.reason)

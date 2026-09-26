@@ -109,11 +109,12 @@ compensated for Landlock's inability to hide paths are not ported (see
   Selected paths below a replacement root, such as a default stage root, are
   preserved before replacement and restored afterward. The scoped worker
   source allocation remains a later host/device and worker-state selection.
-- [ ] Replace Landlock write rules with a recursively read-only view plus
-  explicit writable mounts. Prove in a disposable namespace that setting
-  `MOUNT_ATTR_RDONLY` recursively on inherited mounts is permitted, that
-  user-writable passthrough trees then return `EROFS`, and that each selected
-  writable mount stays writable.
+- [x] Replace Landlock write rules with a recursively read-only view plus
+  explicit writable mounts. Selected-tree plans set `MOUNT_ATTR_RDONLY`
+  recursively on the inherited mount tree, then clear it only on explicit
+  read-write bind mounts. The capability probe and disposable namespace tests
+  prove recursive setup, `EROFS` for inherited passthrough writes, and writes
+  through selected writable mounts. The live worker remains unchanged.
 - [ ] Hide `/home`, `/root`, and `/run/user`; restore the Spack source, store,
   repository, configuration, and cache paths located there. Point `HOME`,
   `XDG_CACHE_HOME`, and Java `user.home`/`java.io.tmpdir` at the scoped
@@ -173,7 +174,7 @@ compensated for Landlock's inability to hide paths are not ported (see
   `spack-empty-host-dirs` are private setup scratch for mount endpoints, not
   the build stage and not copies of Spack's package sources. Its location or
   removal has no bearing on host visibility or retention of the build stage.
-- [ ] Keep durable scratch for the first policy activation. Trusted setup
+- [x] Keep durable scratch for the first policy activation. Trusted setup
   allocates a mode-0700, per-worker scratch directory outside every hidden,
   replacement, stage, prefix, and writable-policy root; the child uses it
   only for mount endpoints. The supervisor owns cleanup after the worker is
@@ -333,15 +334,20 @@ once. Port behavior, not implementation details.
   stage, prefix, and writable-policy roots. Require the supervisor to own
   cleanup, reject live workers and stale-path replacement, and cover
   concurrent allocation, setup cleanup, symlinked bases, and collisions.
-- [ ] B3, `sandbox: prove a read-only view with explicit writable mounts`.
+
+- [x] B3, `sandbox: prove a read-only view with explicit writable mounts`.
+  Selected-tree plans now mark inherited mounts recursively read-only and
+  explicitly restore writable bind mounts. Capability, fake-libc, installer,
+  and real-namespace tests cover `MOUNT_ATTR_RDONLY`, `EROFS`, and writable
+  restoration without changing the live worker.
+- [ ] C1, `installer: preserve host-visible stage and prefix lifecycles`,
+  using a stable per-build stage parent and supervisor-owned prefix pivot.
 
 ## Proposed sequence
 
 Each item is one commit with focused tests and documentation, and each keeps
 the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
-- [ ] C1, `installer: preserve host-visible stage and prefix lifecycles`,
-  using a stable per-build stage parent and supervisor-owned prefix pivot.
 - [ ] C2, `sandbox: select host, device, and worker-state inputs`.
 - [ ] C3, `sandbox: validate selected policies before worker threads`.
 - [ ] C4, `sandbox: record real compiler build evidence`. Tick the source
@@ -441,3 +447,11 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   symlinked-base, collision, live-worker, stale-path, and cleanup tests pass.
   The live worker remains unchanged. Selected B3, a recursively read-only
   namespace view with explicit writable mounts.
+- 2026-09-26: Completed B3 with an explicit read-only-view flag for dormant
+  selected-tree plans. The plan makes the inherited mount tree recursively
+  read-only after trusted endpoint preparation, clears read-only only on
+  explicit writable bind mounts, and leaves the legacy narrow planner order
+  and live worker unchanged. The capability probe, fake-libc assertions,
+  installer-plan checks, and disposable real-namespace test prove recursive
+  setup, `EROFS` passthrough denial, and writable restoration. Selected C1,
+  host-visible stage and prefix lifecycle preservation.

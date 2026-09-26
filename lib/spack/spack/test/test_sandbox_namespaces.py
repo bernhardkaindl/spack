@@ -31,6 +31,7 @@ class FakeLibc:
         self.unshare_calls = []
         self.mount_calls = []
         self.mount_setattr_calls = []
+        self.mount_setattr_attributes = []
 
     def unshare(self, flags):
         self.unshare_calls.append(flags.value)
@@ -42,6 +43,7 @@ class FakeLibc:
 
     def mount_setattr(self, directory_fd, path, flags, attributes, size):
         self.mount_setattr_calls.append((directory_fd.value, path, flags.value))
+        self.mount_setattr_attributes.append((attributes._obj.attr_set, attributes._obj.attr_clr))
         return 0
 
     def capset(self, header, capabilities):
@@ -664,6 +666,29 @@ def test_writable_preserved_mounts_remain_writable(tmp_path):
     assert libc.mount_setattr_calls == []
 
 
+def test_read_only_view_restores_explicit_writable_mounts(tmp_path):
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    read_only_source = tmp_path / "read-only-source"
+    read_only_source.mkdir()
+    read_write_source = tmp_path / "read-write-source"
+    read_write_source.mkdir()
+    policy = ns.build_namespace_filesystem_policy(
+        [str(hidden)],
+        [(str(read_only_source), str(hidden / "read-only"))],
+        [(str(read_write_source), str(hidden / "read-write"))],
+        read_only_view=True,
+    )
+
+    plan = ns.build_namespace_mount_plan_from_policy(policy, str(tmp_path / "stage"))
+    libc = FakeLibc()
+    assert ns._apply_namespace_mount_plan(plan, libc)
+    assert plan.read_only_view
+    assert libc.mount_setattr_calls[0] == (ns.AT_FDCWD, b"/", ns.AT_RECURSIVE)
+    assert libc.mount_setattr_attributes[0] == (ns.MOUNT_ATTR_RDONLY, 0)
+    assert (0, ns.MOUNT_ATTR_RDONLY) in libc.mount_setattr_attributes
+
+
 def test_mount_plan_validation_precedes_namespace_entry(namespace_setup, tmp_path):
     libc, _ = namespace_setup
     parent = tmp_path / "parent"
@@ -942,6 +967,68 @@ os._exit(0)
     assert result.returncode == 0, result.stderr
     assert (source / "preserved-write").read_text() == "preserved"
     assert (source / "restored-write").read_text() == "restored"
+    assert not list(hidden.iterdir())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
+def test_live_read_only_view_rejects_passthrough_writes(tmp_path):
+    if not ns.namespace_sandbox_available():
+        pytest.skip("unprivileged namespaces unavailable")
+    passthrough = tmp_path / "passthrough"
+    passthrough.mkdir()
+    writable_source = tmp_path / "writable-source"
+    writable_source.mkdir()
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    code = """
+import errno
+import os
+import sys
+from pathlib import Path
+from spack.sandbox_namespaces import NamespaceSandbox, build_namespace_filesystem_policy
+
+passthrough = Path(sys.argv[1])
+writable_source = Path(sys.argv[2])
+hidden = Path(sys.argv[3])
+stage = Path(sys.argv[4])
+policy = build_namespace_filesystem_policy(
+    [str(hidden)],
+    read_write_mounts=[(str(writable_source), str(hidden / "writable"))],
+    read_only_view=True,
+)
+sandbox = NamespaceSandbox()
+assert sandbox.prepare_filesystem_policy(policy, str(stage))
+assert sandbox.drop_mount_authority()
+try:
+    (passthrough / "must-fail").write_text("must fail")
+except OSError as error:
+    assert error.errno == errno.EROFS, error
+else:
+    raise AssertionError("inherited passthrough tree remained writable")
+(hidden / "writable" / "must-work").write_text("writable")
+os._exit(0)
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(passthrough),
+            str(writable_source),
+            str(hidden),
+            str(stage),
+        ],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (passthrough / "must-fail").exists()
+    assert (writable_source / "must-work").read_text() == "writable"
     assert not list(hidden.iterdir())
 
 
