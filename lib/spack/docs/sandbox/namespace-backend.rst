@@ -466,6 +466,15 @@ namespace path types, and header path traversal before any later selection
 work consumes the data. Loading is currently dormant: this commit does not
 activate the policy or change the live worker.
 
+A2 adds dormant selection helpers on top of these files. They select compiler
+languages represented by concrete DAG edges and supported compiler nodes,
+deduplicate repeated selections, and use the header policy to enumerate exact
+glibc, Linux UAPI, GCC-internal, and libstdc++ trees. Non-GCC C++ selection is
+capped at the configured safe libstdc++ major, while GCC selection follows its
+reported installation. The helper also identifies other GCC installations for
+later masking. These results are evidence for later policy compilation only;
+the worker does not call the helpers.
+
 The compiler requires every selected spelling to be an existing canonical
 path. Symlink spellings fail until the policy can preserve both the selected
 name and its resolved source. It collapses a same-access descendant only when

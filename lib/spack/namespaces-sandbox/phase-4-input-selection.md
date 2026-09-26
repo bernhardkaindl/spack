@@ -76,10 +76,10 @@ compensated for Landlock's inability to hide paths are not ported (see
 
 ### Compiler, header, and tool selection
 
-- [ ] Select compilers from concrete language edges and compiler nodes on the
+- [x] Select compilers from concrete language edges and compiler nodes on the
   DAG. Exclude unselected languages and deduplicate repeated edges. Call
   `supported_compilers(repo=spack.repo.PATH)`.
-- [ ] Select exact glibc, Linux UAPI, libstdc++, and GCC-internal headers from
+- [x] Select exact glibc, Linux UAPI, libstdc++, and GCC-internal headers from
   the header policy. Keep the libstdc++ major-version cap for non-GCC C++, and
   mask GCC installations that no selected language requires.
 - [ ] Resolve helpers from the compiler (`-print-prog-name`,
@@ -301,17 +301,25 @@ once. Port behavior, not implementation details.
   and each malformed case. Documentation: the policy-data paragraph in
   `lib/spack/docs/sandbox/namespace-backend.rst`.
 
-- [ ] A2, `sandbox: select concrete compilers and system headers`. Use the
+- [x] A2, `sandbox: select concrete compilers and system headers`. Use the
   loaded policy data to select only the concrete compiler languages and exact
   header trees required by the DAG; keep this selection dormant and focused
-  on compiler/header evidence.
+  on compiler/header evidence. The helpers deduplicate language-edge and
+  compiler-node selections, apply the non-GCC libstdc++ major cap, and expose
+  unselected GCC installations for later masking. Tests cover synthetic DAGs,
+  mixed language selection, system versus non-system compilers, and GCC versus
+  non-GCC header selection.
+
+- [ ] A3, `sandbox: resolve compiler helpers, aliases, and stage tools`. Use
+  the selected compiler paths to resolve subordinate programs and files,
+  preserve searched spellings and aliases, and select the fetch/expansion
+  tool closure without activating the policy.
 
 ## Proposed sequence
 
 Each item is one commit with focused tests and documentation, and each keeps
 the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
-- [ ] A3, `sandbox: resolve compiler helpers, aliases, and stage tools`.
 - [ ] B1, `sandbox: add passthrough, replacement, and generated-symlink
   policy entries`, replacing derived parent masks.
 - [ ] B2, `sandbox: allocate durable mount-plan scratch`, including
@@ -385,3 +393,11 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   live worker. Added malformed version/list/alias/header-path tests and
   documented the policy-data boundary. Selected A2, concrete compiler and
   system-header selection, as the next work item.
+- 2026-09-26: Completed A2 with dormant compiler-language and system-header
+  selectors. Language edges are filtered by the loaded compiler vocabulary,
+  supported compiler nodes are discovered with the repository-aware compiler
+  API, and duplicate selections are removed deterministically. Header paths
+  come from the validated policy; system GCC installations, GCC-internal
+  headers, Linux UAPI headers, and the non-GCC libstdc++ major cap are handled
+  without changing the live worker. Synthetic DAG and header-layout tests
+  passed. Selected A3, compiler helper, alias, and stage-tool resolution.

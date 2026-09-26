@@ -20,7 +20,8 @@ checks mount visibility in a disposable process. It deliberately keeps the
 installer's narrow ``/usr/share/aclocal`` mask. Host ``/bin``, ``/usr/bin``, and
 ``/usr/include`` are not masked: doing so before preserving selected sources
 would hide the very programs and headers needed to populate the replacement
-view. The unfinished compiler/tool/header policy is not part of this boundary.
+view. The compiler and system-header selectors are now dormant groundwork; the
+unfinished helper, runtime, and whole-host policy is not part of this boundary.
 
 Status by design phase
 ----------------------
