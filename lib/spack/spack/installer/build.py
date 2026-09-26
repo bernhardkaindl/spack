@@ -1650,7 +1650,6 @@ def prepare_namespace_activation(
     for entry in compiler_driver_paths(spec):
         compiler_paths.append(entry.source)
     for _language, compiler_path, _compiler_spec in _selected_compilers(spec):
-        compiler_paths.append(compiler_path)
         compiler_paths.extend(
             entry.source for entry in compiler_support_paths(compiler_path)
         )
