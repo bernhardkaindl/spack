@@ -24,7 +24,7 @@ import traceback
 from gzip import GzipFile
 from multiprocessing import Process
 from pathlib import Path
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Iterable, List, NamedTuple, Optional, Tuple
 
 from spack.vendor.typing_extensions import Protocol
 
@@ -354,6 +354,17 @@ def compiler_driver_paths(
                 seen.add((entry.spelling, entry.source))
                 result.append(entry)
     return result
+
+
+def compiler_alias_symlink_paths(
+    spec: spack.spec.Spec, policy: Optional[dict] = None
+) -> List[spack.sandbox_namespaces.NamespaceGeneratedSymlink]:
+    """Convert selected compiler alias spellings into generated namespace symlinks."""
+    return [
+        spack.sandbox_namespaces.NamespaceGeneratedSymlink(entry.spelling, entry.source)
+        for entry in compiler_driver_paths(spec, policy)
+        if entry.spelling != entry.source
+    ]
 
 
 def executable_support_paths(
@@ -1210,6 +1221,8 @@ def namespace_filesystem_policy_and_plan_from_inputs(
     stage_path: str,
     mount_plan_stage: str,
     selected_paths: NamespacePolicyInputPaths,
+    replacement_mounts: Iterable[Tuple[str, str]] = (),
+    generated_symlinks: Iterable[spack.sandbox_namespaces.NamespaceGeneratedSymlink] = (),
 ) -> Tuple[
     spack.sandbox_namespaces.NamespaceFilesystemPolicy, spack.sandbox_namespaces.NamespaceMountPlan
 ]:
@@ -1306,24 +1319,15 @@ def namespace_filesystem_policy_and_plan_from_inputs(
 
     effective_read_only = minimal_paths(requested_read_only)
     effective_read_write = minimal_paths(requested_read_write)
-    mount_targets = effective_read_only + effective_read_write
 
-    candidate_hidden_roots = list(requested_hidden_roots)
-    for target in mount_targets:
-        parent = os.path.dirname(target)
-        if parent == os.path.sep:
-            raise spack.sandbox_namespaces.NamespaceSetupError(
-                errno.EINVAL,
-                "select namespace policy hidden roots",
-                f"cannot isolate a top-level path without hiding the filesystem root: {target}",
-            )
-        candidate_hidden_roots.append(parent)
-    hidden_roots = minimal_paths(tuple(sorted(set(candidate_hidden_roots))))
+    hidden_roots = minimal_paths(requested_hidden_roots)
 
     policy = spack.sandbox_namespaces.build_namespace_filesystem_policy(
         hidden_roots,
         ((path, path) for path in effective_read_only),
         ((path, path) for path in effective_read_write),
+        replacement_mounts=replacement_mounts,
+        generated_symlinks=generated_symlinks,
     )
 
     def assert_covered(paths, mounts, access):
