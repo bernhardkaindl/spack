@@ -360,6 +360,18 @@ once. Port behavior, not implementation details.
 
 ## Proposed sequence
 
+### D3 commit steps
+
+1. [x] D3.1: represent fresh writable tmpfs mounts in immutable policy/plan
+  data, validate conflicts before mutation, retain literal generated symlink
+  targets such as `/proc/self/fd`, and apply tmpfs after read-only setup.
+2. [ ] D3.2: select private shared memory and descriptor links from versioned
+  policy data; extend capability probing and test fatal activation failures
+  before authority drop and `Tee`. Preserve the device allowlist and fallback.
+3. [ ] D3.3: prove real device/link/shared-memory behavior, host and concurrent
+  worker isolation, and post-setup authority removal; update documentation,
+  close D3 with evidence, and select whole-child lifecycle verification.
+
 Each item is one commit with focused tests and documentation. Suggested PR
 grouping: A1-A3, B1-B3, and C1-C4.
 
@@ -603,3 +615,11 @@ lifecycle. D2's disposable activation test does not close that lifecycle gap.
   repository-update or generated-API hooks. Selected D3 private `/dev`
   construction next; retained the full install-child lifecycle gap and the
   accepted same-UID pre-bind substitution limitation.
+- 2026-09-26: Completed D3.1. Immutable policy and plan now carry fresh tmpfs
+  targets below hidden roots, reject invalid/conflicting targets before entry,
+  and mount mode-1777 shared memory with `nosuid,nodev` after read-only tree
+  setup. Generated symlink targets remain literal: resolving `/proc/self/fd`
+  in the supervisor would incorrectly pin the supervisor PID. Trusted
+  pre-thread creation retains child-relative resolution; inherited descriptor
+  minimization remains out of scope. Thirteen focused model/alias tests and
+  Ruff pass. Production selection and capability probing are D3.2.

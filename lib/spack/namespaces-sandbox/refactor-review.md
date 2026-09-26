@@ -249,8 +249,13 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
   failure tests. Add no config settings or broad host-device grants.
 
 After D3, run the whole writable inventory and stage/prefix success and failure
-semantics through a complete install-child lifecycle. D2 is focused activation
-evidence, not completion of that deferred integration work.
+semantics through a complete install-child lifecycle. D3 will proceed in three
+separately validated steps recorded in the Phase 4 ledger: D3.1 immutable
+tmpfs/link model and application; D3.2 production selection and capability
+coverage; D3.3 disposable-kernel isolation evidence and final documentation.
+
+D2 is focused activation evidence, not completion of those deferred lifecycle
+checks.
 
 - [x] Materialize the complete trusted input selection in trusted installer
   setup. Select the complete hidden host/device roots; resolve the concrete
@@ -567,3 +572,10 @@ evidence, not completion of that deferred integration work.
   validation avoids the repository's update and API-generation hooks. Selected
   D3 private `/dev` construction with fresh shared memory, descriptor links,
   capability coverage, isolation, and fatal-failure tests as the next item.
+- 2026-09-26: Completed D3.1 with validated immutable tmpfs targets and literal
+  generated symlink targets. Fresh writable shared memory is mounted only
+  after read-only setup, with `nosuid,nodev` and mode 1777. Model tests reject
+  invalid paths, overlaps, and noncanonical hand-built policies before entry.
+  Literal `/proc/self` avoids publishing the supervisor's PID through worker
+  descriptor links; inherited descriptor minimization remains deferred.
+  Thirteen focused tests and Ruff pass. D3.2 activation/probing is next.
