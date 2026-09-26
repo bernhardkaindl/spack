@@ -619,3 +619,9 @@ checks.
   repository roots, but policy assembly re-added the raw alias. Policy assembly
   now resolves that trusted root, with a regression asserting the canonical
   target is mounted read-only. Retry the actual install next.
+- 2026-09-26: The following attempt reached scratch allocation but exhausted
+  candidates: `/tmp` and Spack's `var_path` overlap hidden roots, while `/var`
+  and `/opt` are unwritable to this user. Added `/run/lock`, a canonical
+  user-writable path outside selected roots, as the next fallback. A disposable
+  namespace bind probe succeeded; all 30 sandbox-common tests and Ruff pass.
+  The next actual m4 attempt will validate full activation.

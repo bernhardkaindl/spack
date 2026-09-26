@@ -696,3 +696,10 @@ not close that lifecycle gap.
   re-added the raw alias and rejected it. Policy assembly now resolves the
   trusted repository root; the regression proves the canonical target remains
   a read-only mount. Retry the actual install next.
+- 2026-09-26: The next m4 retry reached mount-plan scratch allocation. The
+  default temporary directory and Spack's `var_path` are both below selected
+  hidden roots; `/var` and `/opt` are not writable by this unprivileged worker.
+  Added canonical `/run/lock` as the next scratch candidate; it is writable
+  without overlapping selected roots, and a disposable namespace probe
+  confirmed bind-mount setup works there. The 30 sandbox-common tests and Ruff
+  pass. Retry the real install to validate the full activation path.
