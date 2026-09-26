@@ -252,6 +252,16 @@ def test_filesystem_policy_rejects_stage_below_hidden_root_before_namespace_entr
     assert libc.unshare_calls == []
 
 
+def test_filesystem_policy_rejects_hidden_root_in_reserved_scratch(tmp_path):
+    stage = tmp_path / "stage"
+    hidden = stage / "spack-preserved-host-paths" / "nested"
+    hidden.mkdir(parents=True)
+    policy = ns.build_namespace_filesystem_policy([str(hidden)])
+
+    with pytest.raises(ns.NamespaceSetupError, match="hidden root overlaps mount-plan scratch"):
+        ns.build_namespace_mount_plan_from_policy(policy, str(stage))
+
+
 def test_filesystem_policy_compiles_generated_paths(tmp_path):
     hidden = tmp_path / "hidden"
     hidden.mkdir()

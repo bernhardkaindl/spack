@@ -364,11 +364,19 @@ def build_namespace_mount_plan_from_policy(
     """Compile validated filesystem policy into deterministic mount operations."""
     policy = _validated_namespace_filesystem_policy(policy)
     resolved_stage = os.path.realpath(os.path.abspath(stage_path))
+    reserved_stage_paths = (
+        os.path.join(resolved_stage, "spack-empty-host-dirs"),
+        os.path.join(resolved_stage, "spack-preserved-host-paths"),
+    )
     for root in policy.hidden_roots:
         if resolved_stage == root or _path_contains(root, resolved_stage):
             _mount_plan_error(
                 "compile namespace policy",
                 f"mount-plan stage must be outside hidden roots: {resolved_stage}",
+            )
+        if any(root == path or _path_contains(path, root) for path in reserved_stage_paths):
+            _mount_plan_error(
+                "compile namespace policy", f"hidden root overlaps mount-plan scratch: {root}"
             )
     classified_paths = [mount.target for mount in policy.read_only_mounts]
     classified_paths.extend(mount.target for mount in policy.read_write_mounts)

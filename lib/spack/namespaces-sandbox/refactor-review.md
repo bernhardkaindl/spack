@@ -136,11 +136,25 @@ model, but not the policy-derived mount tree in
   and configuration inputs. Keep the runtime on the current narrow mask until
   the policy is complete enough to replace default Landlock safely.
 
-- [ ] Select the hidden roots and trusted compiler, tool, header, repository,
+- [x] Select the hidden roots and trusted compiler, tool, header, repository,
   and Spack-source grants needed to compile the installer-created policy into a
   complete mount tree. Prove representative policies compile without silently
   dropping paths, provide scratch space outside all hidden roots, but do not
-  activate the broader tree until those inputs are complete.
+  activate the broader tree until those inputs are complete. A dormant helper
+  now requires explicit hidden roots and canonical host selections, includes
+  concrete dependency prefixes, active repositories, required ``sbang`` paths,
+  and partitioned Spack source trees, derives parent masks, verifies ancestor
+  coverage after deduplication, and rejects overlap with caller-provided
+  external scratch. Synthetic-host and fail-closed input tests exercise the
+  boundary; the worker still uses the narrow mask.
+
+- [ ] Materialize the complete trusted input selection in pre-thread installer
+  setup. Select the complete hidden host/device roots; resolve the concrete
+  build's external compiler executables and canonical aliases, support tools,
+  exact header and runtime trees, and Python runtime; replace the broad system
+  temporary-directory grant with a scoped worker directory; allocate durable
+  mount-plan scratch outside the derived hidden roots; and validate the
+  resulting policy with representative real compiler builds before activation.
 
 ### Tests and documentation structure
 
@@ -204,10 +218,23 @@ model, but not the policy-derived mount tree in
   are collapsed. Policy compilation rejects classified paths that do not yet
   have a containing hidden root; the live worker does not use this broad policy.
 - Hidden roots must exist, lexical overlap checks consider every prior ancestor,
-  and mount-plan scratch space must remain outside hidden roots. Preserved
-  sources are rechecked and never recreated after validation. Descriptor-based
-  anchoring against concurrent same-type source substitution remains future
-  hardening at this trusted pre-thread boundary.
+  and mount-plan scratch space and its reserved source subtrees may not overlap
+  hidden roots. Preserved sources are rechecked and never recreated after
+  validation. Descriptor-based anchoring against concurrent same-type source
+  substitution remains future hardening at this trusted pre-thread boundary.
+- Selected-tree policy compilation now treats explicit hidden roots and exact
+  host compiler, tool, header, runtime, and scoped temporary paths as required
+  trusted inputs.
+  Non-external compiler and tool packages remain covered by concrete dependency
+  prefixes; whole external prefixes such as ``/usr`` are not restored because
+  that would defeat selective ``/usr/bin`` and ``/usr/include`` masking.
+- Active repository roots, required ``sbang`` paths, and partitioned Spack
+  source trees are explicit read-only grants. Required paths fail if absent or
+  non-canonical. Same-access descendants are omitted only after coverage by an
+  ancestor mount is proved, and top-level paths fail rather than forcing a
+  hidden filesystem root. Explicit and derived parent masks compile
+  deterministically without changing the live worker. Unrelated host trees
+  remain visible until the complete hidden-root/device policy is selected.
 - The namespace filesystem policy is intended to be the default confinement;
   Landlock is retained in the current narrow integration only as a transitional
   constraint and should become opt-in for permission-denied behavior tests.
@@ -324,4 +351,22 @@ model, but not the policy-derived mount tree in
   fresh full Sphinx build reports no warning from the changed policy pages and
   confirms the sandbox index is now in the top-level doctree. The warning gate
   remains blocked by 14 unrelated repository autodoc, orphan, and reference
+  warnings.
+- 2026-09-26: Added the dormant selected-tree namespace policy compiler. It
+  requires explicit masks and canonical compiler, tool, header, runtime, and
+  scoped temporary selections; includes concrete dependency prefixes, active
+  repository roots, required ``sbang`` paths, and partitioned Spack source
+  trees; derives non-overlapping parent masks; and verifies every requested path
+  remains represented after ancestor collapse. Review added reserved-scratch
+  overlap rejection and fail-closed missing, symlink, and top-level path cases,
+  and narrowed readiness claims because unrelated host trees remain visible.
+  Kept the worker on the narrow ``/usr/share/aclocal`` mask and selected the
+  complete host/device and production-input policy plus real-build validation
+  as the next work item.
+- 2026-09-26: Independent re-review found no remaining high- or medium-severity
+  issues after the scratch, canonical-path, explicit-mask, repository, and
+  documentation repairs. Ruff formatting and lint passed for all four changed
+  Python files, and the namespace/shared sandbox suite passed 86 tests. A fresh
+  Sphinx build reported no warning from the changed pages; its warning gate
+  remains blocked by the same 14 unrelated autodoc, toctree, and reference
   warnings.
