@@ -613,3 +613,9 @@ checks.
   permits empty compiler/header inputs without selecting compiler executables;
   the other required input categories remain enforced. A focused policy test
   covers this compilerless case. Retry the actual install next.
+- 2026-09-26: The following m4 attempt reached `glibc` and `gcc` preparation,
+  then failed because the trusted package-repository root in `~/.spack` is a
+  symlink to the canonical checkout. Host input selection already resolves
+  repository roots, but policy assembly re-added the raw alias. Policy assembly
+  now resolves that trusted root, with a regression asserting the canonical
+  target is mounted read-only. Retry the actual install next.

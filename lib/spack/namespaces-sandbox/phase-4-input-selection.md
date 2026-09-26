@@ -689,3 +689,10 @@ not close that lifecycle gap.
   compiler-header inputs while retaining required tools, runtime, and temporary
   paths; a focused regression proves no compiler executable is exposed. Retry
   the real install after this fix.
+- 2026-09-26: The next m4 attempt passed compilerless selection and began
+  preparing `glibc` and `gcc`, then failed because the active trusted package
+  repository root under `~/.spack/package_repos` is a symlink to the canonical
+  checkout. Host input selection had already resolved it, but policy assembly
+  re-added the raw alias and rejected it. Policy assembly now resolves the
+  trusted repository root; the regression proves the canonical target remains
+  a read-only mount. Retry the actual install next.
