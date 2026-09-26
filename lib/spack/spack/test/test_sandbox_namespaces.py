@@ -1265,6 +1265,62 @@ def test_pre_thread_setup_prepares_and_drops_namespace_authority(monkeypatch, tm
     ]
 
 
+def test_namespace_policy_validation_precedes_namespace_mutation(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare", hidden_dirs, stage_path))
+            return True
+
+    sandbox = RecordingSandbox()
+    for name in ("hidden", "tool", "header", "runtime", "temporary"):
+        (tmp_path / name).mkdir()
+    selected_paths = build.NamespacePolicyInputPaths(
+        hidden_roots=(str(tmp_path / "hidden"),),
+        compiler_paths=(str(tmp_path / "missing-compiler"),),
+        tool_paths=(str(tmp_path / "tool"),),
+        header_paths=(str(tmp_path / "header"),),
+        runtime_paths=(str(tmp_path / "runtime"),),
+        temporary_paths=(str(tmp_path / "temporary"),),
+    )
+    monkeypatch.setattr(
+        ns,
+        "freeze_namespace_sandbox_capability",
+        lambda: calls.append(("freeze",)),
+    )
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+
+    with pytest.raises(ns.NamespaceSetupError, match="missing-compiler"):
+        build._prepare_namespace_sandbox_before_threads(
+            {"enable": True},
+            SimpleNamespace(prefix=tmp_path / "prefix", traverse=lambda **kwargs: []),
+            str(tmp_path / "stage"),
+            mount_plan_stage=str(tmp_path / "mount-plan"),
+            selected_paths=selected_paths,
+        )
+    assert calls == []
+
+
+def test_namespace_policy_validation_is_unconditional(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        build,
+        "namespace_filesystem_policy_and_plan_from_inputs",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or ("policy", "plan"),
+    )
+    selected_paths = build.NamespacePolicyInputPaths((), (), (), (), (), ())
+
+    assert build.validate_namespace_policy_before_threads(
+        {},
+        SimpleNamespace(),
+        str(tmp_path / "stage"),
+        str(tmp_path / "mount-plan"),
+        selected_paths,
+    )
+    assert calls
+
+
 def test_pre_thread_namespace_failure_is_reported(monkeypatch, tmp_path):
     class StateStream:
         closed = False
