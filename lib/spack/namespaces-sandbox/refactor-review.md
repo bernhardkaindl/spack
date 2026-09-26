@@ -660,3 +660,7 @@ checks.
   `chmod: not found`. Added `chmod` to the stage-tool policy and its shipped
   policy test. Retry m4 to continue measuring the install child's actual tool
   needs.
+- 2026-09-26: With `chmod` selected, configure repeatedly reported
+  `eval: expr: not found` and did not exit, so the retry was stopped while
+  preserving its host stage and log. Added `expr` to the selected stage-tool
+  policy and asserted the shipped entry. Retry the real install.

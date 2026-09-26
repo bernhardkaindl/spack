@@ -39,6 +39,7 @@ stage_programs:
 - 7z
 - bunzip2
 - chmod
+- expr
 - git
 - gunzip
 - gzip
