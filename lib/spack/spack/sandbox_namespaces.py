@@ -858,6 +858,7 @@ def _build_namespace_mount_plan(
         )
     )
     replacement_requests = []
+    replacement_preserved = []
     for request in replacement_mounts:
         if request.access is not NamespaceMountAccess.READ_WRITE:
             _mount_plan_error(
@@ -874,14 +875,18 @@ def _build_namespace_mount_plan(
                 "validate replacement target",
                 f"replacement target is not a hidden directory: {request.target}",
             )
+        preserved_source = os.path.join(preserved_root, f"replacement-{len(replacement_requests)}")
+        replacement_preserved.append(
+            NamespacePreservedMount(request.source, preserved_source, True, request.access)
+        )
         replacement_requests.append(
-            NamespacePreservedMount(request.source, request.target, True, request.access)
+            NamespacePreservedMount(preserved_source, request.target, True, request.access)
         )
     replacement_requests.sort(key=lambda item: (item.target, item.source))
     return NamespaceMountPlan(
         resolved_stage,
         mounts,
-        preserved_mounts,
+        preserved_mounts + tuple(replacement_preserved),
         restoration_mounts,
         tuple(generated_paths),
         tuple(replacement_requests),
@@ -901,7 +906,7 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
 
     os.makedirs(plan.stage_path, exist_ok=True)
 
-    for preserved in plan.preserved_mounts + plan.replacement_mounts:
+    for preserved in plan.preserved_mounts:
         if not os.path.exists(preserved.source):
             _mount_plan_error(
                 "apply mount plan source",
