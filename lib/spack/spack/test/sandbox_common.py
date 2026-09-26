@@ -901,6 +901,8 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
     monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(host / "store"))
     monkeypatch.setattr(spack.store.STORE, "upstreams", None)
 
+    inherited_environment = dict(os.environ)
+    inherited_tempdir = build.tempfile.tempdir
     activation, scratch = build.prepare_namespace_activation(
         {},
         spec,
@@ -911,6 +913,10 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
         str(fetch_cache),
     )
     try:
+        assert activation.worker_root == str(worker_root)
+        assert os.environ == inherited_environment
+        assert build.tempfile.tempdir == inherited_tempdir
+        assert not list(worker_root.iterdir())
         read_only_targets = {mount.target for mount in activation.policy.read_only_mounts}
         read_write_targets = {mount.target for mount in activation.policy.read_write_mounts}
         assert read_only_targets == {str(compiler), str(tool), str(headers), str(user_cache)}

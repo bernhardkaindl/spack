@@ -387,7 +387,7 @@ grouping: A1-A3, B1-B3, and C1-C4.
     cache, and temporary directories after mount setup and authority drop.
     Set POSIX, Python, and Java defaults before `Tee`; preserve inherited Java
     options. The focused activation regression includes paths with spaces.
-  2. [ ] D2.2, prove containment and failure isolation. Cover invalid roots,
+  2. [x] D2.2, prove containment and failure isolation. Cover invalid roots,
     pre-existing child paths, setup failures, unchanged fallback and parent
     state, environment cleaning, and real-namespace writable state.
   3. [ ] D2.3, reconcile the backend documentation and both review ledgers with
@@ -563,3 +563,25 @@ install-child lifecycle.
   options. The activation regression and affected namespace, shared sandbox,
   and installer suites passed (141 tests). D2.2 failure, containment, and
   real-kernel evidence is next; D2 is not yet complete.
+- 2026-09-26: Completed D2.2. Focused checks reject missing, non-directory,
+  relative, symlinked, non-normalized, and unselected worker roots, and refuse
+  pre-existing home/cache/temp paths without publishing environment changes.
+  Mount/authority failures never start `Tee` or configure the environment;
+  disabled/fallback paths and trusted parent preparation remain unchanged.
+  Standard environment cleaning preserves the scoped defaults. A disposable
+  namespace proves mode-0700 directories, writable HOME/XDG/POSIX/Python temp
+  paths, hidden home contents, inherited `EROFS`, replacement-temp writes,
+  host-visible worker files, and parent environment/tempfile isolation.
+  The installed Java runtime reports the scoped properties even with spaces
+  and both quote types in paths, overriding older values in inherited
+  `JAVA_TOOL_OPTIONS` while retaining other options.
+- 2026-09-26: D2.2 testing found two blockers and repaired them: worker-root
+  validation accepted `..` spellings, and masking a replacement source's
+  ancestor removed that source before it was bound. The root must now equal
+  its canonical absolute spelling. Replacement sources are pinned in durable
+  scratch before masks, just like other selected sources. This is trusted
+  pre-thread mount authority; recipe code still starts only after authority
+  drop. Failed setup remains fatal, never an unconstrained retry. The accepted
+  same-UID pre-bind substitution limitation is unchanged. All 161 affected
+  tests and Ruff checks pass. D2.3 documentation reconciliation is next;
+  complete install-child lifecycle evidence remains deferred.
