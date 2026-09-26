@@ -652,3 +652,7 @@ checks.
   already selected. A focused alias regression and live nested-stage namespace
   test pass; the two sandbox suites pass 138 tests, with Ruff and whitespace
   checks clean. E1 remains open pending the next real m4 install.
+- 2026-09-26: The shell-alias repair let gmake enter `configure`; it then
+  reported `sed: not found` because `sed` was not selected in `sandbox.yaml`.
+  Added `sed` to the stage-tool policy and asserted the shipped policy contains
+  it. The next real m4 retry will test the production selector and mount.
