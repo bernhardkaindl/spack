@@ -509,6 +509,15 @@ attached worker is no longer alive; cleanup refuses live workers and refuses
 paths replaced by a symlink or another inode. This scratch is ordinary
 host-backed setup state, separate from the host-visible stage and prefix.
 
+B3 completes the dormant access model for selected-tree plans. Such a plan
+marks the inherited mount tree read-only recursively with
+``MOUNT_ATTR_RDONLY`` before applying its bind restores. Read-write policy
+mounts explicitly clear that attribute on their bind views, while read-only
+mounts retain it. The capability probe and disposable namespace tests verify
+that recursive inherited mounts can be made read-only, passthrough writes
+return ``EROFS``, and selected writable mounts remain writable. The live
+worker still uses the narrow mask and transitional Landlock.
+
 The resulting policy must compile with allocated mount-plan scratch outside
 every hidden root, and hidden roots may not overlap the planner's reserved
 source subtrees. Representative synthetic-host tests cover explicit masks,

@@ -172,10 +172,17 @@ model, but not the policy-derived mount tree in
   setup-failure, symlinked-base, collision, and abnormal-exit cases are
   covered before policy activation.
 
-- [ ] Prove a recursively read-only namespace view with explicit writable
-  mounts. Verify the recursive mount attribute on inherited trees, reject
-  writes to user-writable passthrough paths with ``EROFS``, and keep each
-  selected writable mount writable in a disposable namespace.
+- [x] Prove a recursively read-only namespace view with explicit writable
+  mounts. Selected-tree plans now set ``MOUNT_ATTR_RDONLY`` recursively on
+  inherited mounts and clear it only on explicit writable bind views. The
+  capability probe, plan-level tests, installer assertion, and disposable
+  real namespace test cover recursive setup, ``EROFS`` passthrough denial, and
+  writable restoration without changing the live worker.
+
+- [ ] Preserve host-visible stage and prefix lifecycles. Use a stable
+  host-backed per-build stage parent for child-owned cleanup, and move prefix
+  pivot, rollback, and failed-prefix cleanup to the supervisor without
+  changing the path seen by build tools.
 
 - [ ] Materialize the complete trusted input selection in pre-thread installer
   setup. Select the complete hidden host/device roots; resolve the concrete
