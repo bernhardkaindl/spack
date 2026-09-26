@@ -17,6 +17,7 @@ import selectors
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -31,6 +32,7 @@ from spack.vendor.typing_extensions import Protocol
 import spack.binary_distribution
 import spack.build_environment
 import spack.builder
+import spack.caches
 import spack.compilers.config
 import spack.config
 import spack.error
@@ -45,6 +47,7 @@ import spack.store
 import spack.url_buildcache
 import spack.util.environment
 import spack.util.filesystem as fs
+import spack.util.ld_so_conf
 import spack.util.lock
 import spack.util.spack_yaml as syaml
 import spack.util.timer
@@ -108,6 +111,17 @@ class NamespacePolicyInputPaths(NamedTuple):
     header_paths: Tuple[str, ...]
     runtime_paths: Tuple[str, ...]
     temporary_paths: Tuple[str, ...]
+
+
+class NamespaceHostDeviceWorkerPaths(NamedTuple):
+    """Trusted host, device, and worker-state paths selected before policy compilation."""
+
+    hidden_roots: Tuple[str, ...]
+    replacement_roots: Tuple[str, ...]
+    host_runtime_paths: Tuple[str, ...]
+    device_paths: Tuple[str, ...]
+    read_only_paths: Tuple[str, ...]
+    writable_paths: Tuple[str, ...]
 
 
 class ResolvedSandboxPath(NamedTuple):
@@ -428,6 +442,121 @@ def stage_tool_paths(policy: Optional[dict] = None) -> List[ResolvedSandboxPath]
                     seen.add((support.spelling, support.source))
                     result.append(support)
     return result
+
+
+def _canonical_existing_paths(
+    paths: Iterable[str], *, character_devices: bool = False
+) -> Tuple[str, ...]:
+    result = []
+    seen = set()
+    for path in paths:
+        resolved = os.path.realpath(os.path.abspath(path))
+        if not os.path.exists(resolved):
+            continue
+        if character_devices and not stat.S_ISCHR(os.stat(resolved).st_mode):
+            continue
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
+    return tuple(sorted(result))
+
+
+def _canonical_required_paths(paths: Iterable[str], category: str) -> Tuple[str, ...]:
+    result = []
+    seen = set()
+    for path in paths:
+        absolute = os.path.abspath(path)
+        resolved = os.path.realpath(absolute)
+        if not os.path.lexists(absolute):
+            raise spack.sandbox_namespaces.NamespaceSetupError(
+                errno.ENOENT,
+                "select namespace policy inputs",
+                f"{category} path does not exist: {path}",
+            )
+        if absolute != resolved:
+            raise spack.sandbox_namespaces.NamespaceSetupError(
+                errno.EINVAL,
+                "select namespace policy inputs",
+                f"{category} path is not canonical: {path} resolves to {resolved}",
+            )
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(resolved)
+    return tuple(sorted(result))
+
+
+def select_namespace_host_device_worker_paths(
+    config: dict,
+    spec: spack.spec.Spec,
+    stage_path: str,
+    *,
+    log_path: Optional[str],
+    jobserver_paths: Iterable[str],
+    worker_root: str,
+    fetch_cache_path: str,
+    policy: Optional[dict] = None,
+) -> NamespaceHostDeviceWorkerPaths:
+    """Select host, device, and worker-state inputs without changing the worker filesystem.
+
+    Host runtime paths are candidates and are omitted when unavailable. Lifecycle and worker
+    paths are explicit trusted inputs and fail closed when missing or non-canonical.
+    """
+    policy = policy if policy is not None else _load_sandbox_policy()
+    hidden_roots = _canonical_existing_paths(policy["hidden_roots"])
+    replacement_roots = tuple(
+        root
+        for root in _canonical_existing_paths(policy["replacement_roots"])
+        if root in hidden_roots
+    )
+    host_runtime_paths = _canonical_existing_paths(
+        policy["host_runtime_read_paths"]
+        + policy["file_runtime_read_paths"]
+        + spack.util.ld_so_conf.host_dynamic_linker_search_paths()
+    )
+    device_paths = _canonical_existing_paths(policy["device_nodes"], character_devices=True)
+
+    repositories = tuple(spack.repo.PATH.repos)
+    read_only_candidates = [
+        spack.paths.bin_path,
+        spack.paths.lib_path,
+        spack.paths.share_path,
+        spack.paths.etc_path,
+        spack.paths.user_config_path,
+        spack.paths.system_config_path,
+        *host_runtime_paths,
+        *[str(dep.prefix) for dep in spec.traverse(root=False) if not dep.external],
+        *[repo.root for repo in repositories],
+        *[repo.python_path for repo in repositories if getattr(repo, "python_path", None)],
+        os.path.join(spack.store.STORE.unpadded_root, "bin", "sbang"),
+        *[
+            os.path.join(upstream_db.root, "bin", "sbang")
+            for upstream_db in spack.store.STORE.upstreams or ()
+        ],
+        spack.paths.user_cache_path,
+        spack.caches.misc_cache_location(config=spack.config.CONFIG),
+        *config.get("allow_read", []),
+    ]
+    read_only_paths = _canonical_existing_paths(read_only_candidates)
+
+    required_worker_paths = [stage_path, str(spec.prefix), worker_root, fetch_cache_path]
+    if log_path is not None:
+        required_worker_paths.append(log_path)
+    required_worker_paths.extend(jobserver_paths)
+    writable_paths = list(_canonical_required_paths(required_worker_paths, "worker"))
+    writable_paths.extend(
+        _canonical_existing_paths(
+            config.get("allow_write", [])
+        )
+    )
+
+    return NamespaceHostDeviceWorkerPaths(
+        hidden_roots,
+        replacement_roots,
+        host_runtime_paths,
+        device_paths,
+        read_only_paths,
+        tuple(sorted(set(writable_paths))),
+    )
 
 
 def tool_runtime_paths(spec: spack.spec.Spec, tool_paths) -> List[str]:

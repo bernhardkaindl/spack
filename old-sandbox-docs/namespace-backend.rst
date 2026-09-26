@@ -535,6 +535,16 @@ through the transaction. The live worker still uses the narrow mask and
 transitional Landlock; this lifecycle boundary prepares it for the complete
 policy without activating that policy.
 
+C2 adds a dormant trusted-input boundary for the eventual selected-tree
+policy. It canonicalizes explicit hidden and replacement roots, combines the
+versioned runtime candidates with the host dynamic-linker search paths, keeps
+only real character devices from the device list, and selects read-only
+Spack, repository, dependency, configuration, and cache paths. Stage, prefix,
+log, jobserver, fetch-cache, and scoped-worker paths are explicit writable
+inputs and fail closed when missing or non-canonical. Optional host candidates
+are omitted when unavailable. Selection does not mutate the worker or activate
+the broader policy; pre-thread validation is the next boundary.
+
 The resulting policy must compile with allocated mount-plan scratch outside
 every hidden root, and hidden roots may not overlap the planner's reserved
 source subtrees. Representative synthetic-host tests cover explicit masks,

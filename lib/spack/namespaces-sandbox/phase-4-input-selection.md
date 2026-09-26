@@ -349,7 +349,7 @@ once. Port behavior, not implementation details.
 Each item is one commit with focused tests and documentation, and each keeps
 the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
-- [ ] C2, `sandbox: select host, device, and worker-state inputs`.
+- [x] C2, `sandbox: select host, device, and worker-state inputs`.
 - [ ] C3, `sandbox: validate selected policies before worker threads`.
 - [ ] C4, `sandbox: record real compiler build evidence`. Tick the source
   item in `refactor-review.md` only after this passes, then select
@@ -466,3 +466,11 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   lock across the transaction. Focused lifecycle, installer, and prefix
   integration tests passed; C2 host/device and worker-state input selection is
   now selected.
+- 2026-09-26: Completed C2 with a dormant, fail-closed selector for explicit
+  hidden and replacement roots, dynamic-linker and policy runtime candidates,
+  real device nodes, Spack source and configuration paths, repositories,
+  dependency prefixes, caches, stage/prefix/log paths, jobserver FIFOs, and a
+  scoped worker directory. Missing explicit worker paths and non-canonical
+  spellings fail before policy compilation; unavailable host candidates are
+  omitted. Focused synthetic-host tests pass, and the live worker remains
+  unchanged. Selected C3, pre-thread policy validation.

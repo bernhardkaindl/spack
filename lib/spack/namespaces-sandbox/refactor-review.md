@@ -184,6 +184,17 @@ model, but not the policy-derived mount tree in
   pivot, rollback, and failed-prefix cleanup to the supervisor without
   changing the path seen by build tools.
 
+- [x] C2, select host, device, and worker-state inputs. The dormant selector
+  combines policy and dynamic-linker runtime candidates, filters device
+  entries to character devices, restores repository, source, configuration,
+  dependency, and cache paths, and requires canonical stage, prefix, log,
+  jobserver, fetch-cache, and scoped-worker paths. Focused synthetic-host
+  coverage proves optional candidates are skipped and explicit worker paths
+  fail closed. Select C3, pre-thread policy validation.
+
+- [ ] C3, validate the selected policy before worker threads and preserve the
+  current narrow live-worker behavior.
+
 - [ ] Materialize the complete trusted input selection in pre-thread installer
   setup. Select the complete hidden host/device roots; resolve the concrete
   build's external compiler executables and canonical aliases, support tools,
