@@ -13,13 +13,16 @@ import sys
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
+import spack.build_environment
 import spack.error
 import spack.installer.build as build
 import spack.sandbox
 import spack.sandbox_namespaces as ns
+import spack.spec
 import spack.util.tty
 
 
@@ -331,9 +334,15 @@ def test_filesystem_policy_compiles_replacement_and_generated_alias(tmp_path):
 
     plan = ns.build_namespace_mount_plan_from_policy(policy, str(stage))
 
+    preserved_source = str(stage / "spack-preserved-host-paths" / "replacement-0")
+    assert plan.preserved_mounts == (
+        ns.NamespacePreservedMount(
+            str(replacement), preserved_source, True, ns.NamespaceMountAccess.READ_WRITE
+        ),
+    )
     assert plan.replacement_mounts == (
         ns.NamespacePreservedMount(
-            str(replacement), str(hidden), True, ns.NamespaceMountAccess.READ_WRITE
+            preserved_source, str(hidden), True, ns.NamespaceMountAccess.READ_WRITE
         ),
     )
     assert plan.generated_symlinks == (
@@ -1404,22 +1413,24 @@ def test_namespace_selection_does_not_preflight_landlock(monkeypatch):
     assert sandbox._landlock is None
 
 
-def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path):
+@pytest.mark.parametrize("failure", [None, "policy", "authority"])
+def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path, failure):
     calls = []
     worker_root = tmp_path / "worker with spaces"
     worker_root.mkdir()
     monkeypatch.setattr(os, "environ", dict(os.environ, JAVA_TOOL_OPTIONS="-Xmx256m"))
     monkeypatch.setattr(build.tempfile, "tempdir", "/inherited-temp")
+    inherited_environment = dict(os.environ)
 
     class RecordingSandbox(ns.NamespaceSandbox):
-        def prepare_filesystem_policy(self, policy, mount_plan_stage):
-            calls.append(("prepare policy", policy, mount_plan_stage))
+        def prepare_filesystem_policy(self, policy, stage_path):
+            calls.append(("prepare policy", policy, stage_path))
             self._filesystem_policy_active = True
-            return True
+            return failure != "policy"
 
         def drop_mount_authority(self):
             calls.append(("drop mount authority",))
-            return True
+            return failure != "authority"
 
         def allow_read(self, path):
             calls.append(("read", path))
@@ -1437,13 +1448,15 @@ def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path):
         "freeze_namespace_sandbox_capability",
         lambda: ns.NamespaceCapability(True, None, None),
     )
-    spec = SimpleNamespace(traverse=lambda **kwargs: [], prefix=tmp_path / "prefix")
+    spec = spack.spec.Spec()
+    channel = cast(build.IpcChannel, None)
     policy = ns.build_namespace_filesystem_policy(
         [], read_write_mounts=[(str(worker_root), str(worker_root))], read_only_view=True
     )
     activation = build.NamespaceActivation(policy, str(tmp_path / "mount-plan"), str(worker_root))
 
     def start_tee(*args):
+        spack.build_environment.clean_environment().apply_modifications()
         assert os.environ["HOME"] == str(worker_root / "home")
         assert os.environ["XDG_CACHE_HOME"] == str(worker_root / "cache")
         for variable in ("TMPDIR", "TMP", "TEMP"):
@@ -1461,8 +1474,20 @@ def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path):
 
     monkeypatch.setattr(build, "Tee", start_tee)
 
+    if failure:
+        with pytest.raises(spack.error.InstallError):
+            build._start_tee_after_namespace(
+                {"enable": True}, channel, None, channel, "build.log", spec,
+                str(tmp_path), activation,
+            )
+        assert os.environ == inherited_environment
+        assert build.tempfile.tempdir == "/inherited-temp"
+        assert not list(worker_root.iterdir())
+        assert ("tee",) not in calls
+        return
+
     _, prepared = build._start_tee_after_namespace(
-        {"enable": True}, None, None, None, "build.log", spec, str(tmp_path), activation
+        {"enable": True}, channel, None, channel, "build.log", spec, str(tmp_path), activation
     )
     assert prepared is sandbox
     build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=sandbox)
@@ -1471,6 +1496,185 @@ def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path):
         ("drop mount authority",),
         ("tee",),
     ]
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing", "file", "symlink", "relative", "dotdot", "unselected"]
+)
+def test_namespace_worker_root_validation(tmp_path, invalid):
+    root = tmp_path / "worker"
+    root.mkdir()
+    policy = ns.build_namespace_filesystem_policy(
+        [], read_write_mounts=[(str(root), str(root))], read_only_view=True
+    )
+    if invalid == "missing":
+        root.rmdir()
+    elif invalid == "file":
+        root.rmdir()
+        root.touch()
+    elif invalid == "symlink":
+        alias = tmp_path / "alias"
+        alias.symlink_to(root)
+        root = alias
+    elif invalid == "relative":
+        root = os.path.relpath(root)
+    elif invalid == "dotdot":
+        root = root / ".." / "worker"
+    elif invalid == "unselected":
+        root = tmp_path
+    activation = build.NamespaceActivation(policy, str(tmp_path / "scratch"), str(root))
+    with pytest.raises((spack.error.InstallError, ns.NamespaceSetupError)):
+        build._validate_namespace_worker_root(activation)
+
+
+@pytest.mark.parametrize("name", ["home", "cache", "tmp"])
+@pytest.mark.parametrize("existing", ["directory", "file", "symlink"])
+def test_namespace_worker_environment_rejects_existing_paths(
+    tmp_path, monkeypatch, name, existing
+):
+    root = tmp_path / "worker"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = root / name
+    if existing == "directory":
+        target.mkdir()
+    elif existing == "file":
+        target.touch()
+    else:
+        target.symlink_to(outside)
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setattr(build.tempfile, "tempdir", "/inherited-temp")
+    inherited_environment = dict(os.environ)
+    with pytest.raises(FileExistsError):
+        build._configure_namespace_worker_environment(str(root))
+    assert os.environ == inherited_environment
+    assert build.tempfile.tempdir == "/inherited-temp"
+    assert not list(outside.iterdir())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_namespace_worker_environment_unchanged_for_fallback(tmp_path, monkeypatch, enabled):
+    fallback = object()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: fallback)
+    monkeypatch.setattr(ns, "freeze_namespace_sandbox_capability", lambda: None)
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setattr(build.tempfile, "tempdir", "/inherited-temp")
+    inherited_environment = dict(os.environ)
+    sandbox = build._prepare_namespace_sandbox_before_threads(
+        {"enable": enabled}, spack.spec.Spec(), str(tmp_path)
+    )
+    assert sandbox is (fallback if enabled else None)
+    assert os.environ == inherited_environment
+    assert build.tempfile.tempdir == "/inherited-temp"
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
+def test_live_namespace_worker_environment(tmp_path):
+    if not ns.namespace_sandbox_available():
+        pytest.skip("unprivileged namespaces unavailable")
+    hidden = tmp_path / "hidden-home"
+    hidden.mkdir()
+    secret = hidden / "host-secret"
+    secret.write_text("private")
+    stage_parent = hidden / "stage-parent"
+    stage_parent.mkdir()
+    worker_root = stage_parent / "worker with 'single' and \"double\" quotes"
+    worker_root.mkdir()
+    replacement = tmp_path / "host-tmp"
+    replacement.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    inherited_environment = dict(os.environ)
+    inherited_tempdir = build.tempfile.tempdir
+    code = """
+import errno
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from spack.installer import build
+from spack.sandbox_namespaces import (
+    build_namespace_filesystem_policy, freeze_namespace_sandbox_capability,
+)
+
+hidden, stage_parent, root, replacement, scratch = map(Path, sys.argv[1:6])
+policy = build_namespace_filesystem_policy(
+    [str(hidden), str(replacement)],
+    read_write_mounts=[(str(stage_parent), str(stage_parent))],
+    replacement_mounts=[(str(root), str(replacement))],
+    read_only_view=True,
+)
+activation = build.NamespaceActivation(policy, str(scratch), str(root))
+assert freeze_namespace_sandbox_capability().available
+os.environ['JAVA_TOOL_OPTIONS'] = '-Xmx64m -Duser.home=/old -Djava.io.tmpdir=/old'
+os.environ.pop('_JAVA_OPTIONS', None)
+os.environ.pop('JDK_JAVA_OPTIONS', None)
+tempfile.tempdir = '/stale-parent-cache'
+
+def start_tee(*args):
+    for variable, name in (
+        ('HOME', 'home'), ('XDG_CACHE_HOME', 'cache'),
+        ('TMPDIR', 'tmp'), ('TMP', 'tmp'), ('TEMP', 'tmp'),
+    ):
+        path = Path(os.environ[variable])
+        assert path == root / name, (variable, path, root / name)
+        assert path.resolve() == path
+        assert path.stat().st_mode & 0o777 == 0o700
+        (path / variable).write_text('worker')
+    generated = Path(tempfile.mkdtemp())
+    assert generated.parent == root / 'tmp'
+    with tempfile.NamedTemporaryFile() as temporary:
+        assert Path(temporary.name).parent == root / 'tmp'
+        temporary.write(b'worker')
+    assert not (hidden / 'host-secret').exists()
+    (replacement / 'private-temp').write_text('replacement')
+    try:
+        (root.parent.parent.parent / 'must-fail').write_text('denied')
+    except OSError as error:
+        assert error.errno == errno.EROFS
+    else:
+        raise AssertionError('inherited view remained writable')
+    if sys.argv[6]:
+        result = subprocess.run(
+            [sys.argv[6], '-XshowSettings:properties', '-version'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        for property_name, directory in (('user.home', 'home'), ('java.io.tmpdir', 'tmp')):
+            assert f'{property_name} = {root / directory}' in result.stderr, result.stderr
+    return object()
+
+build.Tee = start_tee
+_, sandbox = build._start_tee_after_namespace(
+    {'enable': True}, None, None, None, 'build.log', SimpleNamespace(),
+    str(stage_parent), activation,
+)
+assert sandbox.filesystem_policy_active
+os._exit(0)
+"""
+    result = subprocess.run(
+        [
+            sys.executable, "-c", code, str(hidden), str(stage_parent), str(worker_root),
+            str(replacement), str(scratch), shutil.which("java") or "",
+        ],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert os.environ == inherited_environment
+    assert build.tempfile.tempdir == inherited_tempdir
+    assert secret.read_text() == "private"
+    assert not list(replacement.iterdir())
+    assert (worker_root / "private-temp").read_text() == "replacement"
+    for name, variable in (("home", "HOME"), ("cache", "XDG_CACHE_HOME"), ("tmp", "TMPDIR")):
+        assert (worker_root / name / variable).read_text() == "worker"
 
 
 def test_namespace_selection_uses_constrained_landlock_fallback(monkeypatch):
