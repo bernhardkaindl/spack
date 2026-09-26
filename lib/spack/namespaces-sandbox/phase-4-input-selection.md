@@ -327,15 +327,19 @@ once. Port behavior, not implementation details.
   preserves lexical alias paths, and creates generated symlinks in the private
   mask source without activating the worker.
 
-- [ ] B2, `sandbox: allocate durable mount-plan scratch`, including
-  supervisor-owned cleanup and collision tests.
+- [x] B2, `sandbox: allocate durable mount-plan scratch`, including
+  supervisor-owned cleanup and collision tests. Allocate a unique mode-0700
+  lease from a canonical non-symlink base outside all hidden, replacement,
+  stage, prefix, and writable-policy roots. Require the supervisor to own
+  cleanup, reject live workers and stale-path replacement, and cover
+  concurrent allocation, setup cleanup, symlinked bases, and collisions.
+- [ ] B3, `sandbox: prove a read-only view with explicit writable mounts`.
 
 ## Proposed sequence
 
 Each item is one commit with focused tests and documentation, and each keeps
 the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
-- [ ] B3, `sandbox: prove a read-only view with explicit writable mounts`.
 - [ ] C1, `installer: preserve host-visible stage and prefix lifecycles`,
   using a stable per-build stage parent and supervisor-owned prefix pivot.
 - [ ] C2, `sandbox: select host, device, and worker-state inputs`.
@@ -428,3 +432,12 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   masks for the selected-tree compiler. Focused policy, mount-plan, and
   installer tests passed. Selected B2, durable supervisor-cleaned mount-plan
   scratch and collision validation.
+- 2026-09-26: Completed B2 with a supervisor-owned durable scratch lease for
+  mount endpoints. Allocation uses a canonical non-symlink base, creates
+  unique mode-0700 directories outside policy and lifecycle roots, and rejects
+  root overlap and active allocation collisions. Cleanup is owner-only,
+  refuses live attached workers and replaced scratch inodes, and remains
+  usable for setup failure and abnormal worker exit. Concurrent allocation,
+  symlinked-base, collision, live-worker, stale-path, and cleanup tests pass.
+  The live worker remains unchanged. Selected B3, a recursively read-only
+  namespace view with explicit writable mounts.
