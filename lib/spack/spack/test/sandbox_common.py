@@ -273,6 +273,24 @@ def test_stage_tool_paths_include_helper_chain_and_git_exec_path(monkeypatch):
     ]
 
 
+def test_stage_tool_alias_symlink_paths_restore_selected_spelling(monkeypatch, tmp_path):
+    from spack import sandbox_namespaces
+    from spack.installer import build
+
+    tool_dir = tmp_path / "usr" / "bin"
+    tool_dir.mkdir(parents=True)
+    shell = tool_dir / "sh"
+    dash = tool_dir / "dash"
+    dash.touch()
+    shell.symlink_to("dash")
+    monkeypatch.setattr(build, "which_string", lambda name: str(shell) if name == "sh" else None)
+
+    entry = build.ResolvedSandboxPath("sh", str(dash.resolve()))
+    assert build.stage_tool_alias_symlink_paths((entry,), (str(tool_dir),)) == [
+        sandbox_namespaces.NamespaceGeneratedSymlink(str(shell), str(dash.resolve()))
+    ]
+
+
 def test_tool_runtime_paths_include_owner_and_link_run_dependencies(tmp_path: pathlib.Path):
     from spack.installer import build
 

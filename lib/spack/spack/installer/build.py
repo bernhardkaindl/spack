@@ -462,6 +462,26 @@ def stage_tool_paths(policy: Optional[dict] = None) -> List[ResolvedSandboxPath]
     return result
 
 
+def stage_tool_alias_symlink_paths(
+    tool_entries: Iterable[ResolvedSandboxPath], hidden_roots: Iterable[str]
+) -> List[spack.sandbox_namespaces.NamespaceGeneratedSymlink]:
+    """Restore selected stage-tool spellings when their executables are symlinks."""
+    result = []
+    for entry in tool_entries:
+        spelling = which_string(entry.spelling)
+        if spelling is None:
+            continue
+        spelling = os.path.abspath(spelling)
+        alias = os.path.join(
+            os.path.realpath(os.path.dirname(spelling)), os.path.basename(spelling)
+        )
+        if alias == entry.source or os.path.realpath(spelling) != entry.source:
+            continue
+        if any(os.path.commonpath((root, alias)) == root for root in hidden_roots):
+            result.append(spack.sandbox_namespaces.NamespaceGeneratedSymlink(alias, entry.source))
+    return result
+
+
 def _canonical_existing_paths(
     paths: Iterable[str], *, character_devices: bool = False
 ) -> Tuple[str, ...]:
@@ -1681,9 +1701,17 @@ def prepare_namespace_activation(
     replacement_mounts = tuple((worker_root, root) for root in host_paths.replacement_roots)
     device_policy = _load_sandbox_policy()
     tmpfs_paths = tuple(device_policy["tmpfs_paths"])
-    generated_symlinks = tuple(compiler_alias_symlink_paths(spec)) + tuple(
-        spack.sandbox_namespaces.NamespaceGeneratedSymlink(link, target)
-        for link, target in device_policy["device_symlinks"].items()
+    generated_symlinks = tuple(
+        dict.fromkeys(
+            (
+                *compiler_alias_symlink_paths(spec),
+                *stage_tool_alias_symlink_paths(tool_entries, host_paths.hidden_roots),
+                *(
+                    spack.sandbox_namespaces.NamespaceGeneratedSymlink(link, target)
+                    for link, target in device_policy["device_symlinks"].items()
+                ),
+            )
+        )
     )
     policy = namespace_selected_filesystem_policy_from_inputs(
         config,
