@@ -148,6 +148,19 @@ model, but not the policy-derived mount tree in
   external scratch. Synthetic-host and fail-closed input tests exercise the
   boundary; the worker still uses the narrow mask.
 
+- [x] Resolve the selected compiler helpers and stage-tool closure without
+  ambient compiler fallback. Absolute `-print-prog-name` and
+  `-print-file-name` answers are kept with their searched spellings, bare
+  answers and Spack binutils wrappers are rejected, aliases remain available
+  for later generated symlinks, and `cpp`, `file`, Git, script helper chains,
+  and Spack-built tool dependency prefixes are covered by focused tests. The
+  selectors remain dormant and the worker still uses the narrow mask.
+
+- [ ] Add explicit passthrough and replacement policy entries plus generated
+  alias symlinks. Use the A3 spelling/source records to replace derived parent
+  masks without restoring broad `/usr`, `/tmp`, or `/var/tmp` trees. Keep the
+  live worker unchanged until the complete input inventory is validated.
+
 - [ ] Materialize the complete trusted input selection in pre-thread installer
   setup. Select the complete hidden host/device roots; resolve the concrete
   build's external compiler executables and canonical aliases, support tools,
@@ -389,3 +402,11 @@ model, but not the policy-derived mount tree in
   system-header and GCC-installation selection, with repository-aware compiler
   discovery and focused synthetic tests. The live worker remains on the narrow
   mask; A3 helper, alias, and stage-tool resolution is now selected.
+- 2026-09-26: Completed A3 in the Phase 4 ledger. Added dormant compiler
+  helper, alias, executable-support, Git, stage-tool, helper-chain, and
+  Spack-tool-runtime selectors. Absolute compiler answers are canonicalized
+  without ambient fallback; searched spellings remain distinct, Spack
+  binutils wrappers are excluded, and focused tests cover the complete A3
+  boundary. The live worker remains on the narrow mask; B1 explicit
+  passthrough, replacement, and generated-symlink policy entries are now
+  selected.

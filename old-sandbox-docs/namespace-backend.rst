@@ -475,6 +475,18 @@ reported installation. The helper also identifies other GCC installations for
 later masking. These results are evidence for later policy compilation only;
 the worker does not call the helpers.
 
+A3 adds dormant subordinate-input selection. Compiler ``-print-prog-name`` and
+``-print-file-name`` answers are accepted only when absolute; bare answers are
+not resolved through ambient ``PATH``, and ``libexec/spack`` binutils wrappers
+are not selected in preference to real binutils. The selectors preserve each
+searched spelling separately from its canonical source, including compiler
+driver aliases for later generated symlinks. They also select ``cpp``'s
+``cc1``, ``file`` magic data, Git's configured ``--exec-path`` directory, the
+fetch/expansion tool set and script-helper closure, and link/run dependency
+prefixes for Spack-built tools. A3 records these inputs but does not create
+symlinks or activate the policy; explicit passthrough, replacement, and
+generated-symlink entries are the next B1 boundary.
+
 The compiler requires every selected spelling to be an existing canonical
 path. Symlink spellings fail until the policy can preserve both the selected
 name and its resolved source. It collapses a same-access descendant only when
