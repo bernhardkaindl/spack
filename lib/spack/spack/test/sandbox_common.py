@@ -1046,3 +1046,12 @@ def test_complete_namespace_policy_rejects_missing_selected_path(
     )
     assert str(uncovered_temporary) in {mount.target for mount in policy.read_write_mounts}
     assert str(uncovered_temporary) in {mount.target for mount in plan.restoration_mounts}
+
+    compilerless_policy, _ = namespace_filesystem_policy_and_plan_from_inputs(
+        {},
+        spec,
+        str(existing),
+        str(tmp_path / "mount-plan-compilerless"),
+        selected_paths._replace(compiler_paths=(), header_paths=()),
+    )
+    assert str(compiler) not in {mount.target for mount in compilerless_policy.read_only_mounts}

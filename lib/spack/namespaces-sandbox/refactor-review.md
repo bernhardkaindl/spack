@@ -607,3 +607,9 @@ checks.
   canonical configured root before compiling the policy; symlinked/noncanonical
   spellings fail closed. A production assembly regression proves the cache
   starts absent and is writable-selected. E1.2 m4 retry is next.
+- 2026-09-26: The first E1.2 retry passed fetch-cache selection but failed on
+  `compiler-wrapper`, which has no compiler virtual dependencies and only
+  copies Spack's wrapper script during installation. Policy selection now
+  permits empty compiler/header inputs without selecting compiler executables;
+  the other required input categories remain enforced. A focused policy test
+  covers this compilerless case. Retry the actual install next.
