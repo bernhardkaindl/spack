@@ -349,7 +349,7 @@ once. Port behavior, not implementation details.
 - [x] C1, `installer: preserve host-visible stage and prefix lifecycles`,
   using a stable per-build stage parent and supervisor-owned prefix pivot.
 
-- [ ] D3, complete private `/dev` construction. Keep the existing selected
+- [x] D3, complete private `/dev` construction. Keep the existing selected
   device bind mounts, including `/dev/urandom`; add a fresh per-worker tmpfs
   at `/dev/shm` and generated `/dev/fd`, `/dev/stdin`, `/dev/stdout`, and
   `/dev/stderr` links. First extend and validate the immutable mount plan,
@@ -415,9 +415,31 @@ grouping: A1-A3, B1-B3, and C1-C4.
     verified evidence and limitations. Close D2 and select private `/dev`
     construction as D3, keeping full install-child lifecycle proof separate.
 
-Next is D3 `/dev` construction, followed by the whole writable inventory and
-stage/prefix success and failure semantics through a complete install-child
-lifecycle. D2's disposable activation test does not close that lifecycle gap.
+Next is E1, the whole writable inventory and full install-child lifecycle,
+starting with a real sandboxed `spack install m4`. D2/D3 activation tests do
+not close that lifecycle gap.
+
+- [ ] E1, inventory all paths touched by the complete install child and make
+  `spack install m4` succeed under automatic namespace activation. Start with a
+  real constrained install and record exact missing/read-only/writable paths;
+  repair only trusted selectors and mount-plan semantics required by those
+  observations. Then verify fetch, stage, configure/build, prefix finalization,
+  logs, and success/failure cleanup from the supervisor. Keep recipe/core
+  sources read-only, avoid config options and broad store/stage-root grants,
+  and retain `/usr/lib*` policy candidates and device-list provenance.
+
+### E1 commit steps
+
+1. [x] E1.1, prepare narrowly selected persistent roots that Spack normally
+   creates lazily before immutable writable-path validation; reject
+   noncanonical roots and test fresh-install assembly.
+2. [-] E1.2, repeatedly run real sandboxed `spack install m4`, record each
+   production selection/lifecycle failure, and fix the smallest trusted
+   boundary responsible. Keep complete install-child evidence separate from
+   synthetic planner tests.
+3. [ ] E1.3, verify successful prefix/log/store visibility and failure-stage
+   retention, prefix rollback/keep behavior, then reconcile both ledgers and
+   select the next outstanding sandbox-docs item.
 
 ## Accepted improvements
 
@@ -632,8 +654,8 @@ lifecycle. D2's disposable activation test does not close that lifecycle gap.
   synthetic shared-memory alias. Actual link/tmpfs setup failures remain fatal
   before `Tee`, environment publication, or fallback. All 198 affected tests
   pass, including live namespace checks, and Ruff passes. D3.3 real `/dev`
-  behavior and concurrent isolation are next. Skip Sphinx builds for this work
-  per the user's directive; retain documentation and whitespace checks.
+  behavior and concurrent isolation are next. Sphinx validation was
+  subsequently resumed and passed for the changed backend page.
 - 2026-09-26: Completed D3.3 and closed private `/dev` construction. Two
   simultaneous disposable namespace workers each see only selected device
   nodes plus `shm` and generated descriptor links, preserve device identity,
@@ -643,16 +665,20 @@ lifecycle. D2's disposable activation test does not close that lifecycle gap.
   unchanged. Both workers report zero effective/permitted/inheritable
   capabilities and reject later bind mounts. Combined D3 suites pass 199
   tests with live namespace checks enabled; Ruff and whitespace checks pass.
-  No Sphinx builds were run per request. Selected whole-child writable
-  inventory and install lifecycle verification next, starting with a real
-  `spack install m4` attempt. Detached mounts, Windows, and network policy
+  Selected whole-child writable inventory and install lifecycle verification
+  next, starting with a real `spack install m4` attempt. Detached mounts,
+  Windows, and network policy
   remain outside this increment.
 
-- [ ] E1, inventory all paths touched by the complete install child and make
-  `spack install m4` succeed under automatic namespace activation. Start with a
-  real constrained install and record exact missing/read-only/writable paths;
-  repair only trusted selectors and mount-plan semantics required by those
-  observations. Then verify fetch, stage, configure/build, prefix finalization,
-  logs, and success/failure cleanup from the supervisor. Keep recipe/core
-  sources read-only, avoid config options and broad store/stage-root grants,
-  and retain `/usr/lib*` policy candidates and device-list provenance.
+- 2026-09-26: Resumed Sphinx validation after the user reversed the temporary
+  skip instruction. The isolated `namespace-backend.rst` Sphinx build passed;
+  future RST documentation changes require Sphinx validation again.
+- 2026-09-26: E1.1 failure evidence: the first real m4 install against a fresh
+  store failed before namespace setup because the configured source-cache
+  directory (`$spack/var/spack/cache`) did not exist. Spack normally creates
+  that cache lazily, after activation; the selected policy correctly requires
+  writable roots to exist before mounting. Activation now creates only that
+  canonical configured cache root in trusted parent setup before path
+  selection; noncanonical spellings fail closed. The production assembler
+  regression starts with an absent cache and passes. Selected E1.2, retry the
+  real install and address the next concrete worker failure.

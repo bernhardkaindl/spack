@@ -1627,6 +1627,14 @@ def prepare_namespace_activation(
     fetch_cache_path: str,
 ) -> Tuple[NamespaceActivation, spack.sandbox_namespaces.NamespaceMountPlanScratch]:
     """Select, compile, and lease one build's complete namespace policy."""
+    fetch_cache_path = os.path.abspath(fetch_cache_path)
+    if fetch_cache_path != os.path.realpath(fetch_cache_path):
+        raise spack.sandbox_namespaces.NamespaceSetupError(
+            errno.EINVAL,
+            "prepare namespace fetch cache",
+            f"fetch cache path is not canonical: {fetch_cache_path}",
+        )
+    os.makedirs(fetch_cache_path, mode=0o700, exist_ok=True)
     host_paths = select_namespace_host_device_worker_paths(
         config,
         spec,
