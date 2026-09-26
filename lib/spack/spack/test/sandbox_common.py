@@ -902,7 +902,12 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
         lambda: [build.ResolvedSandboxPath(str(tool), str(tool))],
     )
     monkeypatch.setattr(build, "tool_runtime_paths", lambda spec, tools: [])
-    monkeypatch.setattr(build, "system_compiler_header_paths", lambda spec: (str(headers),))
+    missing_header = headers / "a.out.h"
+    monkeypatch.setattr(
+        build,
+        "system_compiler_header_paths",
+        lambda spec: (str(headers), str(missing_header)),
+    )
     monkeypatch.setattr(
         build,
         "compiler_alias_symlink_paths",
@@ -974,6 +979,7 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
         read_only_targets = {mount.target for mount in activation.policy.read_only_mounts}
         read_write_targets = {mount.target for mount in activation.policy.read_write_mounts}
         assert read_only_targets == {str(compiler), str(tool), str(headers), str(user_cache)}
+        assert str(missing_header) not in read_only_targets
         assert read_write_targets == {
             os.devnull,
             str(stage),

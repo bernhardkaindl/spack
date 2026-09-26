@@ -710,3 +710,9 @@ not close that lifecycle gap.
   assembler redundantly re-added the raw configured alias as a canonical mount
   input. Removed that duplicate input and extended the assembler regression to
   cover a symlinked driver. All 30 sandbox-common tests and Ruff pass; retry m4.
+- 2026-09-26: The next m4 activation failed on missing `/usr/include/a.out.h`.
+  The Linux header policy documents missing candidates as ignored, but the
+  activation assembler passed them to required-path validation. It now filters
+  absent header candidates while retaining existing selected paths; the
+  production regression covers this behavior. All 30 sandbox-common tests and
+  Ruff pass. Retry the real install next.
