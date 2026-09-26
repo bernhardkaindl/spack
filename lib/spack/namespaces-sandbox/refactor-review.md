@@ -384,3 +384,8 @@ model, but not the policy-derived mount tree in
   alias, namespace-section, and safe-relative-path validation; the Landlock
   command stub remains excluded and the live worker is unchanged. The Phase 4
   ledger now selects concrete compiler and system-header selection (A2).
+- 2026-09-26: Completed A2 in the Phase 4 ledger. Added dormant compiler
+  language-edge and supported-compiler-node selection plus policy-driven
+  system-header and GCC-installation selection, with repository-aware compiler
+  discovery and focused synthetic tests. The live worker remains on the narrow
+  mask; A3 helper, alias, and stage-tool resolution is now selected.
