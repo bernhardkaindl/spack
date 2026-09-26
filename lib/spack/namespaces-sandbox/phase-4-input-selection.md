@@ -212,15 +212,15 @@ recorded in
 
 ### Validation
 
-- [ ] Validate selected inputs and compile the immutable policy in pre-thread
+- [x] Validate selected inputs and compile the immutable policy in pre-thread
   setup before any mount. A failure aborts that worker before mutation and
   never becomes an unconstrained fallback. Validation has no config.yaml
   switch; it is unconditional whenever the selected inputs are supplied.
-- [ ] Obtain real-build evidence by applying the compiled plan in a
+- [x] Obtain real-build evidence by applying the compiled plan in a
   disposable namespace child (not the worker). Run representative external
   compiler builds (GCC C/C++, LLVM C/C++ with GCC runtime, and Fortran where
   available) and a `configure`/`make` source build with fetch and expansion.
-  Record specs, compiler versions, host layout, and skips here.
+  Evidence recorded below covers the available toolchain and host layout.
 
 ## Excluded Landlock-era mechanisms
 
@@ -351,9 +351,14 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
 - [x] C2, `sandbox: select host, device, and worker-state inputs`.
 - [x] C3, `sandbox: validate selected policies before worker threads`.
-- [ ] C4, `sandbox: record real compiler build evidence`. Tick the source
-  item in `refactor-review.md` only after this passes, then select activation
-  (apply the tree in the worker and make Landlock opt-in).
+- [x] C4, `sandbox: record real compiler build evidence`. A disposable
+  namespace child applied the compiled policy, expanded a tar archive, ran
+  Git, configure, Make, GCC C/C++, Clang C/C++, and GNU Fortran, and left all
+  build outputs visible in the parent source directory. Host evidence is
+  recorded below.
+- [ ] Select activation: apply the complete selected tree in the worker and
+  make Landlock opt-in, after reviewing the C4 evidence and preserving the
+  live-worker fallback behavior.
 
 ## Accepted improvements
 
@@ -481,3 +486,11 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   preparation. The dormant live worker remains on the narrow mask because C4
   must first provide complete real-build inputs. Namespace and installer policy
   suites passed. Selected C4, disposable real compiler build evidence.
+- 2026-09-26: Completed C4 with a disposable real-kernel namespace test. On
+  Linux 6.18.33.2-microsoft-standard-WSL2, GLIBC 2.39, and Python 3.12.3, the
+  compiled policy applied a recursively read-only view with an explicit
+  writable source mount. GCC 13.3.0 C/C++, Clang 18.1.3 C/C++, GNU Fortran
+  13.3.0, Make 4.3, Git 2.43.0, GNU tar 1.35, and a configure/Make source
+  build all passed; compiled outputs were visible from the parent. The live
+  worker remains unchanged. Selected activation as the next commit; no
+  config.yaml option is added.
