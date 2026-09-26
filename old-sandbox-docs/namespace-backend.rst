@@ -412,13 +412,14 @@ Phase 4: Policy-driven mount tree
 The immutable mount-plan validation, preserved-source ordering, immutable mask
 source, read-only/read-write enforcement, and filesystem-policy model are
 complete. ``NamespaceFilesystemPolicy`` classifies canonical hidden roots,
-read-only mounts, read-write mounts, and namespace-local generated files or
-directories in immutable tuples. Its builder rejects duplicate, nested, and
-cross-access targets before namespace entry. Generated paths must be below a
-hidden root. Preserved mounts may be below a hidden root because they are the
-explicit content restored after that root is hidden. Requested hidden roots
-must exist and be directories; the installer's optional default mask filters
-an absent host directory before policy construction.
+read-only passthrough mounts, read-write mounts, replacement mounts, and
+namespace-local generated files, directories, or symlinks in immutable tuples.
+Its builder rejects duplicate, nested, and cross-access targets before
+namespace entry. Generated entries must be below a hidden root. Replacement
+sources must be existing directories mounted at explicit hidden roots;
+preserved mounts may be below a hidden root because they are the explicit
+content restored after that root is hidden. Requested hidden roots must exist
+and be directories.
 
 The installer can construct this policy from the paths represented by its
 current Landlock grants: non-external dependency prefixes, the install prefix,
@@ -484,23 +485,29 @@ driver aliases for later generated symlinks. They also select ``cpp``'s
 ``cc1``, ``file`` magic data, Git's configured ``--exec-path`` directory, the
 fetch/expansion tool set and script-helper closure, and link/run dependency
 prefixes for Spack-built tools. A3 records these inputs but does not create
-symlinks or activate the policy; explicit passthrough, replacement, and
-generated-symlink entries are the next B1 boundary.
+symlinks or activate the policy; B1 consumes these records as explicit
+passthrough, replacement, and generated-symlink entries.
 
-The compiler requires every selected spelling to be an existing canonical
-path. Symlink spellings fail until the policy can preserve both the selected
-name and its resolved source. It collapses a same-access descendant only when
-an existing ancestor mount covers it, then verifies coverage of every
-originally selected path. Explicit hidden roots are combined with the parent
-of each effective identity mount; nested candidates collapse to the outer
-root. A selected top-level path is rejected because restoring it would require
-masking ``/``. The resulting policy must compile with caller-provided
-mount-plan scratch outside every hidden root, and hidden roots may not overlap
-the planner's reserved source subtrees. Representative synthetic-host tests
-cover explicit masks and selected compiler, tool, header, runtime, dependency,
-repository, Spack-source, stage, prefix, device, and temporary paths, including
-an intentionally ancestor-covered header subtree. They also prove disappeared,
-symlinked, and top-level selected paths fail closed.
+B1 completes the dormant policy-entry boundary. Explicit hidden roots are
+provided by trusted setup rather than derived from every mount target, so a
+selected path outside those roots remains visible passthrough and does not
+silently hide a parent such as ``/usr/lib`` or ``/tmp``. A caller-provided
+replacement directory can be mounted at a hidden root, with nested selected
+paths restored afterward. A3 compiler spelling/source records become generated
+symlink entries: the alias path remains lexical, while its target is the
+canonical compiler source. The planner creates those symlinks in the private
+mask source before it is made read-only. These entries are validated and
+compiled but remain dormant; scoped replacement-source allocation and policy
+activation are later work.
+
+The resulting policy must compile with caller-provided mount-plan scratch
+outside every hidden root, and hidden roots may not overlap the planner's
+reserved source subtrees. Representative synthetic-host tests cover explicit
+masks, replacement roots, generated aliases, and selected compiler, tool,
+header, runtime, dependency, repository, Spack-source, stage, prefix, device,
+and temporary paths, including an intentionally ancestor-covered header
+subtree. They also prove disappeared, symlinked, and uncovered selected paths
+fail closed.
 
 The worker does not activate the installer-derived policy yet. It continues to
 use only the narrow ``/usr/share/aclocal`` mask and transitional Landlock. The

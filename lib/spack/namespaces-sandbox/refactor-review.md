@@ -156,10 +156,17 @@ model, but not the policy-derived mount tree in
   and Spack-built tool dependency prefixes are covered by focused tests. The
   selectors remain dormant and the worker still uses the narrow mask.
 
-- [ ] Add explicit passthrough and replacement policy entries plus generated
+- [x] Add explicit passthrough and replacement policy entries plus generated
   alias symlinks. Use the A3 spelling/source records to replace derived parent
-  masks without restoring broad `/usr`, `/tmp`, or `/var/tmp` trees. Keep the
-  live worker unchanged until the complete input inventory is validated.
+  masks without restoring broad `/usr`, `/tmp`, or `/var/tmp` trees. The
+  dormant policy now keeps alias paths lexical, canonicalizes their sources,
+  validates replacement sources at hidden roots, and mounts replacements before
+  nested restorations. The live worker remains unchanged.
+
+- [ ] Allocate durable, supervisor-cleaned mount-plan scratch outside all
+  hidden and replacement roots. Reject symlinked bases, collisions, and stale
+  cleanup races before policy activation; preserve stage and prefix lifecycle
+  semantics independently of the scratch tree.
 
 - [ ] Materialize the complete trusted input selection in pre-thread installer
   setup. Select the complete hidden host/device roots; resolve the concrete
@@ -227,6 +234,11 @@ model, but not the policy-derived mount tree in
   duplicate, nested, hidden-root, generated-path, and cross-access conflicts.
   Generated paths are created in the private mask tmpfs before it becomes
   read-only. Hand-constructed policies are revalidated before compilation.
+- The policy model now distinguishes caller-provided replacement roots and
+  generated symlinks from ordinary passthrough mounts. Replacement sources are
+  validated as directories at explicit hidden roots and mounted before nested
+  restorations; generated alias paths remain lexical while their targets are
+  canonicalized and created in the private mask source.
 - Trusted installer construction classifies the existing dependency, prefix,
   stage, temporary, device, `sbang`, and configured path grants. Missing paths
   are omitted like current sandbox grants and redundant same-access descendants
@@ -410,3 +422,10 @@ model, but not the policy-derived mount tree in
   boundary. The live worker remains on the narrow mask; B1 explicit
   passthrough, replacement, and generated-symlink policy entries are now
   selected.
+- 2026-09-26: Completed B1 in the Phase 4 ledger. Replaced derived parent
+  masks with explicit hidden-root inputs for the selected-tree compiler,
+  added replacement-root and generated-symlink policy entries, and covered
+  their deterministic mount-plan application. Alias spellings survive
+  `realpath` canonicalization, nested restorations follow replacements, and
+  the live worker remains on the narrow mask. Selected durable mount-plan
+  scratch and collision cleanup as B2.

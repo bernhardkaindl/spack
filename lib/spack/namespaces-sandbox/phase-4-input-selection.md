@@ -93,21 +93,22 @@ compensated for Landlock's inability to hide paths are not ported (see
 - [x] Record each searched spelling separately from its resolved source.
   Aliases such as `cc` remain represented at their original path inside a
   masked directory, while canonical source paths are used for validation.
-  A3 does not generate the alias symlinks; B1 adds those policy entries. Do
-  not select every hardlink or same-file entry in a directory.
+  B1 represents aliases as generated symlink entries. Do not select every
+  hardlink or same-file entry in a directory.
 
 ### Host, device, and worker-state exposure
 
-- [ ] Replace derived parent masks with explicit hidden roots from policy data.
+- [x] Replace derived parent masks with explicit hidden roots from policy data.
   A selected path outside every hidden root is visible passthrough and needs
   no mount; a path below one is restored. This prevents incidental masking of
   `/usr/lib` or `/tmp`.
-- [ ] Add replacement roots: a hidden directory whose source is a
+- [x] Add replacement-root policy entries: a hidden directory whose source is a
   caller-provided directory instead of an empty tmpfs. Mounting the scoped
   worker directory at `/tmp` (and `/var/tmp`) gives `tmpfile()` and every
   hard-coded `/tmp` user a private writable tree without a host `/tmp` grant.
-  Selected paths below the host `/tmp`, such as a default stage root, are
-  preserved before replacement and restored afterward.
+  Selected paths below a replacement root, such as a default stage root, are
+  preserved before replacement and restored afterward. The scoped worker
+  source allocation remains a later host/device and worker-state selection.
 - [ ] Replace Landlock write rules with a recursively read-only view plus
   explicit writable mounts. Prove in a disposable namespace that setting
   `MOUNT_ATTR_RDONLY` recursively on inherited mounts is permitted, that
@@ -319,17 +320,21 @@ once. Port behavior, not implementation details.
   include executable support data, add Git's helper directory, and include
   Spack tool prefixes with link/run dependencies.
 
-- [ ] B1, `sandbox: add passthrough, replacement, and generated-symlink
+- [x] B1, `sandbox: add passthrough, replacement, and generated-symlink
   policy entries`. Use the A3 spelling/source records to materialize aliases
-  inside masked directories while replacing derived parent masks.
+  inside masked directories while replacing derived parent masks. The dormant
+  policy model now validates replacement sources at explicit hidden roots,
+  preserves lexical alias paths, and creates generated symlinks in the private
+  mask source without activating the worker.
+
+- [ ] B2, `sandbox: allocate durable mount-plan scratch`, including
+  supervisor-owned cleanup and collision tests.
 
 ## Proposed sequence
 
 Each item is one commit with focused tests and documentation, and each keeps
 the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
-- [ ] B2, `sandbox: allocate durable mount-plan scratch`, including
-  supervisor-owned cleanup and collision tests.
 - [ ] B3, `sandbox: prove a read-only view with explicit writable mounts`.
 - [ ] C1, `installer: preserve host-visible stage and prefix lifecycles`,
   using a stable per-build stage parent and supervisor-owned prefix pivot.
@@ -415,3 +420,11 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   chain, and Spack-built tool link/run dependency prefixes are covered by
   focused tests. The live worker remains unchanged. Selected B1, explicit
   passthrough/replacement entries and generated alias symlinks.
+- 2026-09-26: Completed B1 with explicit hidden-root and passthrough policy
+  inputs, caller-provided replacement mounts, and generated symlink entries.
+  Alias paths remain lexical while their sources are canonicalized; the mount
+  planner creates aliases in the private mask source and mounts replacements
+  before restoring nested selections. The installer no longer derives parent
+  masks for the selected-tree compiler. Focused policy, mount-plan, and
+  installer tests passed. Selected B2, durable supervisor-cleaned mount-plan
+  scratch and collision validation.
