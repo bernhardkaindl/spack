@@ -747,3 +747,9 @@ not close that lifecycle gap.
 - 2026-09-26: Selecting `expr` let configure progress further; it then reported
   `rm: not found` and `ls: not found`. Added both observed utilities to the
   shipped stage-tool policy and asserted them in the policy-data test. Retry m4.
+- 2026-09-26: With `rm` and `ls` available, configure reported missing `cat`
+  and `sort`; its C compiler check also showed `collect2` could not find `ld`.
+  The canonical linker source was selected, but its `/usr/bin/ld` PATH alias
+  was not regenerated. Tool alias assembly now includes compiler-support
+  entries, and the policy selects `cat`, `sort`, and `make` for configure and
+  the build phase. A production-assembly regression covers the linker alias.
