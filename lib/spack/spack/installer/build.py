@@ -646,6 +646,44 @@ def default_hide_as_empty_dirs(spec: spack.spec.Spec) -> List[str]:
     return hidden_dirs
 
 
+def namespace_filesystem_policy_from_inputs(
+    config: dict, spec: spack.spec.Spec, stage_path: str
+) -> spack.sandbox_namespaces.NamespaceFilesystemPolicy:
+    """Classify trusted installer inputs without changing the worker filesystem."""
+    read_only_paths = [str(dep.prefix) for dep in spec.traverse(root=False) if not dep.external]
+    read_only_paths.append(os.path.join(spack.store.STORE.unpadded_root, "bin", "sbang"))
+    read_only_paths.extend(
+        os.path.join(upstream_db.root, "bin", "sbang")
+        for upstream_db in spack.store.STORE.upstreams or []
+    )
+    read_only_paths.extend(config.get("allow_read", []))
+
+    read_write_paths = [stage_path, str(spec.prefix), tempfile.gettempdir(), os.devnull]
+    read_write_paths.extend(config.get("allow_write", []))
+
+    def existing_identity_mounts(paths):
+        resolved_paths = []
+        for path in paths:
+            resolved = os.path.realpath(os.path.abspath(path))
+            if os.path.exists(resolved):
+                resolved_paths.append(resolved)
+        minimal_paths = []
+        for path in sorted(set(resolved_paths)):
+            if any(
+                parent != path and os.path.commonpath((parent, path)) == parent
+                for parent in minimal_paths
+            ):
+                continue
+            minimal_paths.append(path)
+        return ((path, path) for path in minimal_paths)
+
+    return spack.sandbox_namespaces.build_namespace_filesystem_policy(
+        (path for path in default_hide_as_empty_dirs(spec) if os.path.isdir(path)),
+        existing_identity_mounts(read_only_paths),
+        existing_identity_mounts(read_write_paths),
+    )
+
+
 def _prepare_namespace_sandbox_before_threads(
     config: dict, spec: spack.spec.Spec, stage_path: str
 ) -> Optional[spack.sandbox.Sandbox]:
