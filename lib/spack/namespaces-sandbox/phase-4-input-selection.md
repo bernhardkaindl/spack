@@ -724,3 +724,12 @@ not close that lifecycle gap.
   `/usr/bin` tools to external GCC/glibc prefixes at `/usr`, collapsing the
   narrower compiler and Python runtime selections. Tool ownership now excludes
   external package prefixes. All 30 sandbox-common tests and Ruff pass; retry m4.
+- 2026-09-26: The next m4 attempt installed `gcc-runtime` but gmake failed to
+  execute its host-present `spack-src/configure` with `ENOENT`. The executable
+  uses `#!/bin/sh`; policy tracing showed stage-tool selection retained the
+  logical `sh` spelling and canonical `/usr/bin/dash` source but generated
+  aliases only for compilers, leaving `/usr/bin/sh` absent beneath the hidden
+  `/usr/bin`. Activation now generates selected stage-tool aliases at their
+  canonicalized PATH spellings. A focused regression covers `sh -> dash`, and
+  a live namespace test proves a stage nested beneath a replacement root is
+  visible. All 138 sandbox tests, Ruff, and whitespace checks pass; retry m4.
