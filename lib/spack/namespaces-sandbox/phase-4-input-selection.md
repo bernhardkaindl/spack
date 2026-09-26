@@ -291,7 +291,7 @@ once. Port behavior, not implementation details.
 
 ## Next selected work
 
-- [ ] A1, `sandbox: load namespace policy data`. Track `sandbox.yaml` without
+- [x] A1, `sandbox: load namespace policy data`. Track `sandbox.yaml` without
   `commands` and track `linux-header-policy.yaml`; do not add
   `commands/df`. Add lazy loaders in `spack.installer.build` that validate
   the version, list types, alias keys, and safe relative header paths, and
@@ -301,12 +301,16 @@ once. Port behavior, not implementation details.
   and each malformed case. Documentation: the policy-data paragraph in
   `lib/spack/docs/sandbox/namespace-backend.rst`.
 
+- [ ] A2, `sandbox: select concrete compilers and system headers`. Use the
+  loaded policy data to select only the concrete compiler languages and exact
+  header trees required by the DAG; keep this selection dormant and focused
+  on compiler/header evidence.
+
 ## Proposed sequence
 
 Each item is one commit with focused tests and documentation, and each keeps
 the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
-- [ ] A2, `sandbox: select concrete compilers and system headers`.
 - [ ] A3, `sandbox: resolve compiler helpers, aliases, and stage tools`.
 - [ ] B1, `sandbox: add passthrough, replacement, and generated-symlink
   policy entries`, replacing derived parent masks.
@@ -374,3 +378,10 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   option 4 as the only coherent later prototype and rejected partial hybrids
   for Phase 4 due to poor security benefit relative to code, probe,
   failure-path, and compatibility cost.
+- 2026-09-26: Completed A1 by adding lazy, fail-closed loaders for the
+  versioned sandbox and Linux header YAML files. Removed the Landlock command
+  stub from the tracked policy, added validated hidden-root, replacement-root,
+  device-node, and stage-program sections, and kept all data unused by the
+  live worker. Added malformed version/list/alias/header-path tests and
+  documented the policy-data boundary. Selected A2, concrete compiler and
+  system-header selection, as the next work item.

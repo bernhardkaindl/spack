@@ -43,6 +43,7 @@ import spack.url_buildcache
 import spack.util.environment
 import spack.util.filesystem as fs
 import spack.util.lock
+import spack.util.spack_yaml as syaml
 import spack.util.timer
 import spack.util.tty
 from spack.installer.base import (
@@ -104,6 +105,146 @@ class NamespacePolicyInputPaths(NamedTuple):
     header_paths: Tuple[str, ...]
     runtime_paths: Tuple[str, ...]
     temporary_paths: Tuple[str, ...]
+
+
+SANDBOX_POLICY_PATH = os.path.join(spack.paths.share_path, "sandbox", "sandbox.yaml")
+LINUX_HEADER_POLICY_PATH = os.path.join(
+    spack.paths.share_path, "sandbox", "linux-header-policy.yaml"
+)
+
+
+def _policy_error(policy_name: str, path: str, key: str, detail: str) -> spack.error.InstallError:
+    return spack.error.InstallError(f"Invalid {policy_name} key {key!r} in {path}: {detail}")
+
+
+def _load_policy_document(policy_name: str, path: str):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            policy = syaml.load(stream)
+    except (OSError, syaml.SpackYAMLError) as error:
+        raise spack.error.InstallError(f"Cannot load {policy_name} {path}: {error}") from error
+
+    if not isinstance(policy, dict):
+        raise _policy_error(policy_name, path, "<document>", "expected a mapping")
+    if type(policy.get("version")) is not int or policy["version"] != 1:
+        raise _policy_error(policy_name, path, "version", "expected integer 1")
+    return policy
+
+
+def _validate_string_list(policy_name: str, path: str, policy: dict, key: str) -> None:
+    value = policy.get(key)
+    if not isinstance(value, list) or not all(isinstance(entry, str) for entry in value):
+        raise _policy_error(policy_name, path, key, "expected a list of strings")
+
+
+def _validate_absolute_path_list(policy_name: str, path: str, policy: dict, key: str) -> None:
+    _validate_string_list(policy_name, path, policy, key)
+    if any(not os.path.isabs(entry) for entry in policy[key]):
+        raise _policy_error(policy_name, path, key, "expected absolute paths")
+
+
+def _load_sandbox_policy(path: str = SANDBOX_POLICY_PATH) -> dict:
+    """Load and validate the shipped namespace sandbox compatibility policy."""
+    policy_name = "sandbox policy"
+    policy = _load_policy_document(policy_name, path)
+    if "commands" in policy:
+        raise _policy_error(
+            policy_name, path, "commands", "Landlock command stubs are unsupported"
+        )
+
+    list_keys = (
+        "host_runtime_read_paths",
+        "file_runtime_read_paths",
+        "compiler_languages",
+        "compiler_programs",
+        "binutils_programs",
+        "coreutils_install_programs",
+        "coreutils_file_programs",
+        "coreutils_util_programs",
+        "build_utilities_programs",
+        "script_interpreter_programs",
+        "compiler_files",
+        "stage_programs",
+        "device_nodes",
+    )
+    for key in list_keys:
+        _validate_string_list(policy_name, path, policy, key)
+    for key in ("hidden_roots", "replacement_roots"):
+        _validate_absolute_path_list(policy_name, path, policy, key)
+
+    aliases = policy.get("compiler_driver_aliases")
+    languages = policy.get("compiler_languages")
+    if not isinstance(aliases, dict) or set(aliases) != set(languages):
+        raise _policy_error(
+            policy_name,
+            path,
+            "compiler_driver_aliases",
+            "expected exactly one string-list entry for each compiler language",
+        )
+    for language in languages:
+        aliases_for_language = aliases.get(language)
+        if not isinstance(aliases_for_language, list) or not all(
+            isinstance(entry, str) for entry in aliases_for_language
+        ):
+            raise _policy_error(
+                policy_name,
+                path,
+                f"compiler_driver_aliases.{language}",
+                "expected a list of strings",
+            )
+    return policy
+
+
+def _validate_relative_header_paths(path: str, policy: dict, section: str, key: str) -> None:
+    full_key = f"{section}.{key}"
+    value = policy[section].get(key)
+    if not isinstance(value, list) or not all(isinstance(entry, str) for entry in value):
+        raise _policy_error("Linux header policy", path, full_key, "expected a list of strings")
+    for entry in value:
+        normalized = entry.replace("\\", "/")
+        if (
+            not normalized
+            or os.path.isabs(entry)
+            or normalized.startswith("/")
+            or ".." in normalized.split("/")
+        ):
+            raise _policy_error(
+                "Linux header policy", path, full_key, f"unsafe relative path {entry!r}"
+            )
+
+
+def _load_linux_header_policy(path: str = LINUX_HEADER_POLICY_PATH) -> dict:
+    """Load and validate the shipped Linux system-header policy."""
+    policy = _load_policy_document("Linux header policy", path)
+    include_root = policy.get("system_include_root")
+    if not isinstance(include_root, str) or not os.path.isabs(include_root):
+        raise _policy_error(
+            "Linux header policy", path, "system_include_root", "expected an absolute path"
+        )
+
+    for section in ("glibc", "linux"):
+        value = policy.get(section)
+        if not isinstance(value, dict):
+            raise _policy_error("Linux header policy", path, section, "expected a mapping")
+        required_keys = (
+            ("files", "directories", "target_files", "target_directories")
+            if section == "glibc"
+            else ("directories", "target_directories")
+        )
+        for key in required_keys:
+            _validate_relative_header_paths(path, policy, section, key)
+    libstdcxx = policy.get("libstdcxx")
+    if (
+        not isinstance(libstdcxx, dict)
+        or type(libstdcxx.get("maximum_major_for_non_gcc")) is not int
+    ):
+        raise _policy_error(
+            "Linux header policy",
+            path,
+            "libstdcxx.maximum_major_for_non_gcc",
+            "expected an integer",
+        )
+    return policy
 
 
 class ChildInfo:

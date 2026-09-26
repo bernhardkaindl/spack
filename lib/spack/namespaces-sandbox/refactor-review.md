@@ -379,3 +379,8 @@ model, but not the policy-derived mount tree in
   derived parent masks would hide `/usr/lib` and `/tmp`, and that stage and
   prefix mount points conflict with `PrefixPivoter`. Selected policy-data
   loading (A1) as the next commit.
+- 2026-09-26: Completed the policy-data loading increment (A1). The shipped
+  sandbox and Linux header policies now load lazily with version, structure,
+  alias, namespace-section, and safe-relative-path validation; the Landlock
+  command stub remains excluded and the live worker is unchanged. The Phase 4
+  ledger now selects concrete compiler and system-header selection (A2).
