@@ -583,6 +583,8 @@ def test_complete_namespace_policy_from_installer_inputs(monkeypatch, tmp_path: 
     repository_python_path = directory(host / "repos-python")
     repository_composition_root = directory(repository_python_path / "spack_repo")
     repository = directory(repository_composition_root / "builtin")
+    repository_alias = host / "repository-alias"
+    repository_alias.symlink_to(repository, target_is_directory=True)
     hidden_host_state = directory(host / "home")
     dependency_prefix = directory(host / "store" / "dependency")
     external_prefix = directory(host / "external")
@@ -607,7 +609,11 @@ def test_complete_namespace_policy_from_installer_inputs(monkeypatch, tmp_path: 
         spack.repo,
         "PATH",
         SimpleNamespace(
-            repos=[SimpleNamespace(root=str(repository), python_path=str(repository_python_path))]
+            repos=[
+                SimpleNamespace(
+                    root=str(repository_alias), python_path=str(repository_python_path)
+                )
+            ]
         ),
     )
     monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(host / "store"))
