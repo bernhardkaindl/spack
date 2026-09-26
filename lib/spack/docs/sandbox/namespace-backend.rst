@@ -12,12 +12,12 @@ worker and build-phase confinement. Its default filesystem policy hides host
 trees behind empty mounts and bind-mounts only allowlisted content, so normal
 negative lookups return ``ENOENT`` instead of Landlock's ``EPERM``.
 
-Landlock inside the namespace is an optional diagnostic mode for testing how
-installations behave under permission-denied errors. It is not part of the
-target default namespace policy. The current narrow implementation still
-layers Landlock while the policy-driven mount tree is incomplete; removing it
-before every required read, write, and execute path has a namespace mapping
-would weaken confinement.
+Landlock is not layered into an active namespace policy. The namespace backend
+is selected automatically when its capability probe succeeds, while the
+existing Landlock-only backend remains the constrained fallback when namespace
+setup is unavailable. This project adds no namespace options to ``config.yaml``:
+older Spack versions must continue to accept bootstrap configuration written
+by newer versions, so policy selection and validation remain config-free.
 
 Seccomp is not part of the current develop branch's sandbox implementation.
 It exists in an earlier exploratory sandbox branch
@@ -125,10 +125,8 @@ install child freezes its pre-thread result. This preserves diagnostics such as
 worker thread exists.
 
 When the probe reports unavailability, backend selection explicitly chooses
-the existing Landlock-only sandbox. This is a constrained fallback, so it is
-distinct from the shared ``config:sandbox:allow_fallback`` policy for trusted
-direct execution when no sandbox worker is available. The command never
-launches an unconstrained worker.
+the existing Landlock-only sandbox. This is a constrained fallback, and the
+command never launches an unconstrained worker.
 
 Fallback is permitted only from this side-effect-free capability decision.
 Once the install child starts namespace entry or mount-tree preparation, a
@@ -150,16 +148,9 @@ namespaces and is not restricted.
 This closes the :term:`mount-authority window`: no recipe-controlled Python
 runs while the child holds the capability needed to create mounts. The child
 then starts logging and performs recipe-controlled staging, patching, and
-builder setup. The current transitional implementation applies Landlock before
-the build-phase loop because the mount policy is incomplete. The target
-namespace-only default must separately prevent writes to ``/proc`` UID/GID
-mapping files and exposure of tools that could create another namespace.
-
-When opt-in Landlock diagnostic mode is enabled, ABI 8 and newer apply the
-Landlock domain to the child-local logging thread with
-``LANDLOCK_RESTRICT_SELF_TSYNC``. On older ABIs that trusted thread remains
-outside the Landlock domain and must not execute package recipe or build-tool
-code.
+builder setup against the selected namespace policy. Landlock is not applied
+inside an active namespace policy; it is used only by the fallback backend
+when namespace capability probing fails.
 
 The forked child inherits loaded modules, Python objects, environment state,
 and open descriptors from the supervisor. The current boundary therefore
@@ -177,9 +168,9 @@ the internal fork-and-self-restrict path.
 Mount tree design
 -----------------
 
-The namespace backend prepares a private mount tree before the worker
-applies Landlock. The mount tree hides host content and presents only the
-content the worker legitimately needs.
+The namespace backend prepares a private mount tree before the worker starts
+Tee or recipe-controlled code. The mount tree hides host content and presents
+only the content the worker legitimately needs.
 
 Mount-plan validation
 ~~~~~~~~~~~~~~~~~~~~~
@@ -299,16 +290,12 @@ privileged capabilities. The namespace is unprivileged.
 Relationship to Landlock (and future seccomp)
 ----------------------------------------------
 
-The completed namespace backend replaces Landlock as the default filesystem
-policy for namespaced workers:
+The completed namespace backend is the default filesystem policy for namespaced
+workers; Landlock is used only when namespace capability probing fails:
 
 * Empty mounts hide non-allowlisted host content. Read-only and writable bind
   mounts expose only the content and mutation points required by the build.
   Missing content therefore produces ``ENOENT`` instead of ``EPERM``.
-* Landlock may be enabled explicitly inside the namespace to test installation
-  behavior under permission-denied errors or to evaluate defense in depth. It
-  is not enabled by default once the mount policy is complete.
-
 * Seccomp is not part of the current develop branch's sandbox implementation.
   It exists in an earlier exploratory sandbox branch
   (``lib.sandbox/spack/spack/``) but has not been merged into
@@ -394,15 +381,14 @@ Phase 3: Integration with the install worker
 Integrate the namespace backend into the install worker's launch path. When the
 namespace backend is available, the existing Linux install child performs the
 trusted mount setup and drops namespace capabilities before starting
-child-local threads. The current narrow integration later applies Landlock
-immediately before the build phases as a transitional constraint until the
-complete namespace filesystem policy is implemented.
+child-local threads. The complete selected filesystem policy is activated at
+that boundary; the Landlock-only backend is used when namespace setup is
+unavailable.
 
 This phase does not require a second worker protocol or ``exec``. An external
 sandboxing tool may be added later as an alternate launcher, and a future
 fresh-exec boundary may harden inherited-state and recipe-import isolation.
 
-Landlock remains available as an opt-in diagnostic mode inside the namespace.
 Seccomp policies from the earlier exploratory branch may be added later as a
 further inner layer; see `Relationship to Landlock (and future seccomp)`_.
 
@@ -444,7 +430,7 @@ anchoring against a concurrent same-type source substitution remains future
 hardening; policy construction and application therefore remain trusted,
 single-threaded installer work.
 
-The dormant selected-tree compiler makes the next boundary explicit. Trusted
+The selected-tree compiler makes the next boundary explicit. Trusted
 setup must provide nonempty selections of hidden host roots, exact host
 compiler executables, build tools, header trees, runtime paths, and scoped
 temporary directories. Non-external compiler and tool packages already appear
@@ -464,19 +450,19 @@ roots, device nodes, and stage programs. It deliberately has no Landlock
 entries below its absolute system include root for the glibc, Linux UAPI, and
 libstdc++ header policy. Loaders validate versions, list and alias structure,
 namespace path types, and header path traversal before any later selection
-work consumes the data. Loading is currently dormant: this commit does not
-activate the policy or change the live worker.
+work consumes the data. Loading is performed during trusted setup before the
+worker is launched.
 
-A2 adds dormant selection helpers on top of these files. They select compiler
+A2 adds selection helpers on top of these files. They select compiler
 languages represented by concrete DAG edges and supported compiler nodes,
 deduplicate repeated selections, and use the header policy to enumerate exact
 glibc, Linux UAPI, GCC-internal, and libstdc++ trees. Non-GCC C++ selection is
 capped at the configured safe libstdc++ major, while GCC selection follows its
 reported installation. The helper also identifies other GCC installations for
-later masking. These results are evidence for later policy compilation only;
-the worker does not call the helpers.
+later masking. These results are compiled into the activation policy before
+the worker starts.
 
-A3 adds dormant subordinate-input selection. Compiler ``-print-prog-name`` and
+A3 adds subordinate-input selection. Compiler ``-print-prog-name`` and
 ``-print-file-name`` answers are accepted only when absolute; bare answers are
 not resolved through ambient ``PATH``, and ``libexec/spack`` binutils wrappers
 are not selected in preference to real binutils. The selectors preserve each
@@ -486,9 +472,9 @@ driver aliases for later generated symlinks. They also select ``cpp``'s
 fetch/expansion tool set and script-helper closure, and link/run dependency
 prefixes for Spack-built tools. A3 records these inputs but does not create
 symlinks or activate the policy; B1 consumes these records as explicit
-passthrough, replacement, and generated-symlink entries.
+passthrough, replacement, and generated-symlink entries before launch.
 
-B1 completes the dormant policy-entry boundary. Explicit hidden roots are
+B1 completes the policy-entry boundary. Explicit hidden roots are
 provided by trusted setup rather than derived from every mount target, so a
 selected path outside those roots remains visible passthrough and does not
 silently hide a parent such as ``/usr/lib`` or ``/tmp``. A caller-provided
@@ -497,8 +483,8 @@ paths restored afterward. A3 compiler spelling/source records become generated
 symlink entries: the alias path remains lexical, while its target is the
 canonical compiler source. The planner creates those symlinks in the private
 mask source before it is made read-only. These entries are validated and
-compiled but remain dormant; scoped replacement-source allocation and policy
-activation are later work.
+compiled before launch; scoped replacement-source allocation and policy
+activation are part of worker setup.
 
 B2 adds a supervisor-owned ``NamespaceMountPlanScratch`` lease for the
 planner's durable endpoint tree. Allocation requires a canonical, real
@@ -509,14 +495,15 @@ attached worker is no longer alive; cleanup refuses live workers and refuses
 paths replaced by a symlink or another inode. This scratch is ordinary
 host-backed setup state, separate from the host-visible stage and prefix.
 
-B3 completes the dormant access model for selected-tree plans. Such a plan
+B3 completes the access model for selected-tree plans. Such a plan
 marks the inherited mount tree read-only recursively with
 ``MOUNT_ATTR_RDONLY`` before applying its bind restores. Read-write policy
 mounts explicitly clear that attribute on their bind views, while read-only
 mounts retain it. The capability probe and disposable namespace tests verify
 that recursive inherited mounts can be made read-only, passthrough writes
 return ``EROFS``, and selected writable mounts remain writable. The live
-worker still uses the narrow mask and transitional Landlock.
+worker activates this selected policy when namespace capability probing
+succeeds.
 
 C1 preserves the host-visible lifecycle of build stages and install prefixes
 when the selected-tree policy is eventually activated. Trusted supervisor
@@ -531,27 +518,27 @@ The supervisor also performs the prefix pivot before launch and creates the
 empty target at the exact path used by build tools. Prefix rollback, garbage
 removal, ``keep-prefix``, and ``BinaryCacheMiss`` handling happen only after
 the child namespace is gone, while the per-prefix write lock remains held
-through the transaction. The live worker still uses the narrow mask and
-transitional Landlock; this lifecycle boundary prepares it for the complete
-policy without activating that policy.
+through the transaction. The selected namespace policy uses these host-backed
+paths while the worker is confined; the Landlock-only fallback preserves the
+existing behavior when namespace setup is unavailable.
 
-C2 adds a dormant trusted-input boundary for the eventual selected-tree
-policy. It canonicalizes explicit hidden and replacement roots, combines the
+C2 adds a trusted-input boundary for the selected-tree policy. It canonicalizes
+explicit hidden and replacement roots, combines the
 versioned runtime candidates with the host dynamic-linker search paths, keeps
 only real character devices from the device list, and selects read-only
 Spack, repository, dependency, configuration, and cache paths. Stage, prefix,
 log, jobserver, fetch-cache, and scoped-worker paths are explicit writable
 inputs and fail closed when missing or non-canonical. Optional host candidates
-are omitted when unavailable. Selection does not mutate the worker or activate
-the broader policy; pre-thread validation is the next boundary.
+are omitted when unavailable. Trusted setup supplies the immutable activation
+payload, and the child validates and activates it before starting threads.
 
 C3 makes validation a configuration-free boundary. Whenever selected paths
 and mount-plan scratch are supplied, the immutable selected policy and mount
 plan are always compiled before capability freezing, sandbox acquisition, or
 namespace mutation. Invalid paths therefore abort worker setup rather than
-falling back to an unconstrained worker. The dormant live worker still supplies
-neither input, so it remains on the narrow mask until disposable real compiler
-and source-build evidence is recorded.
+falling back to an unconstrained worker. The live worker supplies the selected
+activation payload before namespace setup, so invalid policy data still aborts
+worker setup rather than being silently ignored.
 
 C4 records that evidence in a disposable real-kernel child rather than the
 live worker. On Linux 6.18.33.2-microsoft-standard-WSL2 with GLIBC 2.39 and
@@ -561,8 +548,8 @@ ran Git 2.43.0, configure, Make 4.3, GCC 13.3.0 C/C++, Clang 18.1.3 C/C++,
 and GNU Fortran 13.3.0. The resulting executables remained visible in the
 parent source directory. Tar, a C compiler, and Make are required for this
 evidence; Git, C++, Clang, Clang++, and Fortran are recorded when available.
-The live worker remains unchanged, and activation is a separate next step;
-this work adds no ``config.yaml`` option.
+The live worker now activates the selected policy when namespaces are
+available; this work adds no ``config.yaml`` option.
 
 The resulting policy must compile with allocated mount-plan scratch outside
 every hidden root, and hidden roots may not overlap the planner's reserved
@@ -574,15 +561,13 @@ They also prove concurrent scratch allocation, symlinked bases, allocation
 collisions, disappeared sources, stale-path replacement, and uncovered
 selected paths fail closed.
 
-The worker does not activate the installer-derived policy yet. It continues to
-use only the narrow ``/usr/share/aclocal`` mask and transitional Landlock. The
-selected-tree compiler is not called by the worker because trusted setup does
-not yet materialize the complete hidden host and device policy, exact host
-compiler, tool, header, and runtime set, canonical aliases, or a scoped
-replacement for the broad system temporary directory. Only paths below
-selected hidden roots are absent; unrelated host
-trees remain visible, so this helper is not yet a namespace-only replacement
-for Landlock. The complete policy derives from:
+The worker activates the installer-derived policy when namespace capability
+probing succeeds. Only paths below selected hidden roots are absent; unrelated
+host trees remain visible, so this is a namespace-only replacement for
+Landlock once trusted setup has materialized the complete hidden host and
+device policy, exact host compiler, tool, header, and runtime set, canonical
+aliases, and scoped replacements for writable paths. The complete policy
+derives from:
 
 * The concrete spec's selected compilers and build tools.
 * The host's available header trees and compiler installations.
@@ -628,8 +613,9 @@ Decision gates
 * [ ] A future Windows worker that confines recipe Python is created directly
   inside AppContainer; this platform-specific requirement does not constrain
   Linux launch design.
-* [ ] Namespace mounts provide the complete default filesystem policy;
-  Landlock is opt-in for permission-denied behavior testing.
+* [x] Namespace mounts provide the complete default filesystem policy when
+  available; Landlock is fallback-only and no new ``config.yaml`` option is
+  used.
 * [x] The capability probe reports specific reasons when the namespace backend
   is unavailable.
 * [x] The command never launches an unconstrained worker when the namespace

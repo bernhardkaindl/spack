@@ -1324,7 +1324,7 @@ def test_installer_normalizes_landlock_initialization_error(monkeypatch, tmp_pat
         build._enable_sandbox({"enable": True}, spec, str(tmp_path))
 
 
-def test_namespace_selection_preflights_landlock(monkeypatch):
+def test_namespace_selection_does_not_preflight_landlock(monkeypatch):
     landlock = object()
     monkeypatch.setattr(spack.sandbox.platform, "system", lambda: "Linux")
     monkeypatch.setattr(
@@ -1338,7 +1338,52 @@ def test_namespace_selection_preflights_landlock(monkeypatch):
 
     sandbox = spack.sandbox.get_sandbox()
     assert isinstance(sandbox, ns.NamespaceSandbox)
-    assert sandbox._landlock is landlock
+    assert sandbox._landlock is None
+
+
+def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_filesystem_policy(self, policy, mount_plan_stage):
+            calls.append(("prepare policy", policy, mount_plan_stage))
+            self._filesystem_policy_active = True
+            return True
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
+        def allow_read(self, path):
+            calls.append(("read", path))
+
+        def allow_write(self, path):
+            calls.append(("write", path))
+
+        def apply(self, block_network=False):
+            calls.append(("apply", block_network))
+
+    sandbox = RecordingSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    monkeypatch.setattr(
+        ns,
+        "freeze_namespace_sandbox_capability",
+        lambda: ns.NamespaceCapability(True, None, None),
+    )
+    spec = SimpleNamespace(traverse=lambda **kwargs: [], prefix=tmp_path / "prefix")
+    activation = build.NamespaceActivation(object(), str(tmp_path / "mount-plan"))
+
+    assert (
+        build._prepare_namespace_sandbox_before_threads(
+            {"enable": True}, spec, str(tmp_path), namespace_activation=activation
+        )
+        is sandbox
+    )
+    build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=sandbox)
+    assert calls == [
+        ("prepare policy", activation.policy, activation.mount_plan_stage),
+        ("drop mount authority",),
+    ]
 
 
 def test_namespace_selection_uses_constrained_landlock_fallback(monkeypatch):
