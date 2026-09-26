@@ -817,6 +817,8 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
     hidden_include = directory(host / "usr" / "include")
     selected_hidden_runtime = directory(host / "usr" / "lib")
     compiler = file(hidden_bin / "cc")
+    compiler_alias = hidden_bin / "cc-selected"
+    compiler_alias.symlink_to(compiler)
     tool = file(hidden_bin / "tar")
     headers = directory(hidden_include / "compiler")
     runtime = file(host / "etc" / "passwd")
@@ -887,9 +889,13 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
     monkeypatch.setattr(
         build,
         "compiler_driver_paths",
-        lambda spec: [build.ResolvedSandboxPath(str(compiler), str(compiler))],
+        lambda spec: [build.ResolvedSandboxPath(str(compiler_alias), str(compiler))],
     )
-    monkeypatch.setattr(build, "_selected_compilers", lambda spec: ())
+    monkeypatch.setattr(
+        build,
+        "_selected_compilers",
+        lambda spec: [("c", str(compiler_alias), SimpleNamespace(name="gcc"))],
+    )
     monkeypatch.setattr(
         build,
         "stage_tool_paths",
@@ -897,7 +903,15 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
     )
     monkeypatch.setattr(build, "tool_runtime_paths", lambda spec, tools: [])
     monkeypatch.setattr(build, "system_compiler_header_paths", lambda spec: (str(headers),))
-    monkeypatch.setattr(build, "compiler_alias_symlink_paths", lambda spec: ())
+    monkeypatch.setattr(
+        build,
+        "compiler_alias_symlink_paths",
+        lambda spec: [
+            spack.sandbox_namespaces.NamespaceGeneratedSymlink(
+                str(compiler_alias), str(compiler)
+            )
+        ],
+    )
     monkeypatch.setattr(
         spack.repo,
         "PATH",
@@ -941,13 +955,19 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
             )
         assert activation.worker_root == str(worker_root)
         assert activation.policy.tmpfs_paths == ("/dev/shm",)
-        assert set(activation.policy.generated_symlinks) == {
+        expected_generated_symlinks = {
+            spack.sandbox_namespaces.NamespaceGeneratedSymlink(
+                str(compiler_alias), str(compiler)
+            )
+        }
+        expected_generated_symlinks.update(
             spack.sandbox_namespaces.NamespaceGeneratedSymlink("/dev/" + name, target)
             for name, target in (
                 ("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"),
                 ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2"),
             )
-        }
+        )
+        assert set(activation.policy.generated_symlinks) == expected_generated_symlinks
         assert os.environ == inherited_environment
         assert build.tempfile.tempdir == inherited_tempdir
         assert not list(worker_root.iterdir())
