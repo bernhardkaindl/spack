@@ -553,6 +553,17 @@ falling back to an unconstrained worker. The dormant live worker still supplies
 neither input, so it remains on the narrow mask until disposable real compiler
 and source-build evidence is recorded.
 
+C4 records that evidence in a disposable real-kernel child rather than the
+live worker. On Linux 6.18.33.2-microsoft-standard-WSL2 with GLIBC 2.39 and
+Python 3.12.3, the child applied the compiled recursively read-only policy,
+restored an explicit writable source mount, expanded a GNU tar archive, and
+ran Git 2.43.0, configure, Make 4.3, GCC 13.3.0 C/C++, Clang 18.1.3 C/C++,
+and GNU Fortran 13.3.0. The resulting executables remained visible in the
+parent source directory. Tar, a C compiler, and Make are required for this
+evidence; Git, C++, Clang, Clang++, and Fortran are recorded when available.
+The live worker remains unchanged, and activation is a separate next step;
+this work adds no ``config.yaml`` option.
+
 The resulting policy must compile with allocated mount-plan scratch outside
 every hidden root, and hidden roots may not overlap the planner's reserved
 source subtrees. Representative synthetic-host tests cover explicit masks,

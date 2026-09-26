@@ -200,8 +200,16 @@ model, but not the policy-derived mount tree in
   scratch are supplied, while the dormant live worker still supplies neither.
   Focused ordering, namespace, and installer policy tests pass.
 
-- [ ] C4, obtain disposable real compiler and source-build evidence for the
-  compiled policy before selecting activation.
+- [x] C4, obtain disposable real compiler and source-build evidence for the
+  compiled policy before selecting activation. The disposable namespace test
+  applies the compiled read-only policy with an explicit writable source,
+  expands a tar archive, runs Git, configure, Make, GCC C/C++, Clang C/C++,
+  and GNU Fortran, and verifies parent-visible outputs. Host details and
+  optional-tool handling are recorded in the Phase 4 worklog.
+
+- [ ] Activate the complete selected tree in the worker and make Landlock
+  opt-in, preserving the existing fallback and dormant-worker behavior until
+  activation succeeds.
 
 - [ ] Materialize the complete trusted input selection in pre-thread installer
   setup. Select the complete hidden host/device roots; resolve the concrete
