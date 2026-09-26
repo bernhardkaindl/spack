@@ -8,8 +8,9 @@ focused test evidence, and deferred items remain explicit.
 
 The staged increment improves the capability probe, mount-tree helpers,
 `NamespaceSandbox`, installer wiring, tests, and this project's status page. It
-implements the narrow Linux install-child integration, but not the
-policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
+implements the narrow Linux install-child integration and immutable policy
+model, but not the policy-derived mount tree in
+`lib/spack/docs/sandbox/namespace-backend.rst`.
 
 ## Phase status
 
@@ -24,9 +25,9 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   logging thread, the existing forked Linux install child completes trusted
   namespace mount setup and drops mount authority. It applies Landlock before
   build phases. The supervisor remains unaffected.
-- [ ] Phase 4, policy-driven mount tree (immutable plan validation and
-  non-writable mask sources and access enforcement are complete; immutable
-  policy construction and policy-derived mounts remain open).
+- [ ] Phase 4, policy-driven mount tree (immutable plan and policy validation,
+  non-writable mask sources, and access enforcement are complete;
+  installer-policy activation and the complete derived tree remain open).
 - [ ] Phase 5, complete build-phase policy validation and hardening.
 - [ ] Phase 6, concretizer-worker evaluation.
 
@@ -128,12 +129,18 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   regressions cover files, directory trees, both preserved aliases, and the
   positive writable case.
 
-- [ ] Define and validate one immutable namespace filesystem policy before
+- [x] Define and validate one immutable namespace filesystem policy before
   mutation. It must classify hidden roots, read-only mounts, read-write mounts,
   and namespace-local generated paths; reject duplicate, overlapping, and
   access-conflicting entries; and be constructible from trusted installer spec
   and configuration inputs. Keep the runtime on the current narrow mask until
   the policy is complete enough to replace default Landlock safely.
+
+- [ ] Select the hidden roots and trusted compiler, tool, header, repository,
+  and Spack-source grants needed to compile the installer-created policy into a
+  complete mount tree. Prove representative policies compile without silently
+  dropping paths, provide scratch space outside all hidden roots, but do not
+  activate the broader tree until those inputs are complete.
 
 ### Tests and documentation structure
 
@@ -144,6 +151,8 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   `test_sandbox_namespaces.py`, preserving the stronger staged tests.
 - [x] Restore the same phase map in `index.rst`, distinguishing completed
   increments from incomplete broader phases and not-started work.
+- [x] Integrate the sandbox developer-documentation index into the top-level
+  Sphinx/Read the Docs tree.
 - [x] Scope Phase 3 completion to the internal Linux install-child integration;
   do not imply confinement-before-recipe-import or inherited-state minimization.
 - [x] Re-evaluate Phase 3 with platform-specific process requirements and mark
@@ -185,6 +194,20 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - Preserved allowlist mounts carry explicit access modes. Read-only aliases are
   recursively enforced by the kernel and return `EROFS` without Landlock;
   explicitly writable aliases retain writes to their selected source.
+- The immutable filesystem policy canonicalizes four categories and rejects
+  duplicate, nested, hidden-root, generated-path, and cross-access conflicts.
+  Generated paths are created in the private mask tmpfs before it becomes
+  read-only. Hand-constructed policies are revalidated before compilation.
+- Trusted installer construction classifies the existing dependency, prefix,
+  stage, temporary, device, `sbang`, and configured path grants. Missing paths
+  are omitted like current sandbox grants and redundant same-access descendants
+  are collapsed. Policy compilation rejects classified paths that do not yet
+  have a containing hidden root; the live worker does not use this broad policy.
+- Hidden roots must exist, lexical overlap checks consider every prior ancestor,
+  and mount-plan scratch space must remain outside hidden roots. Preserved
+  sources are rechecked and never recreated after validation. Descriptor-based
+  anchoring against concurrent same-type source substitution remains future
+  hardening at this trusted pre-thread boundary.
 - The namespace filesystem policy is intended to be the default confinement;
   Landlock is retained in the current narrow integration only as a transitional
   constraint and should become opt-in for permission-denied behavior tests.
@@ -288,3 +311,17 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   preserved aliases without Landlock and prove explicit writable mounts still
   propagate writes. Selected immutable namespace filesystem-policy
   construction and pre-mutation conflict validation as the next work item.
+- 2026-09-26: Added an immutable namespace filesystem policy with canonical
+  hidden-root, read-only, read-write, and generated-path categories. Policy
+  construction rejects duplicate, nested, cross-access, and invalid generated
+  entries; hand-built policies and compilability are checked before namespace
+  entry. Added trusted installer construction from existing sandbox grants and
+  generated-path planning without wiring the broad policy into the worker. The
+  namespace/shared sandbox suite passes 80 tests. Selected complete hidden-root
+  and compiler/tool/header/repository grant derivation as the next work item.
+- 2026-09-26: Ran `ruff format --check`, `ruff check`, complete-patch whitespace
+  validation, and the 80-test namespace/shared sandbox suite; all passed. A
+  fresh full Sphinx build reports no warning from the changed policy pages and
+  confirms the sandbox index is now in the top-level doctree. The warning gate
+  remains blocked by 14 unrelated repository autodoc, orphan, and reference
+  warnings.
