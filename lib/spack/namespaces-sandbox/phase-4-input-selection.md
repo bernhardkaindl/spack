@@ -82,18 +82,19 @@ compensated for Landlock's inability to hide paths are not ported (see
 - [x] Select exact glibc, Linux UAPI, libstdc++, and GCC-internal headers from
   the header policy. Keep the libstdc++ major-version cap for non-GCC C++, and
   mask GCC installations that no selected language requires.
-- [ ] Resolve helpers from the compiler (`-print-prog-name`,
+- [x] Resolve helpers from the compiler (`-print-prog-name`,
   `-print-file-name`), not from ambient `PATH`. Ignore bare-name answers,
   prefer real binutils over `libexec/spack` wrappers, and include `cc1` for
   `cpp`, the magic database for `file`, and Git's `--exec-path`.
-- [ ] Select stage tools for fetch and expansion (`tar`, `unzip`, `gzip`,
+- [x] Select stage tools for fetch and expansion (`tar`, `unzip`, `gzip`,
   `gunzip`, `bunzip2`, `xz`, `7z`, `patch`, `sh`, `git`), including script
   helper chains such as `gunzip` to `gzip` and `sh`. For Spack-built tools,
   add the owning prefix and its link/run dependency closure.
-- [ ] Record each searched spelling separately from its resolved source.
-  Aliases such as `cc` must stay visible at their original path inside a
-  masked directory. This requires generated symlinks in the policy model.
-  Do not select every hardlink or same-file entry in a directory.
+- [x] Record each searched spelling separately from its resolved source.
+  Aliases such as `cc` remain represented at their original path inside a
+  masked directory, while canonical source paths are used for validation.
+  A3 does not generate the alias symlinks; B1 adds those policy entries. Do
+  not select every hardlink or same-file entry in a directory.
 
 ### Host, device, and worker-state exposure
 
@@ -310,18 +311,23 @@ once. Port behavior, not implementation details.
   mixed language selection, system versus non-system compilers, and GCC versus
   non-GCC header selection.
 
-- [ ] A3, `sandbox: resolve compiler helpers, aliases, and stage tools`. Use
+- [x] A3, `sandbox: resolve compiler helpers, aliases, and stage tools`. Use
   the selected compiler paths to resolve subordinate programs and files,
   preserve searched spellings and aliases, and select the fetch/expansion
-  tool closure without activating the policy.
+  tool closure without activating the policy. The dormant selectors reject
+  bare compiler answers, skip Spack binutils wrappers, preserve aliases,
+  include executable support data, add Git's helper directory, and include
+  Spack tool prefixes with link/run dependencies.
+
+- [ ] B1, `sandbox: add passthrough, replacement, and generated-symlink
+  policy entries`. Use the A3 spelling/source records to materialize aliases
+  inside masked directories while replacing derived parent masks.
 
 ## Proposed sequence
 
 Each item is one commit with focused tests and documentation, and each keeps
 the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
-- [ ] B1, `sandbox: add passthrough, replacement, and generated-symlink
-  policy entries`, replacing derived parent masks.
 - [ ] B2, `sandbox: allocate durable mount-plan scratch`, including
   supervisor-owned cleanup and collision tests.
 - [ ] B3, `sandbox: prove a read-only view with explicit writable mounts`.
@@ -401,3 +407,11 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   headers, Linux UAPI headers, and the non-GCC libstdc++ major cap are handled
   without changing the live worker. Synthetic DAG and header-layout tests
   passed. Selected A3, compiler helper, alias, and stage-tool resolution.
+- 2026-09-26: Completed A3 with dormant compiler helper and stage-tool
+  selectors. Compiler `-print-*` answers are accepted only when absolute;
+  reported Spack binutils wrappers are ignored, while canonical source paths
+  remain separate from each searched spelling. Selected compiler aliases,
+  `cpp`'s `cc1`, `file` magic data, Git's `--exec-path`, the `gunzip` helper
+  chain, and Spack-built tool link/run dependency prefixes are covered by
+  focused tests. The live worker remains unchanged. Selected B1, explicit
+  passthrough/replacement entries and generated alias symlinks.
