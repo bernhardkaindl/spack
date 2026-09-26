@@ -653,24 +653,25 @@ checks.
   test pass; the two sandbox suites pass 138 tests, with Ruff and whitespace
   checks clean. E1 remains open pending the next real m4 install.
 - 2026-09-26: The shell-alias repair let gmake enter `configure`; it then
-  reported `sed: not found` because `sed` was not selected in `sandbox.yaml`.
-  Added `sed` to the stage-tool policy and asserted the shipped policy contains
-  it. The next real m4 retry will test the production selector and mount.
+  reported `sed: not found`. `sed` already belonged to the policy's
+  `script_interpreter_programs`, but activation selected only `stage_programs`.
+  The installer now unions the coreutils, build-utility, and interpreter
+  program groups for package installation while preserving the stage-only list.
 - 2026-09-26: With `sed` selected, gmake configure advanced but reported
-  `chmod: not found`. Added `chmod` to the stage-tool policy and its shipped
-  policy test. Retry m4 to continue measuring the install child's actual tool
-  needs.
+  `chmod: not found`; it was already listed in `coreutils_install_programs`.
+  The install-tool selector now includes that category.
 - 2026-09-26: With `chmod` selected, configure repeatedly reported
   `eval: expr: not found` and did not exit, so the retry was stopped while
-  preserving its host stage and log. Added `expr` to the selected stage-tool
-  policy and asserted the shipped entry. Retry the real install.
+  preserving its host stage and log. `expr` was already listed in
+  `coreutils_util_programs`; the install-tool union now includes it.
 - 2026-09-26: With `expr` selected, configure progressed further and then
-  reported `rm: not found` and `ls: not found`. Added both utilities to
-  `sandbox.yaml` and the shipped policy test; retry the actual install.
+  reported `rm: not found` and `ls: not found`. Both already belonged to
+  `coreutils_install_programs` and `coreutils_file_programs`; activation now
+  selects them through the install-tool union.
 - 2026-09-26: Configure then reported missing `cat` and `sort`; `config.log`
   showed the C compiler's `collect2` could not find `ld`, despite the
   canonical linker source being selected. The missing `/usr/bin/ld` PATH alias
   was not generated for compiler-support entries. Alias restoration now covers
-  those entries, and `cat`, `sort`, and `make` are selected as configure/build
-  utilities. A production-assembly regression covers the linker alias; E1
-  remains open for the next real install result.
+  those entries. `cat`, `sort`, and `make` were already listed in the coreutils
+  and build-utility groups, which are now selected for install execution. A
+  production-assembly regression covers the linker alias; E1 remains open.
