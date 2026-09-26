@@ -155,6 +155,8 @@ model, but not the policy-derived mount tree in
   temporary-directory grant with a scoped worker directory; allocate durable
   mount-plan scratch outside the derived hidden roots; and validate the
   resulting policy with representative real compiler builds before activation.
+  Planning, per-commit selection, and evidence are tracked in
+  [phase-4-input-selection.md](phase-4-input-selection.md).
 
 ### Tests and documentation structure
 
@@ -370,3 +372,10 @@ model, but not the policy-derived mount tree in
   Sphinx build reported no warning from the changed pages; its warning gate
   remains blocked by the same 14 unrelated autodoc, toctree, and reference
   warnings.
+- 2026-09-26: Moved the input-selection item into its own ledger,
+  `phase-4-input-selection.md`, with sub-phases, excluded Landlock-era
+  mechanisms, reusable earlier tests, and a one-commit-per-step sequence.
+  It records that the worker enters the namespace before staging, that
+  derived parent masks would hide `/usr/lib` and `/tmp`, and that stage and
+  prefix mount points conflict with `PrefixPivoter`. Selected policy-data
+  loading (A1) as the next commit.
