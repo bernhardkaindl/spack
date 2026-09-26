@@ -232,6 +232,15 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
   settings before threads or recipe-controlled setup. Add focused environment
   and writable-policy evidence.
 
+  D2 is split into separately committed steps in the Phase 4 ledger:
+
+  1. [x] D2.1: immutable worker-root payload, child environment initialization
+    after authority drop, and the pre-`Tee` ordering regression.
+  2. [ ] D2.2: containment, setup-failure/fallback isolation, parent-state
+    preservation, environment cleaning, and real-namespace write evidence.
+  3. [ ] D2.3: final backend documentation and ledger reconciliation; close D2
+    and select D3 private `/dev` construction.
+
 After D2, complete the private `/dev` view and run the whole writable inventory
 and stage/prefix failure semantics through a complete install-child lifecycle.
 
@@ -525,3 +534,11 @@ and stage/prefix failure semantics through a complete install-child lifecycle.
   read-only ancestors, resolves duplicate runtime/device paths to writable
   device access, and passes the configured fetch cache. Selected D2 scoped home and temporary
   environment setup next.
+- 2026-09-26: Completed D2.1 as the first of three separate D2 commits.
+  Activation carries and validates the scoped worker root, creates private
+  home/cache/temp directories after successful mounts and authority drop,
+  and publishes POSIX, Python, and quoted Java defaults before `Tee`.
+  The focused ordering regression covers spaces and inherited Java options;
+  all 141 affected namespace, shared sandbox, and installer tests pass.
+  D2 remains open pending D2.2 containment/isolation evidence and D2.3 final
+  documentation. No policy entries or configuration settings changed.

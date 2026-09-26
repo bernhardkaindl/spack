@@ -118,6 +118,7 @@ class NamespaceActivation(NamedTuple):
 
     policy: spack.sandbox_namespaces.NamespaceFilesystemPolicy
     mount_plan_stage: str
+    worker_root: str
 
 
 class NamespaceHostDeviceWorkerPaths(NamedTuple):
@@ -1694,7 +1695,7 @@ def prepare_namespace_activation(
     except BaseException:
         scratch.cleanup()
         raise
-    return NamespaceActivation(policy, scratch.path), scratch
+    return NamespaceActivation(policy, scratch.path, worker_root), scratch
 
 
 def validate_namespace_policy_before_threads(
@@ -1727,6 +1728,42 @@ def validate_namespace_policy_before_threads(
     )
 
 
+def _validate_namespace_worker_root(activation: NamespaceActivation) -> None:
+    """Require an existing canonical worker root covered by a writable identity mount."""
+    root = activation.worker_root
+    _canonical_required_paths((root,), "worker root")
+    if not os.path.isabs(root) or not os.path.isdir(root) or not any(
+        mount.source == mount.target and os.path.commonpath((mount.target, root)) == mount.target
+        for mount in activation.policy.read_write_mounts
+    ):
+        raise spack.error.InstallError("Namespace worker root requires a writable identity mount")
+
+
+def _configure_namespace_worker_environment(worker_root: str) -> None:
+    """Create private worker state and publish it only in the confined child."""
+    home = os.path.join(worker_root, "home")
+    cache = os.path.join(worker_root, "cache")
+    temporary = os.path.join(worker_root, "tmp")
+    for path in (home, cache, temporary):
+        os.mkdir(path, mode=0o700)
+    java_options = " ".join(
+        shlex.quote(option)
+        for option in (f"-Duser.home={home}", f"-Djava.io.tmpdir={temporary}")
+    )
+    inherited_java_options = os.environ.get("JAVA_TOOL_OPTIONS", "")
+    os.environ.update(
+        HOME=home,
+        XDG_CACHE_HOME=cache,
+        TMPDIR=temporary,
+        TMP=temporary,
+        TEMP=temporary,
+        JAVA_TOOL_OPTIONS=" ".join(
+            option for option in (inherited_java_options, java_options) if option
+        ),
+    )
+    tempfile.tempdir = temporary
+
+
 def _prepare_namespace_sandbox_before_threads(
     config: dict,
     spec: spack.spec.Spec,
@@ -1740,9 +1777,8 @@ def _prepare_namespace_sandbox_before_threads(
 ) -> Optional[spack.sandbox.Sandbox]:
     """Prepare the namespace view and drop mount authority before ``Tee``.
 
-    The worker is still single-threaded here. The returned sandbox is reused
-    after recipe-controlled setup so that later code only grants and applies
-    Landlock; it cannot create additional mounts.
+    The worker is still single-threaded here. Complete policy activation also
+    configures worker-local state; the returned sandbox cannot create later mounts.
     """
     if not config.get("enable", False):
         return None
@@ -1776,6 +1812,7 @@ def _prepare_namespace_sandbox_before_threads(
 
     if isinstance(sandbox, spack.sandbox_namespaces.NamespaceSandbox):
         if namespace_activation is not None:
+            _validate_namespace_worker_root(namespace_activation)
             prepared = sandbox.prepare_filesystem_policy(
                 namespace_activation.policy, namespace_activation.mount_plan_stage
             )
@@ -1789,6 +1826,8 @@ def _prepare_namespace_sandbox_before_threads(
                 )
         if prepared and not sandbox.drop_mount_authority():
             raise spack.error.InstallError("Cannot drop namespace mount authority")
+        if prepared and namespace_activation is not None:
+            _configure_namespace_worker_environment(namespace_activation.worker_root)
     return sandbox
 
 
