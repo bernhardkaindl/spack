@@ -236,7 +236,7 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
 
   1. [x] D2.1: immutable worker-root payload, child environment initialization
     after authority drop, and the pre-`Tee` ordering regression.
-  2. [ ] D2.2: containment, setup-failure/fallback isolation, parent-state
+  2. [x] D2.2: containment, setup-failure/fallback isolation, parent-state
     preservation, environment cleaning, and real-namespace write evidence.
   3. [ ] D2.3: final backend documentation and ledger reconciliation; close D2
     and select D3 private `/dev` construction.
@@ -542,3 +542,13 @@ and stage/prefix failure semantics through a complete install-child lifecycle.
   all 141 affected namespace, shared sandbox, and installer tests pass.
   D2 remains open pending D2.2 containment/isolation evidence and D2.3 final
   documentation. No policy entries or configuration settings changed.
+- 2026-09-26: Completed D2.2 with invalid-root and pre-existing-child rejection,
+  mount/authority failure ordering, disabled/fallback isolation, parent-state
+  preservation, environment cleaning, and disposable real-namespace tests.
+  The real JVM also verified scoped properties for paths containing spaces
+  and quotes. The live test exposed replacement sources disappearing under
+  masks; the planner now pins them in durable scratch before masking. Strict
+  worker-root spelling validation also rejects `..`. These repairs preserve
+  the authority-drop boundary and fail-closed behavior; the accepted same-UID
+  pre-bind race remains. All 161 affected tests and Ruff pass. D2.3 final
+  documentation is next, not full install-child lifecycle certification.

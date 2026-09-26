@@ -1731,7 +1731,9 @@ def validate_namespace_policy_before_threads(
 def _validate_namespace_worker_root(activation: NamespaceActivation) -> None:
     """Require an existing canonical worker root covered by a writable identity mount."""
     root = activation.worker_root
-    _canonical_required_paths((root,), "worker root")
+    canonical_root, = _canonical_required_paths((root,), "worker root")
+    if root != canonical_root:
+        raise spack.error.InstallError("Namespace worker root must be canonical and absolute")
     if not os.path.isabs(root) or not os.path.isdir(root) or not any(
         mount.source == mount.target and os.path.commonpath((mount.target, root)) == mount.target
         for mount in activation.policy.read_write_mounts
