@@ -500,22 +500,32 @@ mask source before it is made read-only. These entries are validated and
 compiled but remain dormant; scoped replacement-source allocation and policy
 activation are later work.
 
-The resulting policy must compile with caller-provided mount-plan scratch
-outside every hidden root, and hidden roots may not overlap the planner's
-reserved source subtrees. Representative synthetic-host tests cover explicit
-masks, replacement roots, generated aliases, and selected compiler, tool,
-header, runtime, dependency, repository, Spack-source, stage, prefix, device,
-and temporary paths, including an intentionally ancestor-covered header
-subtree. They also prove disappeared, symlinked, and uncovered selected paths
-fail closed.
+B2 adds a supervisor-owned ``NamespaceMountPlanScratch`` lease for the
+planner's durable endpoint tree. Allocation requires a canonical, real
+directory base, creates a unique mode-0700 directory outside every hidden,
+replacement, stage, prefix, and writable-policy root, and rejects allocation
+collisions. The supervisor may clean the lease after setup failure or after an
+attached worker is no longer alive; cleanup refuses live workers and refuses
+paths replaced by a symlink or another inode. This scratch is ordinary
+host-backed setup state, separate from the host-visible stage and prefix.
+
+The resulting policy must compile with allocated mount-plan scratch outside
+every hidden root, and hidden roots may not overlap the planner's reserved
+source subtrees. Representative synthetic-host tests cover explicit masks,
+replacement roots, generated aliases, and selected compiler, tool, header,
+runtime, dependency, repository, Spack-source, stage, prefix, device, and
+temporary paths, including an intentionally ancestor-covered header subtree.
+They also prove concurrent scratch allocation, symlinked bases, allocation
+collisions, disappeared sources, stale-path replacement, and uncovered
+selected paths fail closed.
 
 The worker does not activate the installer-derived policy yet. It continues to
 use only the narrow ``/usr/share/aclocal`` mask and transitional Landlock. The
 selected-tree compiler is not called by the worker because trusted setup does
 not yet materialize the complete hidden host and device policy, exact host
-compiler, tool, header, and runtime set, canonical aliases, a scoped
-replacement for the broad system temporary directory, or durable mount-plan
-scratch. Only paths below selected hidden roots are absent; unrelated host
+compiler, tool, header, and runtime set, canonical aliases, or a scoped
+replacement for the broad system temporary directory. Only paths below
+selected hidden roots are absent; unrelated host
 trees remain visible, so this helper is not yet a namespace-only replacement
 for Landlock. The complete policy derives from:
 

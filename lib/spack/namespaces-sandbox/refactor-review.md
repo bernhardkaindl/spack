@@ -163,10 +163,19 @@ model, but not the policy-derived mount tree in
   validates replacement sources at hidden roots, and mounts replacements before
   nested restorations. The live worker remains unchanged.
 
-- [ ] Allocate durable, supervisor-cleaned mount-plan scratch outside all
-  hidden and replacement roots. Reject symlinked bases, collisions, and stale
-  cleanup races before policy activation; preserve stage and prefix lifecycle
-  semantics independently of the scratch tree.
+- [x] Allocate durable, supervisor-cleaned mount-plan scratch outside all
+  hidden and replacement roots. The lease now requires a canonical
+  non-symlink base, creates unique mode-0700 endpoint directories outside the
+  policy and lifecycle roots, and rejects allocation collisions. Cleanup is
+  supervisor-only, refuses live attached workers and stale-path replacement,
+  and is independent of stage and prefix lifecycle semantics. Concurrent,
+  setup-failure, symlinked-base, collision, and abnormal-exit cases are
+  covered before policy activation.
+
+- [ ] Prove a recursively read-only namespace view with explicit writable
+  mounts. Verify the recursive mount attribute on inherited trees, reject
+  writes to user-writable passthrough paths with ``EROFS``, and keep each
+  selected writable mount writable in a disposable namespace.
 
 - [ ] Materialize the complete trusted input selection in pre-thread installer
   setup. Select the complete hidden host/device roots; resolve the concrete
