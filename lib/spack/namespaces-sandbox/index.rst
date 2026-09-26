@@ -70,7 +70,9 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
 The case-by-case findings, acceptance criteria, and worklog are tracked in
 ``lib/spack/namespaces-sandbox/refactor-review.md``. The Phase 4 input
 selection work item has its own ledger in
-``lib/spack/namespaces-sandbox/phase-4-input-selection.md``.
+``lib/spack/namespaces-sandbox/phase-4-input-selection.md``. Supporting threat
+analysis and rejected mount-plan variants are recorded in
+``lib/spack/namespaces-sandbox/namespace-mount-plan-alternatives.md``.
 
 Phase 1: capability probe and fallback
 --------------------------------------
