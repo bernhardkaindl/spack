@@ -1466,8 +1466,9 @@ def namespace_selected_filesystem_policy_from_inputs(
         ("runtime", selected_paths.runtime_paths),
         ("temporary", selected_paths.temporary_paths),
     )
+    optional_categories = {"compiler", "header"}
     for category, paths in required_categories:
-        if not paths:
+        if not paths and category not in optional_categories:
             raise spack.sandbox_namespaces.NamespaceSetupError(
                 errno.EINVAL,
                 "select namespace policy inputs",
