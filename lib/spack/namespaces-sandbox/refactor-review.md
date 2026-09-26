@@ -25,7 +25,8 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   namespace mount setup and drops mount authority. It applies Landlock before
   build phases. The supervisor remains unaffected.
 - [ ] Phase 4, policy-driven mount tree (immutable plan validation and
-  non-writable mask sources are complete; policy-derived mounts remain open).
+  non-writable mask sources and access enforcement are complete; immutable
+  policy construction and policy-derived mounts remain open).
 - [ ] Phase 5, complete build-phase policy validation and hardening.
 - [ ] Phase 6, concretizer-worker evaluation.
 
@@ -70,6 +71,11 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
 - [x] Use mask sources that remain non-writable after confinement. Mask sources
   are populated in a private tmpfs and remounted read-only before mask binds
   are exposed. Landlock write grants to the stage cannot populate the source.
+- [x] Require every preserved mount to declare read-only or read-write access.
+  Read-only file and directory aliases use
+  `mount_setattr(MOUNT_ATTR_RDONLY)`; directory attributes are recursive.
+  Invalid modes fail before namespace entry, and writable mounts remain
+  explicitly writable.
 
 ### Landlock composition and installer errors
 
@@ -115,6 +121,19 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   tmpfs remounted read-only after planned endpoints are created. The capability
   probe checks tmpfs creation and remounting, and a real-kernel regression
   grants stage write access before attempting source and target modifications.
+
+- [x] Enforce access modes for preserved allowlist mounts without Landlock.
+  Requests explicitly select read-only or read-write access. The capability
+  probe checks recursive read-only mount attributes, and real-kernel
+  regressions cover files, directory trees, both preserved aliases, and the
+  positive writable case.
+
+- [ ] Define and validate one immutable namespace filesystem policy before
+  mutation. It must classify hidden roots, read-only mounts, read-write mounts,
+  and namespace-local generated paths; reject duplicate, overlapping, and
+  access-conflicting entries; and be constructible from trusted installer spec
+  and configuration inputs. Keep the runtime on the current narrow mask until
+  the policy is complete enough to replace default Landlock safely.
 
 ### Tests and documentation structure
 
@@ -163,6 +182,9 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   without masking system directories.
 - Mask sources live on a read-only tmpfs, so writable stage grants cannot
   populate the empty view through either the source or target alias.
+- Preserved allowlist mounts carry explicit access modes. Read-only aliases are
+  recursively enforced by the kernel and return `EROFS` without Landlock;
+  explicitly writable aliases retain writes to their selected source.
 - The namespace filesystem policy is intended to be the default confinement;
   Landlock is retained in the current narrow integration only as a transitional
   constraint and should become opt-in for permission-denied behavior tests.
@@ -259,3 +281,10 @@ policy-driven mount tree in `lib/spack/docs/sandbox/namespace-backend.rst`.
   namespace backend still layers Landlock until policy-derived allowlist mounts
   are complete; selected that policy and the explicit Landlock diagnostic mode
   as the next work.
+- 2026-09-26: Added explicit read-only/read-write access to preserved mount
+  requests and enforced read-only file and recursive-directory aliases with
+  `mount_setattr`. Extended capability diagnostics for unsupported read-only
+  mount attributes. Disposable real-kernel tests prove `EROFS` through both
+  preserved aliases without Landlock and prove explicit writable mounts still
+  propagate writes. Selected immutable namespace filesystem-policy
+  construction and pre-mutation conflict validation as the next work item.

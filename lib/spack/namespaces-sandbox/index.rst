@@ -44,9 +44,11 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   narrow mask is represented by an immutable, validated, deterministic mount
   plan before namespace mutation. Its empty sources are private tmpfs mounts
   remounted read-only before exposure, so stage write grants cannot populate
-  them. Explicit preserved sources are staged before hiding parents, canonical
-  merged-``/usr`` aliases are restored in safe order, and policy-derived
-  compiler, tool, and header mounts remain future work.
+  them. Explicit preserved sources declare read-only or read-write access, are
+  staged before hiding parents, and are restored through canonical
+  merged-``/usr`` aliases in safe order. Read-only file and recursive directory
+  mounts are kernel-enforced without Landlock. Policy-derived compiler, tool,
+  header, runtime, and writable mounts remain future work.
 * **Phases 5 and 6 -- not started:** full build-phase policy validation and
   concretizer-worker evaluation remain future work.
 
@@ -70,10 +72,11 @@ same numeric values, denies setgroups, and makes the root mount private with
   descriptor and reaps the child even if reading the probe result fails.
 * The child always exits with ``os._exit``; unexpected setup exceptions cannot
   unwind into the parent's caller or duplicate the test runner.
-* The probe checks namespace creation, mappings, propagation containment, the
-  current directory bind mount, and capability dropping. Child and parent
-  failures retain operation-specific diagnostics. It does not yet test every
-  mount type needed by the Phase 4 policy tree.
+* The probe checks namespace creation, mappings, propagation containment,
+  tmpfs creation and read-only remounting, the current directory bind mount,
+  recursive read-only mount attributes, and capability dropping. Child and
+  parent failures retain operation-specific diagnostics. Every additional
+  mount operation introduced by the Phase 4 policy must extend the probe.
 * Completed default-libc probe results are cached. Installer construction
   performs the preflight before build workers start; forked workers inherit
   that result. If preflight failed operationally, the worker retries before
@@ -96,11 +99,11 @@ The worker does not retry after such a failure because namespace or mount state
 may already be partially changed; controlled worker failure is the recovery.
 
 ``hide_directories_as_empty(paths, stage_path, namespace_ready=False,
-libc=None)`` masks existing directories with empty stage-owned directories at
-``stage_path/spack-empty-host-dirs/<index>``. An empty path list is a no-op.
-The helper returns ``False`` if namespaces are unavailable; a mount failure
-raises ``OSError`` rather than accepting a partially prepared view. This is
-still the narrow bind-mount implementation, not the planned tmpfs policy tree.
+libc=None)`` masks existing directories with immutable empty directories from
+a private tmpfs at ``stage_path/spack-empty-host-dirs``. An empty path list is
+a no-op. The helper returns ``False`` if namespaces are unavailable; a mount
+failure raises ``OSError`` rather than accepting a partially prepared view.
+This remains the narrow mask, not the complete policy-derived tree.
 
 ``NamespaceSandbox.prepare_mount_tree`` explicitly enters the namespace before
 masking and marks it ready only after successful preparation, even when there
@@ -149,11 +152,11 @@ the test runner's ``/proc`` mappings. Probe lifecycle regressions exercise
 descriptor cleanup, retry and cache behavior, and isolate the
 unexpected-exception case in a separate interpreter.
 
-A Linux integration test creates an actual private namespace and masks a
-temporary host directory. It verifies an empty listing and ``ENOENT`` inside
-the child, then checks that the parent's file remains visible and unchanged.
-It skips when unprivileged namespaces are unavailable. No system directories
-are masked by the test.
+Linux integration tests create actual private namespaces and temporary mount
+trees. They verify empty-mask visibility and parent isolation, ``EROFS`` for
+read-only file and recursive-directory aliases without Landlock, and successful
+writes through an explicit read-write alias. They skip when unprivileged
+namespaces are unavailable. No system directories are masked by the tests.
 
 Run the focused checks with::
 
@@ -164,11 +167,13 @@ Run the focused checks with::
 Phase 4: policy-driven mount tree
 ---------------------------------
 
-Preserve selected mount sources before hiding parents; handle merged-/usr
-aliases, target creation, and mount ordering without exposing a backup host
-tree to untrusted code. Derive compiler, tool, interpreter, runtime, and header
-selections from the current spec APIs and a shared Landlock/mount policy, not a
-fixed tool list.
+Define one immutable namespace filesystem policy before namespace mutation. It
+must classify hidden roots, read-only mounts, read-write mounts, and generated
+namespace-local paths; reject duplicate, overlapping, and access-conflicting
+entries; and derive its inputs from trusted spec and configuration state. Only
+after that boundary is tested should the installer wire policy-derived
+compiler, tool, interpreter, runtime, header, stage, prefix, and temporary
+mounts into the plan.
 
 Phase 5: build-phase confinement
 --------------------------------
