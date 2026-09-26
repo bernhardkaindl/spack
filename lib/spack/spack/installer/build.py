@@ -201,8 +201,18 @@ def _load_sandbox_policy(path: str = SANDBOX_POLICY_PATH) -> dict:
     )
     for key in list_keys:
         _validate_string_list(policy_name, path, policy, key)
-    for key in ("hidden_roots", "replacement_roots"):
+    for key in ("hidden_roots", "replacement_roots", "tmpfs_paths"):
         _validate_absolute_path_list(policy_name, path, policy, key)
+
+    device_symlinks = policy.get("device_symlinks")
+    if not isinstance(device_symlinks, dict) or not all(
+        isinstance(link, str) and os.path.isabs(link)
+        and isinstance(target, str) and os.path.isabs(target)
+        for link, target in device_symlinks.items()
+    ):
+        raise _policy_error(
+            policy_name, path, "device_symlinks", "expected an absolute path-to-target mapping"
+        )
 
     aliases = policy.get("compiler_driver_aliases")
     languages = policy.get("compiler_languages")
@@ -1438,6 +1448,7 @@ def namespace_selected_filesystem_policy_from_inputs(
     selected_paths: NamespacePolicyInputPaths,
     replacement_mounts: Iterable[Tuple[str, str]] = (),
     generated_symlinks: Iterable[spack.sandbox_namespaces.NamespaceGeneratedSymlink] = (),
+    tmpfs_paths: Iterable[str] = (),
 ) -> spack.sandbox_namespaces.NamespaceFilesystemPolicy:
     """Build a trusted selected-tree policy without activating it.
 
@@ -1557,6 +1568,7 @@ def namespace_selected_filesystem_policy_from_inputs(
         replacement_mounts=replacement_mounts,
         generated_symlinks=generated_symlinks,
         read_only_view=True,
+        tmpfs_paths=tmpfs_paths,
     )
 
     def assert_covered(paths, mounts, access):
@@ -1585,6 +1597,7 @@ def namespace_filesystem_policy_and_plan_from_inputs(
     selected_paths: NamespacePolicyInputPaths,
     replacement_mounts: Iterable[Tuple[str, str]] = (),
     generated_symlinks: Iterable[spack.sandbox_namespaces.NamespaceGeneratedSymlink] = (),
+    tmpfs_paths: Iterable[str] = (),
 ) -> Tuple[
     spack.sandbox_namespaces.NamespaceFilesystemPolicy, spack.sandbox_namespaces.NamespaceMountPlan
 ]:
@@ -1596,6 +1609,7 @@ def namespace_filesystem_policy_and_plan_from_inputs(
         selected_paths,
         replacement_mounts,
         generated_symlinks,
+        tmpfs_paths,
     )
     plan = spack.sandbox_namespaces.build_namespace_mount_plan_from_policy(
         policy, mount_plan_stage
@@ -1655,7 +1669,12 @@ def prepare_namespace_activation(
         tuple(sorted(writable_paths)),
     )
     replacement_mounts = tuple((worker_root, root) for root in host_paths.replacement_roots)
-    generated_symlinks = tuple(compiler_alias_symlink_paths(spec))
+    device_policy = _load_sandbox_policy()
+    tmpfs_paths = tuple(device_policy["tmpfs_paths"])
+    generated_symlinks = tuple(compiler_alias_symlink_paths(spec)) + tuple(
+        spack.sandbox_namespaces.NamespaceGeneratedSymlink(link, target)
+        for link, target in device_policy["device_symlinks"].items()
+    )
     policy = namespace_selected_filesystem_policy_from_inputs(
         config,
         spec,
@@ -1663,6 +1682,7 @@ def prepare_namespace_activation(
         selected_paths,
         replacement_mounts,
         generated_symlinks,
+        tmpfs_paths,
     )
 
     scratch = None
@@ -1691,6 +1711,7 @@ def prepare_namespace_activation(
             selected_paths,
             replacement_mounts,
             generated_symlinks,
+            tmpfs_paths,
         )
     except BaseException:
         scratch.cleanup()
