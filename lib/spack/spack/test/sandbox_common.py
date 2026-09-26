@@ -287,6 +287,7 @@ def test_install_tool_paths_union_policy_program_groups(monkeypatch, tmp_path):
     from spack.installer import build
 
     groups = {
+        "binutils_programs": ["ar", "ld"],
         "coreutils_install_programs": ["chmod", "rm"],
         "coreutils_file_programs": ["cat", "ls"],
         "coreutils_util_programs": ["expr", "sort"],
