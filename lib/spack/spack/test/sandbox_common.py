@@ -7,11 +7,13 @@ import os
 import pathlib
 import sys
 import tempfile
-from typing import List, Tuple
+from typing import Any, List, Tuple, cast
 
 import pytest
 
 import spack.concretize
+import spack.paths
+import spack.repo
 import spack.sandbox
 import spack.sandbox_namespaces
 import spack.store
@@ -171,7 +173,7 @@ def test_default_hide_as_empty_dirs_skips_external_autoconf():
     def fake_spec(dependencies):
         spec = types.SimpleNamespace()
         spec.traverse = lambda root=True: iter(dependencies)
-        return spec
+        return cast(Any, spec)
 
     external = types.SimpleNamespace(name="autoconf", external=True)
     assert default_hide_as_empty_dirs(fake_spec([external])) == []
@@ -208,7 +210,9 @@ def test_namespace_filesystem_policy_from_installer_inputs(monkeypatch, tmp_path
         SimpleNamespace(name="dependency", external=False, prefix=dependency_prefix),
         SimpleNamespace(name="external", external=True, prefix=external_prefix),
     ]
-    spec = SimpleNamespace(prefix=install_prefix, traverse=lambda root=True: iter(dependencies))
+    spec = cast(
+        Any, SimpleNamespace(prefix=install_prefix, traverse=lambda root=True: iter(dependencies))
+    )
     monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(store_root))
     monkeypatch.setattr(spack.store.STORE, "upstreams", None)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temporary_path))
@@ -234,3 +238,191 @@ def test_namespace_filesystem_policy_from_installer_inputs(monkeypatch, tmp_path
         pathlib.Path(os.devnull).resolve(),
     }
     assert external_prefix.resolve() not in read_only_targets
+
+
+def test_complete_namespace_policy_from_installer_inputs(monkeypatch, tmp_path: pathlib.Path):
+    from types import SimpleNamespace
+
+    from spack.installer.build import (
+        NamespacePolicyInputPaths,
+        namespace_filesystem_policy_and_plan_from_inputs,
+    )
+
+    host = tmp_path / "host"
+
+    def directory(path):
+        path.mkdir(parents=True)
+        return path
+
+    def file(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return path
+
+    compiler = file(host / "usr" / "bin" / "cc")
+    tool = file(host / "usr" / "bin" / "make")
+    headers = directory(host / "usr" / "include")
+    compiler_headers = directory(headers / "compiler")
+    runtime = directory(host / "usr" / "lib")
+    repository_python_path = directory(host / "repos-python")
+    repository_composition_root = directory(repository_python_path / "spack_repo")
+    repository = directory(repository_composition_root / "builtin")
+    hidden_host_state = directory(host / "home")
+    dependency_prefix = directory(host / "store" / "dependency")
+    external_prefix = directory(host / "external")
+    install_prefix = directory(host / "store" / "install")
+    stage_path = directory(host / "build" / "stage")
+    temporary_path = directory(host / "build" / "tmp")
+    mount_plan_stage = directory(tmp_path / "mount-plan")
+    sbang = file(host / "store" / "bin" / "sbang")
+
+    spack_prefix = host / "spack"
+    spack_source_paths = (
+        directory(spack_prefix / "bin"),
+        directory(spack_prefix / "lib"),
+        directory(spack_prefix / "share" / "spack"),
+        directory(spack_prefix / "etc" / "spack"),
+    )
+    monkeypatch.setattr(spack.paths, "bin_path", str(spack_source_paths[0]))
+    monkeypatch.setattr(spack.paths, "lib_path", str(spack_source_paths[1]))
+    monkeypatch.setattr(spack.paths, "share_path", str(spack_source_paths[2]))
+    monkeypatch.setattr(spack.paths, "etc_path", str(spack_source_paths[3]))
+    monkeypatch.setattr(
+        spack.repo,
+        "PATH",
+        SimpleNamespace(
+            repos=[SimpleNamespace(root=str(repository), python_path=str(repository_python_path))]
+        ),
+    )
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(host / "store"))
+    monkeypatch.setattr(spack.store.STORE, "upstreams", None)
+
+    dependencies = (
+        SimpleNamespace(name="dependency", external=False, prefix=dependency_prefix),
+        SimpleNamespace(name="external", external=True, prefix=external_prefix),
+    )
+    spec = cast(
+        Any, SimpleNamespace(prefix=install_prefix, traverse=lambda root=True: iter(dependencies))
+    )
+    selected_paths = NamespacePolicyInputPaths(
+        hidden_roots=(str(hidden_host_state),),
+        compiler_paths=(str(compiler),),
+        tool_paths=(str(tool),),
+        header_paths=(str(headers), str(compiler_headers)),
+        runtime_paths=(str(runtime),),
+        temporary_paths=(str(temporary_path),),
+    )
+
+    policy, plan = namespace_filesystem_policy_and_plan_from_inputs(
+        {}, spec, str(stage_path), str(mount_plan_stage), selected_paths
+    )
+
+    read_only_targets = {pathlib.Path(mount.target) for mount in policy.read_only_mounts}
+    assert read_only_targets == {
+        compiler.resolve(),
+        tool.resolve(),
+        headers.resolve(),
+        runtime.resolve(),
+        repository.resolve(),
+        dependency_prefix.resolve(),
+        sbang.resolve(),
+        *(path.resolve() for path in spack_source_paths),
+    }
+    read_write_targets = {pathlib.Path(mount.target) for mount in policy.read_write_mounts}
+    assert read_write_targets == {
+        stage_path.resolve(),
+        install_prefix.resolve(),
+        temporary_path.resolve(),
+        pathlib.Path(os.devnull).resolve(),
+    }
+    assert external_prefix.resolve() not in read_only_targets
+    assert compiler_headers.resolve() not in read_only_targets
+    assert set(policy.hidden_roots) == {
+        str(pathlib.Path(os.devnull).resolve().parent),
+        str((host / "build").resolve()),
+        str(hidden_host_state.resolve()),
+        str(repository_composition_root.resolve()),
+        str(spack_prefix.resolve()),
+        str((host / "store").resolve()),
+        str((host / "usr").resolve()),
+    }
+    assert all(
+        pathlib.Path(root) != mount_plan_stage.resolve()
+        and pathlib.Path(root) not in mount_plan_stage.resolve().parents
+        for root in policy.hidden_roots
+    )
+    assert plan.stage_path == str(mount_plan_stage.resolve())
+    assert {mount.target for mount in plan.restoration_mounts} == {
+        str(path) for path in read_only_targets | read_write_targets
+    }
+
+
+def test_complete_namespace_policy_rejects_missing_selected_path(
+    monkeypatch, tmp_path: pathlib.Path
+):
+    from types import SimpleNamespace
+
+    from spack.installer.build import (
+        NamespacePolicyInputPaths,
+        namespace_filesystem_policy_and_plan_from_inputs,
+    )
+
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    missing = tmp_path / "missing-compiler"
+    spec = cast(Any, SimpleNamespace(prefix=existing, traverse=lambda root=True: iter(())))
+    selected_paths = NamespacePolicyInputPaths(
+        hidden_roots=(str(existing),),
+        compiler_paths=(str(missing),),
+        tool_paths=(str(existing),),
+        header_paths=(str(existing),),
+        runtime_paths=(str(existing),),
+        temporary_paths=(str(existing),),
+    )
+    monkeypatch.setattr(
+        spack.repo,
+        "PATH",
+        SimpleNamespace(repos=[SimpleNamespace(root=str(existing), python_path=None)]),
+    )
+    monkeypatch.setattr(spack.paths, "bin_path", str(existing))
+    monkeypatch.setattr(spack.paths, "lib_path", str(existing))
+    monkeypatch.setattr(spack.paths, "share_path", str(existing))
+    monkeypatch.setattr(spack.paths, "etc_path", str(existing))
+    sbang = tmp_path / "store" / "bin" / "sbang"
+    sbang.parent.mkdir(parents=True)
+    sbang.touch()
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(tmp_path / "store"))
+    monkeypatch.setattr(spack.store.STORE, "upstreams", None)
+
+    with pytest.raises(spack.sandbox_namespaces.NamespaceSetupError, match=str(missing)):
+        namespace_filesystem_policy_and_plan_from_inputs(
+            {}, spec, str(existing), str(tmp_path / "mount-plan"), selected_paths
+        )
+
+    compiler = tmp_path / "compiler"
+    compiler.touch()
+    compiler_link = tmp_path / "compiler-link"
+    compiler_link.symlink_to(compiler)
+    with pytest.raises(
+        spack.sandbox_namespaces.NamespaceSetupError, match="required path is not canonical"
+    ):
+        namespace_filesystem_policy_and_plan_from_inputs(
+            {},
+            spec,
+            str(existing),
+            str(tmp_path / "mount-plan"),
+            selected_paths._replace(compiler_paths=(str(compiler_link),)),
+        )
+
+    with pytest.raises(
+        spack.sandbox_namespaces.NamespaceSetupError, match="without hiding the filesystem root"
+    ):
+        namespace_filesystem_policy_and_plan_from_inputs(
+            {},
+            spec,
+            str(existing),
+            str(tmp_path / "mount-plan"),
+            selected_paths._replace(
+                compiler_paths=(str(compiler),), temporary_paths=(tempfile.gettempdir(),)
+            ),
+        )
