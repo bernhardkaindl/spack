@@ -631,3 +631,8 @@ checks.
   raw compiler path was being included as a required mount. Removed that input
   and added a symlinked-driver assembler regression. All 30 sandbox-common
   tests and Ruff pass. Retry the actual install next.
+- 2026-09-26: The m4 retry then failed on absent `/usr/include/a.out.h`. The
+  Linux header policy says missing candidates are ignored, but activation sent
+  them to required-path validation. Activation now filters missing header
+  candidates while preserving present paths, with production-assembler test
+  coverage. All 30 sandbox-common tests and Ruff pass; retry m4.
