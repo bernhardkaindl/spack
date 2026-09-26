@@ -1203,8 +1203,10 @@ def _probe_namespace_capability(libc) -> NamespaceCapability:
         probe_root = tempfile.mkdtemp(prefix="spack-namespace-probe-")
         bind_source = os.path.join(probe_root, "source")
         bind_target = os.path.join(probe_root, "target")
+        shared_memory = os.path.join(probe_root, "shm")
         os.mkdir(bind_source)
         os.mkdir(bind_target)
+        os.mkdir(shared_memory)
     except OSError as error:
         if probe_root is not None:
             shutil.rmtree(probe_root, ignore_errors=True)
@@ -1266,7 +1268,31 @@ def _probe_namespace_capability(libc) -> NamespaceCapability:
                 _set_mount_read_only(libc, "/", True)
                 _set_mount_read_only(libc, bind_target, True)
                 _set_mount_writable(libc, bind_target, False)
+                _mount_private_tmpfs(libc, shared_memory)
+                descriptor_link = os.path.join(shared_memory, "fd")
+                os.symlink("/proc/self/fd", descriptor_link)
+                device_target = os.path.join(shared_memory, "null")
+                Path(device_target).touch()
+                _check_syscall(
+                    libc.mount(
+                        os.fsencode(os.devnull), os.fsencode(device_target), None,
+                        ctypes.c_ulong(MS_BIND), None,
+                    ),
+                    "mount(MS_BIND device probe)",
+                )
+                _set_mount_writable(libc, device_target, False)
                 _drop_namespace_capabilities(libc)
+                with open(os.path.join(shared_memory, "probe"), "w+") as stream:
+                    stream.write("shared memory")
+                    stream.flush()
+                    with open(os.path.join(descriptor_link, str(stream.fileno()))) as alias:
+                        if alias.read() != "shared memory":
+                            raise OSError(errno.EIO, "descriptor link probe mismatch")
+                descriptor = os.open(device_target, os.O_WRONLY)
+                try:
+                    os.write(descriptor, b"device probe")
+                finally:
+                    os.close(descriptor)
             except NamespaceSetupError as error:
                 result = NamespaceCapability(False, error.operation, error.reason)
             except OSError as error:

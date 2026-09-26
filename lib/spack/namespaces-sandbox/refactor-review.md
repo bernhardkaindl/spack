@@ -579,3 +579,10 @@ checks.
   Literal `/proc/self` avoids publishing the supervisor's PID through worker
   descriptor links; inherited descriptor minimization remains deferred.
   Thirteen focused tests and Ruff pass. D3.2 activation/probing is next.
+- 2026-09-26: Completed D3.2: shipped policy and automatic activation now
+  select private shared memory and literal descriptor links while retaining
+  the device allowlist. The capability probe covers new mount operations and
+  post-drop link/device/shared-memory access. Actual application failures stop
+  before `Tee` and never fall back after mutation. All 198 affected tests and
+  Ruff pass with live namespace evidence enabled. D3.3 concurrent private
+  `/dev` verification is next. Sphinx builds are skipped by user request.
