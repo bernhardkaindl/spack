@@ -8,9 +8,18 @@ focused test evidence, and deferred items remain explicit.
 
 The staged increment improves the capability probe, mount-tree helpers,
 `NamespaceSandbox`, installer wiring, tests, and this project's status page. It
-implements the narrow Linux install-child integration and immutable policy
-model, but not the policy-derived mount tree in
-`lib/spack/docs/sandbox/namespace-backend.rst`.
+implements the Linux install-child integration and automatic activation of the
+immutable policy when namespaces are available. Landlock remains the
+capability fallback.
+
+## Project-wide compatibility directive
+
+Do not add namespace-sandbox options to `config.yaml` or its schema. Spack
+bootstrap configuration is consumed by older Spack versions during upgrades,
+and unknown sandbox keys would make those versions reject the file. Selection
+and validation therefore remain config-free and unconditional whenever
+trusted inputs are supplied. Namespace use is automatic after a successful
+capability probe; Landlock is fallback-only when namespaces are unavailable.
 
 ## Phase status
 
@@ -23,11 +32,13 @@ model, but not the policy-derived mount tree in
   handle, and explicit cleanup API remain open.
 - [x] Phase 3 increment, install-worker integration: before starting its
   logging thread, the existing forked Linux install child completes trusted
-  namespace mount setup and drops mount authority. It applies Landlock before
-  build phases. The supervisor remains unaffected.
+  namespace mount setup and drops mount authority. It activates the selected
+  filesystem policy when namespaces are available and uses Landlock only for
+  the capability fallback. The supervisor remains unaffected.
 - [ ] Phase 4, policy-driven mount tree (immutable plan and policy validation,
-  non-writable mask sources, and access enforcement are complete;
-  installer-policy activation and the complete derived tree remain open).
+  non-writable mask sources, access enforcement, and installer-policy
+  activation are complete; complete install-child lifecycle evidence remains
+  open).
 - [ ] Phase 5, complete build-phase policy validation and hardening.
 - [ ] Phase 6, concretizer-worker evaluation.
 
@@ -80,15 +91,10 @@ model, but not the policy-derived mount tree in
 
 ### Landlock composition and installer errors
 
-- [x] Keep Landlock grants and application layered on the namespace view.
-- [x] Normalize lazy `LandlockSandbox` initialization failures. Namespace
-  selection can succeed while the first `allow_read` or `allow_write` raises a
-  raw `OSError`; the composite backend now raises `SandboxError`, the installer
-  wraps grants and application, and backend selection preflights Landlock.
-- [ ] Implement the documented shared fallback policy. A warning in the current
-  hook is not the final `config:sandbox:allow_fallback` trust decision for
-  trusted direct execution when no constrained worker is available. It does not
-  gate namespace-to-Landlock fallback because Landlock remains constrained.
+- [x] Keep Landlock as the constrained backend fallback when namespace
+  capability probing fails. The active namespace policy does not construct,
+  grant, or apply Landlock, and no new fallback setting is added.
+- [x] Normalize Landlock initialization failures in the fallback backend.
 
 ### Next selected work
 
@@ -139,14 +145,14 @@ model, but not the policy-derived mount tree in
 - [x] Select the hidden roots and trusted compiler, tool, header, repository,
   and Spack-source grants needed to compile the installer-created policy into a
   complete mount tree. Prove representative policies compile without silently
-  dropping paths, provide scratch space outside all hidden roots, but do not
-  activate the broader tree until those inputs are complete. A dormant helper
-  now requires explicit hidden roots and canonical host selections, includes
-  concrete dependency prefixes, active repositories, required ``sbang`` paths,
-  and partitioned Spack source trees, derives parent masks, verifies ancestor
-  coverage after deduplication, and rejects overlap with caller-provided
-  external scratch. Synthetic-host and fail-closed input tests exercise the
-  boundary; the worker still uses the narrow mask.
+  dropping paths and provide scratch space outside all hidden roots. The
+  selector requires explicit hidden roots and canonical host selections,
+  includes concrete dependency prefixes, active repositories, required
+  ``sbang`` paths, and partitioned Spack source trees, derives parent masks,
+  verifies ancestor coverage after deduplication, and rejects overlap with
+  caller-provided external scratch. Synthetic-host and fail-closed input tests
+  exercise the boundary; trusted setup now supplies these inputs to automatic
+  activation.
 
 - [x] Resolve the selected compiler helpers and stage-tool closure without
   ambient compiler fallback. Absolute `-print-prog-name` and
@@ -154,14 +160,15 @@ model, but not the policy-derived mount tree in
   answers and Spack binutils wrappers are rejected, aliases remain available
   for later generated symlinks, and `cpp`, `file`, Git, script helper chains,
   and Spack-built tool dependency prefixes are covered by focused tests. The
-  selectors remain dormant and the worker still uses the narrow mask.
+  selected paths are compiled into the activation payload before launch.
 
 - [x] Add explicit passthrough and replacement policy entries plus generated
   alias symlinks. Use the A3 spelling/source records to replace derived parent
   masks without restoring broad `/usr`, `/tmp`, or `/var/tmp` trees. The
-  dormant policy now keeps alias paths lexical, canonicalizes their sources,
-  validates replacement sources at hidden roots, and mounts replacements before
-  nested restorations. The live worker remains unchanged.
+  policy now keeps alias paths lexical, canonicalizes their sources, validates
+  replacement sources at hidden roots, and mounts replacements before nested
+  restorations. The selected entries are activated automatically when the
+  namespace backend is available.
 
 - [x] Allocate durable, supervisor-cleaned mount-plan scratch outside all
   hidden and replacement roots. The lease now requires a canonical
@@ -184,41 +191,49 @@ model, but not the policy-derived mount tree in
   pivot, rollback, and failed-prefix cleanup to the supervisor without
   changing the path seen by build tools.
 
-- [x] C2, select host, device, and worker-state inputs. The dormant selector
-  combines policy and dynamic-linker runtime candidates, filters device
+- [x] C2, select host, device, and worker-state inputs. The selector combines
+  policy and dynamic-linker runtime candidates, filters device
   entries to character devices, restores repository, source, configuration,
   dependency, and cache paths, and requires canonical stage, prefix, log,
   jobserver, fetch-cache, and scoped-worker paths. Focused synthetic-host
   coverage proves optional candidates are skipped and explicit worker paths
-  fail closed. Select C3, pre-thread policy validation.
+  fail closed. These inputs now feed the immutable activation payload.
 
-- [x] C3, validate the selected policy before worker threads and preserve the
-  current narrow live-worker behavior. The config-free validation helper
+- [x] C3, validate the selected policy before worker threads. The config-free
+  validation helper
   always compiles the immutable selected policy before capability freeze,
   sandbox acquisition, or namespace mutation; invalid inputs abort the worker
   path. The pre-thread hook applies it whenever selected paths and mount-plan
-  scratch are supplied, while the dormant live worker still supplies neither.
-  Focused ordering, namespace, and installer policy tests pass.
+  scratch are supplied. Focused ordering, namespace, and installer policy tests
+  pass.
 
 - [x] C4, obtain disposable real compiler and source-build evidence for the
-  compiled policy before selecting activation. The disposable namespace test
+  compiled policy before activation. The disposable namespace test
   applies the compiled read-only policy with an explicit writable source,
   expands a tar archive, runs Git, configure, Make, GCC C/C++, Clang C/C++,
   and GNU Fortran, and verifies parent-visible outputs. Host details and
   optional-tool handling are recorded in the Phase 4 worklog.
 
-- [ ] Activate the complete selected tree in the worker and make Landlock
-  opt-in, preserving the existing fallback and dormant-worker behavior until
-  activation succeeds.
+- [x] Activate the complete selected tree automatically in the worker when
+  namespaces are available. Trusted parent setup selects and compiles the
+  immutable policy, leases supervisor-cleaned scratch, and the child applies
+  it before Tee/thread creation. Landlock remains fallback-only and no
+  config.yaml option is introduced.
 
-- [ ] Materialize the complete trusted input selection in pre-thread installer
+- [ ] Exercise the activated policy through a complete install-child lifecycle,
+  including home/device hiding, the whole writable inventory, and failure-path
+  stage/prefix evidence.
+
+- [x] Materialize the complete trusted input selection in trusted installer
   setup. Select the complete hidden host/device roots; resolve the concrete
   build's external compiler executables and canonical aliases, support tools,
   exact header and runtime trees, and Python runtime; replace the broad system
   temporary-directory grant with a scoped worker directory; allocate durable
   mount-plan scratch outside the derived hidden roots; and validate the
   resulting policy with representative real compiler builds before activation.
-  Planning, per-commit selection, and evidence are tracked in
+  This was delivered by the activation increment; the remaining gap is
+  complete install-child lifecycle evidence. Planning, per-commit selection,
+  and evidence are tracked in
   [phase-4-input-selection.md](phase-4-input-selection.md).
 
 ### Tests and documentation structure
@@ -305,9 +320,9 @@ model, but not the policy-derived mount tree in
   hidden filesystem root. Explicit and derived parent masks compile
   deterministically without changing the live worker. Unrelated host trees
   remain visible until the complete hidden-root/device policy is selected.
-- The namespace filesystem policy is intended to be the default confinement;
-  Landlock is retained in the current narrow integration only as a transitional
-  constraint and should become opt-in for permission-denied behavior tests.
+- The namespace filesystem policy is the default confinement when the
+  capability probe succeeds; Landlock is retained only as the constrained
+  fallback when namespaces are unavailable.
 - The status page is candid about the narrow `/usr/share/aclocal` policy and the
   optional inherited-state and pre-import hardening that Phase 3 does not claim.
 
@@ -479,3 +494,11 @@ model, but not the policy-derived mount tree in
   now run in the supervisor around the unchanged exact prefix path. Focused
   lifecycle, orchestration, and install integration tests passed. Selected
   complete host, device, and worker-state input selection as C2.
+- 2026-09-26: Activated the complete selected namespace policy automatically
+  from trusted installer setup. The parent selects compiler, tool, header,
+  runtime, device, repository, stage, prefix, cache, log, and jobserver inputs,
+  leases supervisor-cleaned mount-plan scratch, and the child applies the
+  immutable policy before ``Tee`` and worker threads. Active namespace policy
+  setup skips Landlock; the Landlock-only backend remains the capability
+  fallback. No ``config.yaml`` option was added. Selected complete
+  install-child lifecycle evidence as the next hardening item.

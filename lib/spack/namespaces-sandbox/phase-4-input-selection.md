@@ -9,13 +9,20 @@ tick it, add a worklog entry, and move the next item from "Proposed sequence".
 
 ## Review boundary
 
-The series selects, validates, and proves the inputs of the namespace
-filesystem policy. It does not activate the derived tree in the install
-worker, change the live `/usr/share/aclocal` mask, or remove the transitional
-Landlock layer. Activation, Landlock becoming an opt-in diagnostic mode, and
-network policy are later work items. Build stages and install prefixes must
-remain host-backed and visible from the supervisor's mount namespace; no
+The series selects, validates, and activates the namespace filesystem policy
+in the install worker. Build stages and install prefixes must remain
+host-backed and visible from the supervisor's mount namespace; no
 namespace-private copy or tmpfs may replace their persistent contents.
+
+## Compatibility directive
+
+Do not add namespace-sandbox settings to `config.yaml` or its schema in this
+project. Bootstrap configuration is shared across Spack versions, so a newer
+key would make an older Spack reject an otherwise usable bootstrap config.
+Policy selection and validation are therefore unconditional whenever trusted
+inputs are supplied. The namespace backend is selected automatically when its
+capability probe succeeds; Landlock remains the constrained fallback when the
+namespace capability is unavailable, with no new opt-in or fallback setting.
 
 The design target is namespace-native confinement. Mechanisms that only
 compensated for Landlock's inability to hide paths are not ported (see
@@ -23,11 +30,10 @@ compensated for Landlock's inability to hide paths are not ported (see
 
 ## Sub-phase status
 
-- [ ] Phase A, policy data and compiler facts (dormant selection helpers).
-- [ ] Phase B, namespace model extensions required by real inputs (dormant,
-  real-kernel tests).
-- [ ] Phase C, whole-child selection, pre-thread validation, and real-build
-  evidence.
+- [x] Phase A, policy data and compiler facts.
+- [x] Phase B, namespace model extensions required by real inputs.
+- [x] Phase C, whole-child selection, pre-thread validation, real-build
+  evidence, and automatic activation.
 
 ## Evidence
 
@@ -114,7 +120,8 @@ compensated for Landlock's inability to hide paths are not ported (see
   recursively on the inherited mount tree, then clear it only on explicit
   read-write bind mounts. The capability probe and disposable namespace tests
   prove recursive setup, `EROFS` for inherited passthrough writes, and writes
-  through selected writable mounts. The live worker remains unchanged.
+  through selected writable mounts. The live worker activates the selected
+  policy when namespace capability probing succeeds.
 - [ ] Hide `/home`, `/root`, and `/run/user`; restore the Spack source, store,
   repository, configuration, and cache paths located there. Point `HOME`,
   `XDG_CACHE_HOME`, and Java `user.home`/`java.io.tmpdir` at the scoped
@@ -346,8 +353,8 @@ once. Port behavior, not implementation details.
 
 ## Proposed sequence
 
-Each item is one commit with focused tests and documentation, and each keeps
-the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
+Each item is one commit with focused tests and documentation. Suggested PR
+grouping: A1-A3, B1-B3, and C1-C4.
 
 - [x] C2, `sandbox: select host, device, and worker-state inputs`.
 - [x] C3, `sandbox: validate selected policies before worker threads`.
@@ -356,9 +363,13 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   Git, configure, Make, GCC C/C++, Clang C/C++, and GNU Fortran, and left all
   build outputs visible in the parent source directory. Host evidence is
   recorded below.
-- [ ] Select activation: apply the complete selected tree in the worker and
-  make Landlock opt-in, after reviewing the C4 evidence and preserving the
-  live-worker fallback behavior.
+- [x] Select activation: apply the complete selected tree automatically in
+  the worker when namespaces are available. Keep Landlock as the existing
+  capability fallback only; do not add a config.yaml opt-in or diagnostic
+  switch.
+- [ ] Exercise activated policy through a complete install-child lifecycle,
+  including the remaining home, device, writable-inventory, and failure-path
+  evidence gaps.
 
 ## Accepted improvements
 
@@ -494,3 +505,12 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   build all passed; compiled outputs were visible from the parent. The live
   worker remains unchanged. Selected activation as the next commit; no
   config.yaml option is added.
+- 2026-09-26: Activated the selected namespace policy automatically from
+  trusted installer setup. The parent now selects compiler, tool, header,
+  runtime, device, repository, stage, prefix, cache, log, and jobserver inputs,
+  allocates supervisor-cleaned mount-plan scratch, and passes only the
+  immutable policy to the child. Namespace activation does not construct or
+  apply Landlock; the existing Landlock backend remains the capability-only
+  fallback. Added a project-wide directive against new config.yaml options
+  because older Spack versions reject unknown bootstrap keys. Selected full
+  install-child lifecycle evidence as the next work item.

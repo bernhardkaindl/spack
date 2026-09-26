@@ -6,10 +6,9 @@
 Linux user and mount namespace sandbox backend.
 
 Provides a capability probe for unprivileged namespaces, helpers to hide host
-directories with read-only empty tmpfs sources, and a transitional sandbox
-backend that combines the namespace with Landlock. The completed namespace
-policy will use hidden trees and bind-mounted allowlists by default; Landlock
-inside that namespace will be optional.
+directories with read-only empty tmpfs sources, and a namespace-native sandbox
+backend. The completed namespace policy uses hidden trees and bind-mounted
+allowlists by default; Landlock is used only by the separate fallback backend.
 """
 
 import ctypes
@@ -1356,16 +1355,16 @@ def hide_directories_as_empty(
 
 
 class NamespaceSandbox(Sandbox):
-    """Sandbox backend that combines Linux user/mount namespaces with Landlock.
+    """Sandbox backend that applies Linux user/mount namespace filesystem policy.
 
     On Linux, when unprivileged user and mount namespaces are available, this
     backend is preferred over the Landlock-only backend because it can hide host
     filesystem content via empty mounts and bind mounts, rather than only
     denying access through Landlock rules.
 
-    The class delegates ``allow_read`` / ``allow_write`` to an internal
-    ``LandlockSandbox`` so that Landlock's deny rules operate on the
-    namespace-restricted mount tree.
+    The legacy narrow mount path may still delegate ``allow_read`` /
+    ``allow_write`` to an internal ``LandlockSandbox``. A complete selected
+    filesystem policy does not construct or apply Landlock.
     """
 
     def __init__(
@@ -1377,6 +1376,7 @@ class NamespaceSandbox(Sandbox):
         self._stage_path: Optional[str] = None
         self._granted_dirs: List[Path] = []
         self._mount_authority_dropped = False
+        self._filesystem_policy_active = False
         # Create the internal Landlock sandbox lazily unless selection already
         # preflighted and supplied it.
         self._landlock = landlock
@@ -1390,6 +1390,11 @@ class NamespaceSandbox(Sandbox):
     def namespace_ready(self) -> bool:
         """Return whether the private namespace and mount tree are active."""
         return self._namespace_ready
+
+    @property
+    def filesystem_policy_active(self) -> bool:
+        """Return whether the complete selected filesystem policy is active."""
+        return self._filesystem_policy_active
 
     def _ensure_landlock(self) -> "LandlockSandbox":
         """Create the internal LandlockSandbox on first use."""
@@ -1439,6 +1444,7 @@ class NamespaceSandbox(Sandbox):
             return False
         libc = self.libc or ctypes.CDLL(None, use_errno=True)
         self._namespace_ready = _apply_namespace_mount_plan(plan, libc)
+        self._filesystem_policy_active = self._namespace_ready
         return self._namespace_ready
 
     def drop_mount_authority(self) -> bool:
@@ -1496,11 +1502,13 @@ class NamespaceSandbox(Sandbox):
         self._ensure_landlock()._allow_write(original, resolved)  # type: ignore[attr-defined]
 
     def apply(self, block_network: bool = False) -> None:
-        """Apply Landlock on top of the namespace-restricted mount tree.
+        """Apply legacy Landlock rules when no complete policy is active.
 
         If no rules were granted, an empty deny-by-default Landlock ruleset is
         still applied so the namespace is not left unconstrained.
         """
+        if self._filesystem_policy_active:
+            return
         self._ensure_landlock().apply(block_network=block_network)
 
     def cleanup(self) -> None:

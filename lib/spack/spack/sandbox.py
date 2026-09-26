@@ -475,7 +475,7 @@ def get_sandbox() -> Sandbox:
             if decision.backend is NamespaceSandboxBackend.NAMESPACE:
                 from spack.sandbox_namespaces import NamespaceSandbox
 
-                return NamespaceSandbox(landlock=LandlockSandbox())
+                return NamespaceSandbox()
             if decision.backend is NamespaceSandboxBackend.LANDLOCK:
                 spack.util.tty.debug(
                     "Namespace sandbox unavailable during {0}: {1}; using Landlock-only "
