@@ -744,3 +744,6 @@ not close that lifecycle gap.
   `eval: expr: not found` errors and remained active. Stopped the runaway retry
   with the host stage and log intact. Added canonical host `expr` to the
   stage-tool policy and asserted it in the policy-data test; retry m4.
+- 2026-09-26: Selecting `expr` let configure progress further; it then reported
+  `rm: not found` and `ls: not found`. Added both observed utilities to the
+  shipped stage-tool policy and asserted them in the policy-data test. Retry m4.
