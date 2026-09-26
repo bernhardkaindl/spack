@@ -267,7 +267,25 @@ def get_sandbox() -> Sandbox:
     if platform.system() != "Linux":
         raise SandboxError("Build sandboxing is only supported on Linux")
     try:
-        return LandlockSandbox()
+        from spack.sandbox_namespaces import NamespaceSandboxBackend, namespace_sandbox_decision
+
+        decision = namespace_sandbox_decision()
+        if decision.backend is NamespaceSandboxBackend.NAMESPACE:
+            from spack.sandbox_namespaces import NamespaceSandbox
+
+            return NamespaceSandbox()
+        if decision.backend is NamespaceSandboxBackend.LANDLOCK:
+            import spack.util.tty
+
+            spack.util.tty.debug(
+                "Namespace sandbox unavailable during {0}: {1}; using Landlock-only "
+                "sandbox".format(decision.capability.operation, decision.capability.reason)
+            )
+            return LandlockSandbox()
+        raise SandboxError(
+            "Namespace sandbox unavailable during {0}: {1}; unconstrained fallback is "
+            "not permitted".format(decision.capability.operation, decision.capability.reason)
+        )
     except OSError as e:
         raise SandboxError(f"Landlock sandboxing is unavailable: {e}") from e
 
