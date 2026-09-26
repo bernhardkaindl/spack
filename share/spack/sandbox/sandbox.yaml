@@ -38,6 +38,7 @@ device_symlinks:
 stage_programs:
 - 7z
 - bunzip2
+- chmod
 - git
 - gunzip
 - gzip

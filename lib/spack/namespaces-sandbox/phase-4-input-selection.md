@@ -737,3 +737,6 @@ not close that lifecycle gap.
   failed because `sed` was absent from the hidden `/usr/bin`. The shipped
   stage-tool policy now selects `sed` through the existing canonical tool
   resolver; the YAML policy test asserts its presence. Retry the real install.
+- 2026-09-26: Selecting `sed` advanced gmake's configure phase to a missing
+  `chmod` command. Added `chmod` to the shipped stage-tool policy and asserted
+  it in the policy-data test; retry the real install.

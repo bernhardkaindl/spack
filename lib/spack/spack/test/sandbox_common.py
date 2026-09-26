@@ -61,6 +61,7 @@ def test_namespace_policy_data_is_loaded_from_yaml():
     assert policy["tmpfs_paths"] == ["/dev/shm"]
     assert policy["device_symlinks"]["/dev/fd"] == "/proc/self/fd"
     assert "tar" in policy["stage_programs"]
+    assert "chmod" in policy["stage_programs"]
     assert "sed" in policy["stage_programs"]
     assert header_policy["version"] == 1
     assert header_policy["system_include_root"] == "/usr/include"
