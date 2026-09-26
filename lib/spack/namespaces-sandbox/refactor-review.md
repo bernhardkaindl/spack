@@ -179,7 +179,7 @@ model, but not the policy-derived mount tree in
   real namespace test cover recursive setup, ``EROFS`` passthrough denial, and
   writable restoration without changing the live worker.
 
-- [ ] Preserve host-visible stage and prefix lifecycles. Use a stable
+- [x] Preserve host-visible stage and prefix lifecycles. Use a stable
   host-backed per-build stage parent for child-owned cleanup, and move prefix
   pivot, rollback, and failed-prefix cleanup to the supervisor without
   changing the path seen by build tools.
@@ -445,3 +445,10 @@ model, but not the policy-derived mount tree in
   `realpath` canonicalization, nested restorations follow replacements, and
   the live worker remains on the narrow mask. Selected durable mount-plan
   scratch and collision cleanup as B2.
+- 2026-09-26: Completed C1 in the Phase 4 ledger. The supervisor allocates a
+  unique host-backed stage parent, places the removable stage below it, and
+  removes successful stage trees only after the child is reaped. Prefix pivot,
+  rollback, failed-prefix cleanup, keep-prefix, and BinaryCacheMiss handling
+  now run in the supervisor around the unchanged exact prefix path. Focused
+  lifecycle, orchestration, and install integration tests passed. Selected
+  complete host, device, and worker-state input selection as C2.
