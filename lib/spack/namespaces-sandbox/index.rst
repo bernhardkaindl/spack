@@ -40,7 +40,7 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   logging thread, the current build worker performs trusted namespace mount
   setup and drops mount authority. The installer applies Landlock before build
   phases. The broader mount policy is Phase 4.
-* **Phase 4 -- policy model complete, derived tree open:** the current narrow
+* **Phase 4 -- selected-tree compiler complete, whole-host policy open:** the current narrow
   mask is represented by an immutable, validated, deterministic mount plan
   before namespace mutation. Its empty sources are private tmpfs mounts
   remounted read-only before exposure, so stage write grants cannot populate
@@ -53,9 +53,17 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   entries; and can be built from current trusted installer grants. Compilation
   rejects classified paths outside its hidden roots and a scratch directory
   below a hidden root. Preserved sources are rechecked and never recreated if
-  they disappear. The installer-derived policy is not activated:
-  policy-derived compiler, tool, header, runtime, and writable trees remain
-  future work.
+  they disappear. A separate dormant compiler now requires explicit trusted
+  hidden roots plus canonical compiler, tool, header, runtime, and scoped
+  temporary paths; adds concrete dependency prefixes, active repository roots,
+  required ``sbang`` paths, and partitioned Spack source trees; derives
+  non-overlapping parent masks; proves every requested path is mounted or
+  covered by a mounted ancestor; and rejects hidden-root overlap with reserved
+  scratch. Representative synthetic-host policies compile and missing,
+  symlinked, or top-level selected paths fail closed. The live worker does not
+  call this helper. Unrelated host trees remain visible unless explicitly
+  hidden, so the complete host/device policy and production input discovery are
+  still open.
 * **Phases 5 and 6 -- not started:** full build-phase policy validation and
   concretizer-worker evaluation remain future work.
 
@@ -174,13 +182,20 @@ Run the focused checks with::
 Phase 4: policy-driven mount tree
 ---------------------------------
 
-Define one immutable namespace filesystem policy before namespace mutation. It
-must classify hidden roots, read-only mounts, read-write mounts, and generated
-namespace-local paths; reject duplicate, overlapping, and access-conflicting
-entries; and derive its inputs from trusted spec and configuration state. Only
-after that boundary is tested should the installer wire policy-derived
-compiler, tool, interpreter, runtime, header, stage, prefix, and temporary
-mounts into the plan.
+The immutable policy and selected-tree compiler now classify hidden roots,
+read-only mounts, read-write mounts, and generated namespace-local paths before
+namespace mutation. The compiler rejects missing or top-level required paths,
+derives parent masks, verifies intentional ancestor coverage after
+deduplication, and produces a deterministic mount plan only when its scratch
+and reserved source subtrees do not overlap hidden roots. Selected paths must
+already be canonical; preserving symlink aliases remains open.
+
+The remaining Phase 4 work is to select every host and device root that must be
+hidden, materialize the exact trusted compiler, tool, interpreter, runtime, and
+header paths and aliases used by a concrete build, replace the broad system
+temporary-directory grant with scoped worker scratch, exercise the resulting
+tree against representative real builds, and only then activate it in the
+installer.
 
 Phase 5: build-phase confinement
 --------------------------------
