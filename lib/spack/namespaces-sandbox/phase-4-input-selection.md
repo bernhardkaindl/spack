@@ -365,7 +365,7 @@ once. Port behavior, not implementation details.
 1. [x] D3.1: represent fresh writable tmpfs mounts in immutable policy/plan
   data, validate conflicts before mutation, retain literal generated symlink
   targets such as `/proc/self/fd`, and apply tmpfs after read-only setup.
-2. [ ] D3.2: select private shared memory and descriptor links from versioned
+2. [x] D3.2: select private shared memory and descriptor links from versioned
   policy data; extend capability probing and test fatal activation failures
   before authority drop and `Tee`. Preserve the device allowlist and fallback.
 3. [ ] D3.3: prove real device/link/shared-memory behavior, host and concurrent
@@ -623,3 +623,14 @@ lifecycle. D2's disposable activation test does not close that lifecycle gap.
   pre-thread creation retains child-relative resolution; inherited descriptor
   minimization remains out of scope. Thirteen focused model/alias tests and
   Ruff pass. Production selection and capability probing are D3.2.
+- 2026-09-26: Completed D3.2. Versioned policy now selects `/dev/shm` and
+  literal fd/stdin/stdout/stderr links without changing the device allowlist.
+  Trusted production assembly passes them through immutable policy validation.
+  The disposable probe checks writable tmpfs, descriptor-link access, and a
+  device-file bind after recursive read-only setup and capability drop. Device
+  probing uses `O_WRONLY`, avoiding unnecessary create/truncate flags on its
+  synthetic shared-memory alias. Actual link/tmpfs setup failures remain fatal
+  before `Tee`, environment publication, or fallback. All 198 affected tests
+  pass, including live namespace checks, and Ruff passes. D3.3 real `/dev`
+  behavior and concurrent isolation are next. Skip Sphinx builds for this work
+  per the user's directive; retain documentation and whitespace checks.
