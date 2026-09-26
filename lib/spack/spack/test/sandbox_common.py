@@ -158,6 +158,125 @@ def test_selected_compilers_includes_supported_compiler_nodes(monkeypatch):
     ]
 
 
+def test_compiler_support_paths_ignores_bare_names_and_spack_binutils(monkeypatch):
+    from spack.installer import build
+
+    policy = {
+        "compiler_programs": ["cc1", "cc1plus"],
+        "binutils_programs": ["as", "ld"],
+        "compiler_files": ["liblto_plugin.so"],
+    }
+    responses = {
+        "-print-prog-name=cc1": "/usr/libexec/cc1\n",
+        "-print-prog-name=cc1plus": "cc1plus\n",
+        "-print-prog-name=as": "/opt/libexec/spack/as\n",
+        "-print-prog-name=ld": "/usr/bin/ld\n",
+        "-print-file-name=liblto_plugin.so": "/usr/lib/liblto_plugin.so\n",
+    }
+    queries = []
+
+    def run(command, **kwargs):
+        queries.append(command[1])
+        return SimpleNamespace(returncode=0, stdout=responses[command[1]])
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+
+    paths = build.compiler_support_paths("/usr/bin/cc", policy)
+
+    assert queries == list(responses)
+    assert paths == [
+        build.ResolvedSandboxPath("cc1", "/usr/libexec/cc1"),
+        build.ResolvedSandboxPath("ld", str(pathlib.Path("/usr/bin/ld").resolve())),
+        build.ResolvedSandboxPath("liblto_plugin.so", "/usr/lib/liblto_plugin.so"),
+    ]
+
+
+def test_compiler_driver_paths_preserve_alias_spellings(tmp_path: pathlib.Path, monkeypatch):
+    from spack.installer import build
+
+    compiler = tmp_path / "bin" / "clang"
+    compiler.parent.mkdir()
+    compiler.touch()
+    compiler_spec = _compiler_spec("llvm", {"c": str(compiler)})
+    edge = SimpleNamespace(spec=compiler_spec, virtuals=("c",))
+    root = SimpleNamespace(name="root", edges_to_dependencies=lambda: [edge])
+    spec = SimpleNamespace(traverse=lambda: [root])
+    policy = {"compiler_languages": ["c"], "compiler_driver_aliases": {"c": ["cc", "gcc"]}}
+    monkeypatch.setattr(spack.compilers.config, "supported_compilers", lambda *, repo: [])
+
+    assert build.compiler_driver_paths(spec, policy) == [
+        build.ResolvedSandboxPath(str(compiler), str(compiler)),
+        build.ResolvedSandboxPath(str(compiler.parent / "cc"), str(compiler)),
+        build.ResolvedSandboxPath(str(compiler.parent / "gcc"), str(compiler)),
+    ]
+
+
+def test_executable_support_paths_select_file_magic_and_cpp_cc1(
+    tmp_path: pathlib.Path, monkeypatch
+):
+    from spack.installer import build
+
+    magic = tmp_path / "magic.mgc"
+    magic.touch()
+    policy = {"file_runtime_read_paths": [str(magic)]}
+    monkeypatch.setattr(
+        build.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/lib/cc1\n"),
+    )
+
+    assert build.executable_support_paths("/usr/bin/file", policy) == [
+        build.ResolvedSandboxPath(str(magic), str(magic))
+    ]
+    assert build.executable_support_paths("/usr/bin/cpp", policy) == [
+        build.ResolvedSandboxPath("cc1", "/usr/lib/cc1")
+    ]
+
+
+def test_stage_tool_paths_include_helper_chain_and_git_exec_path(monkeypatch):
+    from spack.installer import build
+
+    policy = {"stage_programs": ["gunzip", "git"]}
+    tools = {
+        "gunzip": "/tools/gunzip",
+        "gzip": "/tools/gzip",
+        "sh": "/tools/sh",
+        "git": "/tools/git",
+    }
+    monkeypatch.setattr(build, "which_string", tools.get)
+    monkeypatch.setattr(
+        build.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="/tools/git-core\n"),
+    )
+
+    assert build.stage_tool_paths(policy) == [
+        build.ResolvedSandboxPath("gunzip", "/tools/gunzip"),
+        build.ResolvedSandboxPath("git", "/tools/git"),
+        build.ResolvedSandboxPath("/tools/git --exec-path", "/tools/git-core"),
+        build.ResolvedSandboxPath("gzip", "/tools/gzip"),
+        build.ResolvedSandboxPath("sh", "/tools/sh"),
+    ]
+
+
+def test_tool_runtime_paths_include_owner_and_link_run_dependencies(tmp_path: pathlib.Path):
+    from spack.installer import build
+
+    tool_prefix = tmp_path / "tar"
+    tool = tool_prefix / "bin" / "tar"
+    tool.parent.mkdir(parents=True)
+    tool.touch()
+    dependency = SimpleNamespace(prefix=tmp_path / "libiconv")
+    owner = SimpleNamespace(prefix=tool_prefix, traverse=lambda **kwargs: [dependency])
+    unrelated = SimpleNamespace(prefix=tmp_path / "unrelated")
+    spec = SimpleNamespace(traverse=lambda: [owner, unrelated])
+
+    assert build.tool_runtime_paths(spec, [build.ResolvedSandboxPath("tar", str(tool))]) == [
+        str(tool_prefix),
+        str(dependency.prefix),
+    ]
+
+
 def _system_gcc_layout(tmp_path: pathlib.Path):
     install_root = tmp_path / "lib" / "gcc"
     target = install_root / "test-linux-gnu"

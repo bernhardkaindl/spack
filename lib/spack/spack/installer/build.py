@@ -59,7 +59,7 @@ from spack.installer.base import (
     ProcessExitNotifier,
 )
 from spack.subprocess_context import GlobalStateMarshaler
-from spack.util.executable import ProcessError
+from spack.util.executable import ProcessError, which_string
 
 if sys.platform == "win32":
     from spack.installer.windows import WindowsSentinelBridge as ExitNotifier
@@ -108,6 +108,13 @@ class NamespacePolicyInputPaths(NamedTuple):
     header_paths: Tuple[str, ...]
     runtime_paths: Tuple[str, ...]
     temporary_paths: Tuple[str, ...]
+
+
+class ResolvedSandboxPath(NamedTuple):
+    """Preserve the requested spelling separately from its canonical source path."""
+
+    spelling: str
+    source: str
 
 
 SANDBOX_POLICY_PATH = os.path.join(spack.paths.share_path, "sandbox", "sandbox.yaml")
@@ -277,6 +284,165 @@ def _selected_compilers(
             if path and (language, path) not in seen:
                 seen.add((language, path))
                 result.append((language, path, node))
+    return result
+
+
+def _compiler_query(compiler_path: str, option: str) -> Optional[str]:
+    try:
+        completed = subprocess.run(
+            [compiler_path, option],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    reported = completed.stdout.strip()
+    return reported if os.path.isabs(reported) else None
+
+
+def _resolved_sandbox_path(spelling: str, source: str) -> ResolvedSandboxPath:
+    return ResolvedSandboxPath(spelling, os.path.realpath(source))
+
+
+def _is_spack_binutils_wrapper(path: str) -> bool:
+    parts = Path(path).parts
+    return any(parts[index : index + 2] == ("libexec", "spack") for index in range(len(parts) - 1))
+
+
+def compiler_support_paths(
+    compiler_path: str, policy: Optional[dict] = None
+) -> List[ResolvedSandboxPath]:
+    """Return compiler-reported support programs and files without PATH fallback."""
+    policy = policy if policy is not None else _load_sandbox_policy()
+    result = []
+    for program in policy["compiler_programs"] + policy["binutils_programs"]:
+        reported = _compiler_query(compiler_path, f"-print-prog-name={program}")
+        if reported is None or (
+            program in policy["binutils_programs"] and _is_spack_binutils_wrapper(reported)
+        ):
+            continue
+        result.append(_resolved_sandbox_path(program, reported))
+
+    for filename in policy["compiler_files"]:
+        reported = _compiler_query(compiler_path, f"-print-file-name={filename}")
+        if reported is not None:
+            result.append(_resolved_sandbox_path(filename, reported))
+    return result
+
+
+def compiler_driver_paths(
+    spec: spack.spec.Spec, policy: Optional[dict] = None
+) -> List[ResolvedSandboxPath]:
+    """Return selected compiler drivers and their original alias spellings."""
+    policy = policy if policy is not None else _load_sandbox_policy()
+    result = []
+    seen = set()
+    for language, compiler_path, _compiler_spec in _selected_compilers(spec, policy):
+        source = os.path.realpath(compiler_path)
+        spellings = [compiler_path]
+        spellings.extend(
+            os.path.join(os.path.dirname(compiler_path), alias)
+            for alias in policy["compiler_driver_aliases"][language]
+        )
+        for spelling in spellings:
+            entry = _resolved_sandbox_path(spelling, source)
+            if (entry.spelling, entry.source) not in seen:
+                seen.add((entry.spelling, entry.source))
+                result.append(entry)
+    return result
+
+
+def executable_support_paths(
+    executable: str, policy: Optional[dict] = None
+) -> List[ResolvedSandboxPath]:
+    """Return exact data files required by a selected executable."""
+    policy = policy if policy is not None else _load_sandbox_policy()
+    if os.path.basename(executable) == "file":
+        return [
+            _resolved_sandbox_path(path, path)
+            for path in policy["file_runtime_read_paths"]
+            if os.path.exists(path)
+        ]
+    if os.path.basename(executable) != "cpp":
+        return []
+    reported = _compiler_query(executable, "-print-prog-name=cc1")
+    return [_resolved_sandbox_path("cc1", reported)] if reported is not None else []
+
+
+def git_support_paths(git_path: str) -> List[ResolvedSandboxPath]:
+    """Return Git's configured helper directory, without searching for Git again."""
+    try:
+        completed = subprocess.run(
+            [git_path, "--exec-path"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True,
+        )
+    except OSError:
+        return []
+    exec_path = completed.stdout.strip()
+    if completed.returncode != 0 or not os.path.isabs(exec_path):
+        return []
+    return [_resolved_sandbox_path(f"{git_path} --exec-path", exec_path)]
+
+
+def stage_tool_paths(policy: Optional[dict] = None) -> List[ResolvedSandboxPath]:
+    """Select stage tools, their script-helper closure, and Git's helper directory."""
+    policy = policy if policy is not None else _load_sandbox_policy()
+    helper_closure = {"gunzip": ("gzip", "sh"), "bunzip2": ("bzip2", "sh")}
+    names = list(policy["stage_programs"])
+    for name in tuple(names):
+        for helper in helper_closure.get(name, ()):
+            if helper not in names:
+                names.append(helper)
+
+    result = []
+    seen = set()
+    for name in names:
+        source = which_string(name)
+        if source is None:
+            continue
+        entry = _resolved_sandbox_path(name, source)
+        if (entry.spelling, entry.source) not in seen:
+            seen.add((entry.spelling, entry.source))
+            result.append(entry)
+        if name == "git":
+            for support in git_support_paths(source):
+                if (support.spelling, support.source) not in seen:
+                    seen.add((support.spelling, support.source))
+                    result.append(support)
+    return result
+
+
+def tool_runtime_paths(spec: spack.spec.Spec, tool_paths) -> List[str]:
+    """Return Spack tool prefixes and link/run dependency prefixes owning selected tools."""
+    sources = [
+        path.source if isinstance(path, ResolvedSandboxPath) else os.path.realpath(path)
+        for path in tool_paths
+    ]
+    result = []
+    seen = set()
+    for node in spec.traverse():
+        prefix = os.path.realpath(str(node.prefix))
+        try:
+            owns_tool = any(os.path.commonpath((source, prefix)) == prefix for source in sources)
+        except ValueError:
+            owns_tool = False
+        if not owns_tool:
+            continue
+        for path in [str(node.prefix)] + [
+            str(dependency.prefix)
+            for dependency in node.traverse(root=False, deptype=("link", "run"))
+        ]:
+            resolved = os.path.realpath(path)
+            if resolved not in seen:
+                seen.add(resolved)
+                result.append(resolved)
     return result
 
 
