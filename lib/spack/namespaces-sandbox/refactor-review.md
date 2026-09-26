@@ -625,3 +625,9 @@ checks.
   user-writable path outside selected roots, as the next fallback. A disposable
   namespace bind probe succeeded; all 30 sandbox-common tests and Ruff pass.
   The next actual m4 attempt will validate full activation.
+- 2026-09-26: The next install reached `compiler-wrapper` and rejected the
+  configured `/usr/bin/g++-16` symlink as noncanonical. Compiler selection
+  already carries its canonical source and emits a generated alias; a duplicate
+  raw compiler path was being included as a required mount. Removed that input
+  and added a symlinked-driver assembler regression. All 30 sandbox-common
+  tests and Ruff pass. Retry the actual install next.

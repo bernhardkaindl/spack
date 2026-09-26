@@ -703,3 +703,10 @@ not close that lifecycle gap.
   without overlapping selected roots, and a disposable namespace probe
   confirmed bind-mount setup works there. The 30 sandbox-common tests and Ruff
   pass. Retry the real install to validate the full activation path.
+- 2026-09-26: With scratch allocation working, the next install reached
+  `compiler-wrapper` and failed on `/usr/bin/g++-16`, a symlink to the canonical
+  `/usr/bin/x86_64-linux-gnu-g++-16`. The compiler driver selector already
+  selects canonical sources and represents aliases as generated symlinks; the
+  assembler redundantly re-added the raw configured alias as a canonical mount
+  input. Removed that duplicate input and extended the assembler regression to
+  cover a symlinked driver. All 30 sandbox-common tests and Ruff pass; retry m4.
