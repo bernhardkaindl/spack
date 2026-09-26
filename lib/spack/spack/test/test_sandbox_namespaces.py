@@ -286,6 +286,50 @@ def test_filesystem_policy_compiles_generated_paths(tmp_path):
     assert (stage / "spack-empty-host-dirs/0/generated-file").is_file()
 
 
+def test_filesystem_policy_compiles_replacement_and_generated_alias(tmp_path):
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    compiler = tmp_path / "compiler"
+    compiler.touch()
+    alias = hidden / "cc"
+    alias.symlink_to(compiler)
+    stage = tmp_path / "stage"
+    policy = ns.build_namespace_filesystem_policy(
+        [str(hidden)],
+        replacement_mounts=[(str(replacement), str(hidden))],
+        generated_symlinks=[ns.NamespaceGeneratedSymlink(str(alias), str(compiler))],
+    )
+
+    plan = ns.build_namespace_mount_plan_from_policy(policy, str(stage))
+
+    assert plan.replacement_mounts == (
+        ns.NamespacePreservedMount(
+            str(replacement), str(hidden), True, ns.NamespaceMountAccess.READ_WRITE
+        ),
+    )
+    assert plan.generated_symlinks == (
+        ns.NamespaceGeneratedSymlink(str(alias), str(compiler.resolve())),
+    )
+    assert ns._apply_namespace_mount_plan(plan, FakeLibc())
+    generated_alias = stage / "spack-empty-host-dirs/0/cc"
+    assert generated_alias.is_symlink()
+    assert os.readlink(str(generated_alias)) == str(compiler.resolve())
+
+
+def test_filesystem_policy_rejects_replacement_outside_hidden_root(tmp_path):
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+
+    with pytest.raises(ns.NamespaceSetupError, match="replacement target is not a hidden root"):
+        ns.build_namespace_filesystem_policy(
+            [str(hidden)], replacement_mounts=[(str(replacement), str(tmp_path))]
+        )
+
+
 def test_mount_plan_does_not_recreate_disappeared_preserved_source(tmp_path):
     hidden = tmp_path / "hidden"
     hidden.mkdir()
