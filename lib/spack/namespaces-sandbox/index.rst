@@ -68,7 +68,9 @@ grouping in ``lib/spack/spack/test/test_sandbox_namespaces.py``.
   concretizer-worker evaluation remain future work.
 
 The case-by-case findings, acceptance criteria, and worklog are tracked in
-``lib/spack/namespaces-sandbox/refactor-review.md``.
+``lib/spack/namespaces-sandbox/refactor-review.md``. The Phase 4 input
+selection work item has its own ledger in
+``lib/spack/namespaces-sandbox/phase-4-input-selection.md``.
 
 Phase 1: capability probe and fallback
 --------------------------------------
