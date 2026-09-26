@@ -822,7 +822,7 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
     stage = directory(host / "stage")
     worker_root = directory(host / "worker")
     user_cache = directory(hidden_home / ".spack")
-    fetch_cache = directory(user_cache / "source-cache")
+    fetch_cache = user_cache / "source-cache"
     misc_cache = directory(user_cache / "misc-cache")
     log_path = file(host / "build.log")
     jobserver = file(host / "jobserver")
@@ -918,6 +918,21 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
         str(fetch_cache),
     )
     try:
+        assert fetch_cache.is_dir()
+        fetch_cache_alias = user_cache / "source-cache-alias"
+        fetch_cache_alias.symlink_to(fetch_cache, target_is_directory=True)
+        with pytest.raises(
+            spack.sandbox_namespaces.NamespaceSetupError, match="not canonical"
+        ):
+            build.prepare_namespace_activation(
+                {},
+                spec,
+                str(stage),
+                str(log_path),
+                (str(jobserver),),
+                str(worker_root),
+                str(fetch_cache_alias),
+            )
         assert activation.worker_root == str(worker_root)
         assert activation.policy.tmpfs_paths == ("/dev/shm",)
         assert set(activation.policy.generated_symlinks) == {
