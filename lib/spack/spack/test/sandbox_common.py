@@ -9,10 +9,12 @@ import os
 import pathlib
 import sys
 import tempfile
+from types import SimpleNamespace
 from typing import Any, List, Tuple, cast
 
 import pytest
 
+import spack.compilers.config
 import spack.concretize
 import spack.paths
 import spack.repo
@@ -98,6 +100,123 @@ def test_linux_header_policy_rejects_unsafe_relative_paths(
     with pytest.raises(spack.error.InstallError, match=str(policy_path)) as error:
         build._load_linux_header_policy(str(policy_path))
     assert "glibc.files" in str(error.value)
+
+
+def _minimal_header_policy(include_root: pathlib.Path, maximum_major: int = 15) -> dict:
+    return {
+        "version": 1,
+        "system_include_root": str(include_root),
+        "glibc": {
+            "files": ["stdio.h"],
+            "directories": ["arpa"],
+            "target_files": ["fpu_control.h"],
+            "target_directories": ["bits", "sys"],
+        },
+        "linux": {"directories": ["linux"], "target_directories": ["asm"]},
+        "libstdcxx": {"maximum_major_for_non_gcc": maximum_major},
+    }
+
+
+def _compiler_spec(name: str, compilers: dict) -> SimpleNamespace:
+    return SimpleNamespace(name=name, extra_attributes={"compilers": compilers})
+
+
+def test_selected_compilers_uses_language_edges_and_deduplicates(monkeypatch):
+    from spack.installer import build
+
+    compiler = _compiler_spec(
+        "llvm", {"c": "/usr/bin/clang", "cxx": "/usr/bin/clang++", "fortran": "/usr/bin/flang"}
+    )
+    edge = SimpleNamespace(spec=compiler, virtuals=("c",))
+    root = SimpleNamespace(
+        name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge, edge]
+    )
+    spec = SimpleNamespace(traverse=lambda: [root])
+    monkeypatch.setattr(spack.compilers.config, "supported_compilers", lambda *, repo: ["gcc"])
+
+    selected = build._selected_compilers(spec)
+
+    assert [(language, path) for language, path, _ in selected] == [("c", "/usr/bin/clang")]
+
+
+def test_selected_compilers_includes_supported_compiler_nodes(monkeypatch):
+    from spack.installer import build
+
+    compiler = _compiler_spec(
+        "gcc", {"c": "/usr/bin/gcc", "cxx": "/usr/bin/g++", "fortran": "/usr/bin/gfortran"}
+    )
+    compiler.edges_to_dependencies = lambda: []
+    spec = SimpleNamespace(traverse=lambda: [compiler])
+    monkeypatch.setattr(spack.compilers.config, "supported_compilers", lambda *, repo: ["gcc"])
+
+    selected = build._selected_compilers(spec)
+
+    assert [(language, path) for language, path, _ in selected] == [
+        ("c", "/usr/bin/gcc"),
+        ("cxx", "/usr/bin/g++"),
+        ("fortran", "/usr/bin/gfortran"),
+    ]
+
+
+def _system_gcc_layout(tmp_path: pathlib.Path):
+    install_root = tmp_path / "lib" / "gcc"
+    target = install_root / "test-linux-gnu"
+    (target / "15").mkdir(parents=True)
+    (target / "16").mkdir()
+    include_root = tmp_path / "include"
+    (include_root / "c++" / "15").mkdir(parents=True)
+    (include_root / "c++" / "16").mkdir()
+    return target, include_root
+
+
+@pytest.mark.parametrize("compiler_name, expected_version", [("llvm", "15"), ("gcc", "16")])
+def test_system_compiler_headers_select_libstdcxx_policy_version(
+    tmp_path: pathlib.Path, monkeypatch, compiler_name: str, expected_version: str
+):
+    from spack.installer import build
+
+    target, include_root = _system_gcc_layout(tmp_path)
+    compiler = _compiler_spec(compiler_name, {"cxx": "/usr/bin/clang++"})
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = SimpleNamespace(traverse=lambda: [root])
+    policy = _minimal_header_policy(include_root)
+    monkeypatch.setattr(build, "_gcc_installation", lambda compiler_path: target / "16")
+
+    paths = build.system_compiler_header_paths(spec, policy)
+
+    assert str(include_root / "stdio.h") in paths
+    assert str(include_root / "linux") in paths
+    assert str(include_root / "c++" / expected_version) in paths
+    assert str(include_root / "c++" / ("16" if expected_version == "15" else "15")) not in paths
+
+
+def test_system_compiler_headers_ignore_non_system_compilers(tmp_path: pathlib.Path):
+    from spack.installer import build
+
+    compiler = _compiler_spec("llvm", {"cxx": str(tmp_path / "clang++")})
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = SimpleNamespace(traverse=lambda: [root])
+
+    assert build.system_compiler_header_paths(spec, _minimal_header_policy(tmp_path)) == []
+
+
+def test_gcc_installation_mask_excludes_permitted_cxx_installation(
+    tmp_path: pathlib.Path, monkeypatch
+):
+    from spack.installer import build
+
+    target, include_root = _system_gcc_layout(tmp_path)
+    compiler = _compiler_spec("llvm", {"cxx": "/usr/bin/clang++"})
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = SimpleNamespace(traverse=lambda: [root])
+    monkeypatch.setattr(build, "_gcc_installation", lambda compiler_path: target / "16")
+
+    assert build.gcc_installation_dirs_to_mask(spec, _minimal_header_policy(include_root)) == [
+        str(target / "16")
+    ]
 
 
 def test_allow_read_reports_both_the_requested_and_resolved_path(tmp_path: pathlib.Path):
