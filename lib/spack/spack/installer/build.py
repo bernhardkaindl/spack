@@ -8,6 +8,7 @@ the :func:`worker_function` entry point, the install steps it drives, and the lo
 :class:`ChildInfo` handle the parent uses to talk to the child. See :mod:`spack.installer`
 for the overall design."""
 
+import errno
 import glob
 import io
 import json
@@ -21,7 +22,7 @@ import tempfile
 import traceback
 from gzip import GzipFile
 from multiprocessing import Process
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple
 
 from spack.vendor.typing_extensions import Protocol
 
@@ -32,6 +33,7 @@ import spack.config
 import spack.error
 import spack.hooks
 import spack.mirrors.mirror
+import spack.paths
 import spack.repo
 import spack.sandbox
 import spack.sandbox_namespaces
@@ -91,6 +93,17 @@ class ProcessLike(Protocol):
     def is_alive(self) -> bool: ...
 
     def join(self, timeout: Optional[float] = None) -> None: ...
+
+
+class NamespacePolicyInputPaths(NamedTuple):
+    """Trusted host paths selected before namespace policy compilation."""
+
+    hidden_roots: Tuple[str, ...]
+    compiler_paths: Tuple[str, ...]
+    tool_paths: Tuple[str, ...]
+    header_paths: Tuple[str, ...]
+    runtime_paths: Tuple[str, ...]
+    temporary_paths: Tuple[str, ...]
 
 
 class ChildInfo:
@@ -682,6 +695,149 @@ def namespace_filesystem_policy_from_inputs(
         existing_identity_mounts(read_only_paths),
         existing_identity_mounts(read_write_paths),
     )
+
+
+def namespace_filesystem_policy_and_plan_from_inputs(
+    config: dict,
+    spec: spack.spec.Spec,
+    stage_path: str,
+    mount_plan_stage: str,
+    selected_paths: NamespacePolicyInputPaths,
+) -> Tuple[
+    spack.sandbox_namespaces.NamespaceFilesystemPolicy, spack.sandbox_namespaces.NamespaceMountPlan
+]:
+    """Compile a trusted selected-tree policy without activating it.
+
+    Host compiler, tool, header, runtime, and scoped temporary paths are
+    explicit because a concrete compiler prefix such as ``/usr`` is too broad
+    to restore below a hidden tree. Active package repositories and immutable
+    Spack source subtrees are selected from trusted process state.
+    """
+
+    required_categories = (
+        ("hidden root", selected_paths.hidden_roots),
+        ("compiler", selected_paths.compiler_paths),
+        ("tool", selected_paths.tool_paths),
+        ("header", selected_paths.header_paths),
+        ("runtime", selected_paths.runtime_paths),
+        ("temporary", selected_paths.temporary_paths),
+    )
+    for category, paths in required_categories:
+        if not paths:
+            raise spack.sandbox_namespaces.NamespaceSetupError(
+                errno.EINVAL,
+                "select namespace policy inputs",
+                f"no {category} paths were selected",
+            )
+
+    repositories = tuple(spack.repo.PATH.repos)
+    repository_roots = tuple(repo.root for repo in repositories)
+    if not repository_roots:
+        raise spack.sandbox_namespaces.NamespaceSetupError(
+            errno.EINVAL,
+            "select namespace policy inputs",
+            "no package repository roots were selected",
+        )
+    spack_source_paths = (
+        spack.paths.bin_path,
+        spack.paths.lib_path,
+        spack.paths.share_path,
+        spack.paths.etc_path,
+    )
+
+    read_only_paths = [str(dep.prefix) for dep in spec.traverse(root=False) if not dep.external]
+    for _, paths in required_categories[1:-1]:
+        read_only_paths.extend(paths)
+    read_only_paths.extend(repository_roots)
+    read_only_paths.extend(spack_source_paths)
+    read_only_paths.extend(config.get("allow_read", []))
+
+    sbang_paths = [os.path.join(spack.store.STORE.unpadded_root, "bin", "sbang")]
+    sbang_paths.extend(
+        os.path.join(upstream_db.root, "bin", "sbang")
+        for upstream_db in spack.store.STORE.upstreams or []
+    )
+    read_only_paths.extend(sbang_paths)
+
+    read_write_paths = [stage_path, str(spec.prefix), os.devnull]
+    read_write_paths.extend(selected_paths.temporary_paths)
+    read_write_paths.extend(config.get("allow_write", []))
+
+    def canonical_required_paths(paths):
+        result = []
+        for path in paths:
+            absolute = os.path.abspath(path)
+            resolved = os.path.realpath(absolute)
+            if not os.path.exists(resolved):
+                raise spack.sandbox_namespaces.NamespaceSetupError(
+                    errno.ENOENT,
+                    "select namespace policy inputs",
+                    f"required path does not exist: {path}",
+                )
+            if absolute != resolved:
+                raise spack.sandbox_namespaces.NamespaceSetupError(
+                    errno.EINVAL,
+                    "select namespace policy inputs",
+                    f"required path is not canonical: {path} resolves to {resolved}",
+                )
+            result.append(resolved)
+        return tuple(sorted(set(result)))
+
+    requested_hidden_roots = canonical_required_paths(selected_paths.hidden_roots)
+    requested_read_only = canonical_required_paths(read_only_paths)
+    requested_read_write = canonical_required_paths(read_write_paths)
+
+    def minimal_paths(paths):
+        result = []
+        for path in paths:
+            if any(
+                parent == path or os.path.commonpath((parent, path)) == parent for parent in result
+            ):
+                continue
+            result.append(path)
+        return tuple(result)
+
+    effective_read_only = minimal_paths(requested_read_only)
+    effective_read_write = minimal_paths(requested_read_write)
+    mount_targets = effective_read_only + effective_read_write
+
+    candidate_hidden_roots = list(requested_hidden_roots)
+    for target in mount_targets:
+        parent = os.path.dirname(target)
+        if parent == os.path.sep:
+            raise spack.sandbox_namespaces.NamespaceSetupError(
+                errno.EINVAL,
+                "select namespace policy hidden roots",
+                f"cannot isolate a top-level path without hiding the filesystem root: {target}",
+            )
+        candidate_hidden_roots.append(parent)
+    hidden_roots = minimal_paths(tuple(sorted(set(candidate_hidden_roots))))
+
+    policy = spack.sandbox_namespaces.build_namespace_filesystem_policy(
+        hidden_roots,
+        ((path, path) for path in effective_read_only),
+        ((path, path) for path in effective_read_write),
+    )
+
+    def assert_covered(paths, mounts, access):
+        targets = tuple(mount.target for mount in mounts)
+        for path in paths:
+            if not any(
+                target == path or os.path.commonpath((target, path)) == target
+                for target in targets
+            ):
+                raise spack.sandbox_namespaces.NamespaceSetupError(
+                    errno.EINVAL,
+                    "validate namespace policy coverage",
+                    f"{access} path is not represented by the policy: {path}",
+                )
+
+    assert_covered(requested_read_only, policy.read_only_mounts, "read-only")
+    assert_covered(requested_read_write, policy.read_write_mounts, "read-write")
+    plan = spack.sandbox_namespaces.build_namespace_mount_plan_from_policy(
+        policy, mount_plan_stage
+    )
+    return policy, plan
 
 
 def _prepare_namespace_sandbox_before_threads(

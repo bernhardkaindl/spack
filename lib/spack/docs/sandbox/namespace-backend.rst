@@ -443,12 +443,41 @@ anchoring against a concurrent same-type source substitution remains future
 hardening; policy construction and application therefore remain trusted,
 single-threaded installer work.
 
+The dormant selected-tree compiler makes the next boundary explicit. Trusted
+setup must provide nonempty selections of hidden host roots, exact host
+compiler executables, build tools, header trees, runtime paths, and scoped
+temporary directories. Non-external compiler and tool packages already appear
+as concrete dependency prefixes and remain read-only. Active
+package-repository roots come from the repository search path. Spack's
+``bin``, ``lib``, ``share/spack``, and ``etc/spack`` trees are separate
+read-only grants so the store and writable state below the Spack prefix are not
+accidentally exposed. Spack and upstream ``sbang`` paths are required when
+selected rather than silently omitted.
+
+The compiler requires every selected spelling to be an existing canonical
+path. Symlink spellings fail until the policy can preserve both the selected
+name and its resolved source. It collapses a same-access descendant only when
+an existing ancestor mount covers it, then verifies coverage of every
+originally selected path. Explicit hidden roots are combined with the parent
+of each effective identity mount; nested candidates collapse to the outer
+root. A selected top-level path is rejected because restoring it would require
+masking ``/``. The resulting policy must compile with caller-provided
+mount-plan scratch outside every hidden root, and hidden roots may not overlap
+the planner's reserved source subtrees. Representative synthetic-host tests
+cover explicit masks and selected compiler, tool, header, runtime, dependency,
+repository, Spack-source, stage, prefix, device, and temporary paths, including
+an intentionally ancestor-covered header subtree. They also prove disappeared,
+symlinked, and top-level selected paths fail closed.
+
 The worker does not activate the installer-derived policy yet. It continues to
 use only the narrow ``/usr/share/aclocal`` mask and transitional Landlock. The
-next policy-driven increment must select hidden roots that make every required
-installer path compilable and cover the selected compilers, build tools,
-headers, package repositories, and Spack source tree. The complete policy
-derives from:
+selected-tree compiler is not called by the worker because trusted setup does
+not yet materialize the complete hidden host and device policy, exact host
+compiler, tool, header, and runtime set, canonical aliases, a scoped
+replacement for the broad system temporary directory, or durable mount-plan
+scratch. Only paths below selected hidden roots are absent; unrelated host
+trees remain visible, so this helper is not yet a namespace-only replacement
+for Landlock. The complete policy derives from:
 
 * The concrete spec's selected compilers and build tools.
 * The host's available header trees and compiler installations.
@@ -456,8 +485,9 @@ derives from:
 * The stage, prefix, and temporary directories.
 
 A path that is not allowlisted is absent below a hidden root. Once every
-required path is represented, compilable, and validated, the namespaced worker
-stops applying Landlock by default.
+required path is materialized, represented, compilable, and validated against
+real builds, the namespaced worker can activate this tree and stop applying
+Landlock by default.
 
 Phase 5: Build-phase confinement
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
