@@ -470,6 +470,7 @@ def install_tool_paths(policy: Optional[dict] = None) -> List[ResolvedSandboxPat
     """Select coreutils and build utilities needed during package installation."""
     policy = policy if policy is not None else _load_sandbox_policy()
     program_groups = (
+        "binutils_programs",
         "coreutils_install_programs",
         "coreutils_file_programs",
         "coreutils_util_programs",
