@@ -42,6 +42,7 @@ stage_programs:
 - gunzip
 - gzip
 - patch
+- sed
 - sh
 - tar
 - unzip

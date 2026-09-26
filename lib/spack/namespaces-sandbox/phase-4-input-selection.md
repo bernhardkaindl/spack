@@ -733,3 +733,7 @@ not close that lifecycle gap.
   canonicalized PATH spellings. A focused regression covers `sh -> dash`, and
   a live namespace test proves a stage nested beneath a replacement root is
   visible. All 138 sandbox tests, Ruff, and whitespace checks pass; retry m4.
+- 2026-09-26: Restoring the shell alias let gmake enter `configure`, which then
+  failed because `sed` was absent from the hidden `/usr/bin`. The shipped
+  stage-tool policy now selects `sed` through the existing canonical tool
+  resolver; the YAML policy test asserts its presence. Retry the real install.
