@@ -368,7 +368,7 @@ once. Port behavior, not implementation details.
 2. [x] D3.2: select private shared memory and descriptor links from versioned
   policy data; extend capability probing and test fatal activation failures
   before authority drop and `Tee`. Preserve the device allowlist and fallback.
-3. [ ] D3.3: prove real device/link/shared-memory behavior, host and concurrent
+3. [x] D3.3: prove real device/link/shared-memory behavior, host and concurrent
   worker isolation, and post-setup authority removal; update documentation,
   close D3 with evidence, and select whole-child lifecycle verification.
 
@@ -634,3 +634,25 @@ lifecycle. D2's disposable activation test does not close that lifecycle gap.
   pass, including live namespace checks, and Ruff passes. D3.3 real `/dev`
   behavior and concurrent isolation are next. Skip Sphinx builds for this work
   per the user's directive; retain documentation and whitespace checks.
+- 2026-09-26: Completed D3.3 and closed private `/dev` construction. Two
+  simultaneous disposable namespace workers each see only selected device
+  nodes plus `shm` and generated descriptor links, preserve device identity,
+  exercise null/zero/random/urandom/full behavior and shell redirections to
+  `/dev/null`, and write the same name independently in private `/dev/shm`.
+  They cannot observe a host shared-memory file; the parent file remains
+  unchanged. Both workers report zero effective/permitted/inheritable
+  capabilities and reject later bind mounts. Combined D3 suites pass 199
+  tests with live namespace checks enabled; Ruff and whitespace checks pass.
+  No Sphinx builds were run per request. Selected whole-child writable
+  inventory and install lifecycle verification next, starting with a real
+  `spack install m4` attempt. Detached mounts, Windows, and network policy
+  remain outside this increment.
+
+- [ ] E1, inventory all paths touched by the complete install child and make
+  `spack install m4` succeed under automatic namespace activation. Start with a
+  real constrained install and record exact missing/read-only/writable paths;
+  repair only trusted selectors and mount-plan semantics required by those
+  observations. Then verify fetch, stage, configure/build, prefix finalization,
+  logs, and success/failure cleanup from the supervisor. Keep recipe/core
+  sources read-only, avoid config options and broad store/stage-root grants,
+  and retain `/usr/lib*` policy candidates and device-list provenance.

@@ -241,7 +241,7 @@ capability probe; Landlock is fallback-only when namespaces are unavailable.
   3. [x] D2.3: final backend documentation and ledger reconciliation; close D2
     and select D3 private `/dev` construction.
 
-- [ ] D3, complete the private `/dev` view. Preserve selected device binds,
+- [x] D3, complete the private `/dev` view. Preserve selected device binds,
   add fresh per-worker `/dev/shm` tmpfs and the fd/stdin/stdout/stderr links,
   validate the immutable plan, and probe the additional operations before
   activation. Require disposable-kernel device/link/shared-memory behavior,
@@ -256,6 +256,13 @@ coverage; D3.3 disposable-kernel isolation evidence and final documentation.
 
 D2 is focused activation evidence, not completion of those deferred lifecycle
 checks.
+
+- [ ] E1, prove the whole install-child writable/read-only inventory and make
+  an actual `spack install m4` succeed with automatic namespace activation.
+  Record failures before repairs; verify fetch, stage, configure/build, logs,
+  prefix visibility/finalization, and failure cleanup. Keep stage and core
+  source trees narrowly scoped and read-only; add no config option or broad
+  store grant.
 
 - [x] Materialize the complete trusted input selection in trusted installer
   setup. Select the complete hidden host/device roots; resolve the concrete
@@ -586,3 +593,10 @@ checks.
   before `Tee` and never fall back after mutation. All 198 affected tests and
   Ruff pass with live namespace evidence enabled. D3.3 concurrent private
   `/dev` verification is next. Sphinx builds are skipped by user request.
+- 2026-09-26: Completed D3.3 and selected E1. Concurrent disposable namespace
+  workers prove private `/dev/shm`, host and cross-worker isolation, literal
+  descriptor links, selected-device identity/I/O, `/dev/null` redirection, and
+  capability removal. The full D3-affected suite passes 199 tests with live
+  tests enabled; Ruff and whitespace checks pass. Sphinx was skipped as
+  requested. Next is real whole-child install evidence and `spack install m4`;
+  full lifecycle semantics must not be inferred from the D3 activation test.
