@@ -134,6 +134,7 @@ class NamespaceFilesystemPolicy(NamedTuple):
     replacement_mounts: Tuple[NamespaceMountRequest, ...] = ()
     generated_symlinks: Tuple[NamespaceGeneratedSymlink, ...] = ()
     read_only_view: bool = False
+    tmpfs_paths: Tuple[str, ...] = ()
 
 
 class NamespacePreservedMount(NamedTuple):
@@ -156,6 +157,7 @@ class NamespaceMountPlan(NamedTuple):
     replacement_mounts: Tuple[NamespacePreservedMount, ...] = ()
     generated_symlinks: Tuple[NamespaceGeneratedSymlink, ...] = ()
     read_only_view: bool = False
+    tmpfs_paths: Tuple[str, ...] = ()
 
 
 _active_namespace_mount_plan_scratch = set()
@@ -435,6 +437,7 @@ def build_namespace_filesystem_policy(
     replacement_mounts: Iterable[Tuple[str, str]] = (),
     generated_symlinks: Iterable[NamespaceGeneratedSymlink] = (),
     read_only_view: bool = False,
+    tmpfs_paths: Iterable[str] = (),
 ) -> NamespaceFilesystemPolicy:
     """Canonicalize and validate namespace filesystem intent.
 
@@ -532,16 +535,31 @@ def build_namespace_filesystem_policy(
             )
         canonical_symlink_list.append(
             NamespaceGeneratedSymlink(
-                os.path.abspath(symlink.path), os.path.realpath(os.path.abspath(symlink.target))
+                os.path.abspath(symlink.path), os.path.abspath(symlink.target)
             )
         )
     canonical_symlinks = tuple(sorted(canonical_symlink_list, key=lambda item: item.path))
+
+    canonical_tmpfs = []
+    for path in tmpfs_paths:
+        if not isinstance(path, str) or not os.path.isabs(path) or os.path.normpath(path) != path:
+            _mount_plan_error("validate namespace policy tmpfs", f"invalid tmpfs path: {path!r}")
+        if not any(_path_contains(root, path) for root in sorted_hidden_roots):
+            _mount_plan_error(
+                "validate namespace policy tmpfs", f"tmpfs is not below a hidden root: {path}"
+            )
+        if any(_path_contains(mount.target, path) for mount in canonical_replacement):
+            _mount_plan_error(
+                "validate namespace policy tmpfs", f"tmpfs overlaps a replacement root: {path}"
+            )
+        canonical_tmpfs.append(path)
 
     classified_paths = [
         (mount.target, mount.access.value) for mount in canonical_read_only + canonical_read_write
     ]
     classified_paths.extend((path.path, "generated") for path in canonical_generated)
     classified_paths.extend((path.path, "generated symlink") for path in canonical_symlinks)
+    classified_paths.extend((path, "tmpfs") for path in canonical_tmpfs)
     sorted_classified_paths = sorted(classified_paths, key=lambda item: item[0])
     for index, (path, category) in enumerate(sorted_classified_paths):
         for previous_path, previous_category in sorted_classified_paths[:index]:
@@ -600,6 +618,7 @@ def build_namespace_filesystem_policy(
         canonical_replacement,
         canonical_symlinks,
         read_only_view,
+        tuple(sorted(canonical_tmpfs)),
     )
 
 
@@ -648,6 +667,7 @@ def _validated_namespace_filesystem_policy(
         replacement_mounts,
         policy.generated_symlinks,
         policy.read_only_view,
+        policy.tmpfs_paths,
     )
     if policy != validated:
         _mount_plan_error("validate namespace policy", "policy is not canonical")
@@ -707,6 +727,7 @@ def build_namespace_mount_plan_from_policy(
         plan.replacement_mounts,
         policy.generated_symlinks,
         policy.read_only_view,
+        policy.tmpfs_paths,
     )
 
 
@@ -1025,6 +1046,9 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
             endpoint = os.path.join(mask.source, os.path.relpath(generated.path, mask.target))
             os.makedirs(os.path.dirname(endpoint), exist_ok=True)
             os.symlink(generated.target, endpoint)
+        for target in plan.tmpfs_paths:
+            mask = next(mount for mount in plan.mounts if _path_contains(mount.target, target))
+            os.makedirs(os.path.join(mask.source, os.path.relpath(target, mask.target)))
         _check_syscall(
             libc.mount(
                 None,
@@ -1074,7 +1098,20 @@ def _apply_namespace_mount_plan(plan: NamespaceMountPlan, libc: ctypes.CDLL) -> 
             mount.source_is_directory,
             mount.access,
         )
+    for target in plan.tmpfs_paths:
+        _mount_private_tmpfs(libc, target)
     return True
+
+
+def _mount_private_tmpfs(libc: ctypes.CDLL, target: str) -> None:
+    """Create writable shared memory without exposing host devices or set-ID files."""
+    _check_syscall(
+        libc.mount(
+            b"tmpfs", os.fsencode(target), b"tmpfs",
+            ctypes.c_ulong(MS_NOSUID | MS_NODEV), b"mode=1777",
+        ),
+        "mount(tmpfs shared memory)",
+    )
 
 
 def _enter_user_mount_namespace(libc, _probe_child: bool = False) -> None:
