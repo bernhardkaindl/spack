@@ -378,6 +378,22 @@ grouping: A1-A3, B1-B3, and C1-C4.
   Prove all generated paths stay below the scoped worker root and remain
   writable through the selected policy.
 
+  ### D2 commit steps
+
+  Each step is a separate commit; D2 stays open until all three are verified.
+
+  1. [x] D2.1, carry the worker root and configure the confined child. Validate
+    writable identity-mount coverage before mounting; create private home,
+    cache, and temporary directories after mount setup and authority drop.
+    Set POSIX, Python, and Java defaults before `Tee`; preserve inherited Java
+    options. The focused activation regression includes paths with spaces.
+  2. [ ] D2.2, prove containment and failure isolation. Cover invalid roots,
+    pre-existing child paths, setup failures, unchanged fallback and parent
+    state, environment cleaning, and real-namespace writable state.
+  3. [ ] D2.3, reconcile the backend documentation and both review ledgers with
+    verified evidence and limitations. Close D2 and select private `/dev`
+    construction as D3, keeping full install-child lifecycle proof separate.
+
 After D2, complete `/dev` construction and then exercise the whole writable
 inventory plus stage/prefix success and failure semantics through a complete
 install-child lifecycle.
@@ -538,3 +554,12 @@ install-child lifecycle.
   while their exact runtime selections currently keep them as read-only
   passthrough trees. Selected
   D2 worker-local home and temporary environment setup next.
+- 2026-09-26: Completed D2.1. The immutable activation payload now carries
+  the worker root. The child validates its canonical directory and writable
+  identity-mount coverage before mounting, then creates mode-0700 home,
+  cache, and temporary directories after dropping mount authority. It sets
+  `HOME`, `XDG_CACHE_HOME`, `TMPDIR`, `TMP`, `TEMP`, `tempfile.tempdir`, and
+  quoted Java home/temporary defaults before `Tee`, retaining inherited Java
+  options. The activation regression and affected namespace, shared sandbox,
+  and installer suites passed (141 tests). D2.2 failure, containment, and
+  real-kernel evidence is next; D2 is not yet complete.
