@@ -667,3 +667,10 @@ checks.
 - 2026-09-26: With `expr` selected, configure progressed further and then
   reported `rm: not found` and `ls: not found`. Added both utilities to
   `sandbox.yaml` and the shipped policy test; retry the actual install.
+- 2026-09-26: Configure then reported missing `cat` and `sort`; `config.log`
+  showed the C compiler's `collect2` could not find `ld`, despite the
+  canonical linker source being selected. The missing `/usr/bin/ld` PATH alias
+  was not generated for compiler-support entries. Alias restoration now covers
+  those entries, and `cat`, `sort`, and `make` are selected as configure/build
+  utilities. A production-assembly regression covers the linker alias; E1
+  remains open for the next real install result.
