@@ -192,8 +192,16 @@ model, but not the policy-derived mount tree in
   coverage proves optional candidates are skipped and explicit worker paths
   fail closed. Select C3, pre-thread policy validation.
 
-- [ ] C3, validate the selected policy before worker threads and preserve the
-  current narrow live-worker behavior.
+- [x] C3, validate the selected policy before worker threads and preserve the
+  current narrow live-worker behavior. The config-free validation helper
+  always compiles the immutable selected policy before capability freeze,
+  sandbox acquisition, or namespace mutation; invalid inputs abort the worker
+  path. The pre-thread hook applies it whenever selected paths and mount-plan
+  scratch are supplied, while the dormant live worker still supplies neither.
+  Focused ordering, namespace, and installer policy tests pass.
+
+- [ ] C4, obtain disposable real compiler and source-build evidence for the
+  compiled policy before selecting activation.
 
 - [ ] Materialize the complete trusted input selection in pre-thread installer
   setup. Select the complete hidden host/device roots; resolve the concrete

@@ -212,10 +212,10 @@ recorded in
 
 ### Validation
 
-- [ ] Add an opt-in, schema-validated validation setting. When enabled,
-  selection and compilation run in pre-thread setup before any mount. A
-  failure aborts that worker before mutation and never becomes an
-  unconstrained fallback. When disabled, selection does no extra work.
+- [ ] Validate selected inputs and compile the immutable policy in pre-thread
+  setup before any mount. A failure aborts that worker before mutation and
+  never becomes an unconstrained fallback. Validation has no config.yaml
+  switch; it is unconditional whenever the selected inputs are supplied.
 - [ ] Obtain real-build evidence by applying the compiled plan in a
   disposable namespace child (not the worker). Run representative external
   compiler builds (GCC C/C++, LLVM C/C++ with GCC runtime, and Fortran where
@@ -350,10 +350,10 @@ Each item is one commit with focused tests and documentation, and each keeps
 the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
 
 - [x] C2, `sandbox: select host, device, and worker-state inputs`.
-- [ ] C3, `sandbox: validate selected policies before worker threads`.
+- [x] C3, `sandbox: validate selected policies before worker threads`.
 - [ ] C4, `sandbox: record real compiler build evidence`. Tick the source
-  item in `refactor-review.md` only after this passes, then select
-  activation (apply the tree in the worker and make Landlock opt-in).
+  item in `refactor-review.md` only after this passes, then select activation
+  (apply the tree in the worker and make Landlock opt-in).
 
 ## Accepted improvements
 
@@ -474,3 +474,10 @@ the live worker unchanged. Suggested PR grouping: A1-A3, B1-B3, and C1-C4.
   spellings fail before policy compilation; unavailable host candidates are
   omitted. Focused synthetic-host tests pass, and the live worker remains
   unchanged. Selected C3, pre-thread policy validation.
+- 2026-09-26: Completed C3 with a configuration-free pre-thread validation
+  wrapper for the immutable selected policy and mount plan. Validation is
+  unconditional whenever selected paths and mount-plan scratch are supplied;
+  invalid paths fail before capability freeze, sandbox acquisition, or mount
+  preparation. The dormant live worker remains on the narrow mask because C4
+  must first provide complete real-build inputs. Namespace and installer policy
+  suites passed. Selected C4, disposable real compiler build evidence.

@@ -1550,8 +1550,45 @@ def namespace_filesystem_policy_and_plan_from_inputs(
     return policy, plan
 
 
+def validate_namespace_policy_before_threads(
+    config: dict,
+    spec: spack.spec.Spec,
+    stage_path: str,
+    mount_plan_stage: str,
+    selected_paths: NamespacePolicyInputPaths,
+    replacement_mounts: Iterable[Tuple[str, str]] = (),
+    generated_symlinks: Iterable[spack.sandbox_namespaces.NamespaceGeneratedSymlink] = (),
+) -> Optional[
+    Tuple[
+        spack.sandbox_namespaces.NamespaceFilesystemPolicy,
+        spack.sandbox_namespaces.NamespaceMountPlan,
+    ]
+]:
+    """Validate the selected namespace policy before any worker mutation.
+
+    Validation is unconditional whenever this helper is called. Callers can retain the returned
+    immutable policy and mount plan for a later activation step.
+    """
+    return namespace_filesystem_policy_and_plan_from_inputs(
+        config,
+        spec,
+        stage_path,
+        mount_plan_stage,
+        selected_paths,
+        replacement_mounts,
+        generated_symlinks,
+    )
+
+
 def _prepare_namespace_sandbox_before_threads(
-    config: dict, spec: spack.spec.Spec, stage_path: str
+    config: dict,
+    spec: spack.spec.Spec,
+    stage_path: str,
+    *,
+    mount_plan_stage: Optional[str] = None,
+    selected_paths: Optional[NamespacePolicyInputPaths] = None,
+    replacement_mounts: Iterable[Tuple[str, str]] = (),
+    generated_symlinks: Iterable[spack.sandbox_namespaces.NamespaceGeneratedSymlink] = (),
 ) -> Optional[spack.sandbox.Sandbox]:
     """Prepare the namespace view and drop mount authority before ``Tee``.
 
@@ -1561,6 +1598,21 @@ def _prepare_namespace_sandbox_before_threads(
     """
     if not config.get("enable", False):
         return None
+
+    if mount_plan_stage is not None or selected_paths is not None:
+        if mount_plan_stage is None or selected_paths is None:
+            raise spack.error.InstallError(
+                "Namespace policy validation requires selected paths and mount-plan scratch"
+            )
+        validate_namespace_policy_before_threads(
+            config,
+            spec,
+            stage_path,
+            mount_plan_stage,
+            selected_paths,
+            replacement_mounts,
+            generated_symlinks,
+        )
 
     spack.sandbox_namespaces.freeze_namespace_sandbox_capability()
     try:
