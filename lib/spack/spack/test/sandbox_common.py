@@ -281,9 +281,16 @@ def test_tool_runtime_paths_include_owner_and_link_run_dependencies(tmp_path: pa
     tool.parent.mkdir(parents=True)
     tool.touch()
     dependency = SimpleNamespace(prefix=tmp_path / "libiconv")
-    owner = SimpleNamespace(prefix=tool_prefix, traverse=lambda **kwargs: [dependency])
-    unrelated = SimpleNamespace(prefix=tmp_path / "unrelated")
-    spec = SimpleNamespace(traverse=lambda: [owner, unrelated])
+    owner = SimpleNamespace(
+        prefix=tool_prefix, external=False, traverse=lambda **kwargs: [dependency]
+    )
+    unrelated = SimpleNamespace(prefix=tmp_path / "unrelated", external=False)
+    external_owner = SimpleNamespace(
+        prefix=tmp_path,
+        external=True,
+        traverse=lambda **kwargs: [SimpleNamespace(prefix=tmp_path / "external-dependency")],
+    )
+    spec = SimpleNamespace(traverse=lambda: [owner, unrelated, external_owner])
 
     assert build.tool_runtime_paths(spec, [build.ResolvedSandboxPath("tar", str(tool))]) == [
         str(tool_prefix),

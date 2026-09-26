@@ -586,6 +586,8 @@ def tool_runtime_paths(spec: spack.spec.Spec, tool_paths) -> List[str]:
     result = []
     seen = set()
     for node in spec.traverse():
+        if getattr(node, "external", False):
+            continue
         prefix = os.path.realpath(str(node.prefix))
         try:
             owns_tool = any(os.path.commonpath((source, prefix)) == prefix for source in sources)
