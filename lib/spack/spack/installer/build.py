@@ -1476,7 +1476,7 @@ def namespace_selected_filesystem_policy_from_inputs(
             )
 
     repositories = tuple(spack.repo.PATH.repos)
-    repository_roots = tuple(repo.root for repo in repositories)
+    repository_roots = tuple(os.path.realpath(repo.root) for repo in repositories)
     if not repository_roots:
         raise spack.sandbox_namespaces.NamespaceSetupError(
             errno.EINVAL,
