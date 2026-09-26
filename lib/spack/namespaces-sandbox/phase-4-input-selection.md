@@ -755,5 +755,10 @@ not close that lifecycle gap.
   The canonical linker source was selected, but its `/usr/bin/ld` PATH alias
   was not regenerated. Tool alias assembly now includes compiler-support
   entries. `cat`, `sort`, and `make` were already listed in the coreutils and
-  build-utility groups, now selected for the whole install child. A
-  production-assembly regression covers the linker alias.
+  build-utility groups. A production-assembly regression covers the linker
+  alias.
+- 2026-09-26: The corrected install-tool union let gmake configure and compile
+  most of its support library, then its build script failed on missing `ar`.
+  `ar` was already in `binutils_programs`; that group now participates in the
+  install-tool union. Compiler-internal helpers remain selected by exact
+  compiler queries. Retry the real install.

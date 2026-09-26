@@ -673,5 +673,10 @@ checks.
   canonical linker source being selected. The missing `/usr/bin/ld` PATH alias
   was not generated for compiler-support entries. Alias restoration now covers
   those entries. `cat`, `sort`, and `make` were already listed in the coreutils
-  and build-utility groups, which are now selected for install execution. A
-  production-assembly regression covers the linker alias; E1 remains open.
+  and build-utility groups. A production-assembly regression covers the linker
+  alias.
+- 2026-09-26: After the existing coreutils/build/interpreter groups were
+  selected, gmake configured and compiled its support library but stopped
+  because `ar` was missing. `ar` already belongs to `binutils_programs`; the
+  install-tool selector now includes that curated group as well. Compiler
+  internals remain selected through compiler-reported paths. E1 remains open.
