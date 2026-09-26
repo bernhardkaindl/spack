@@ -740,3 +740,7 @@ not close that lifecycle gap.
 - 2026-09-26: Selecting `sed` advanced gmake's configure phase to a missing
   `chmod` command. Added `chmod` to the shipped stage-tool policy and asserted
   it in the policy-data test; retry the real install.
+- 2026-09-26: Selecting `chmod` advanced configure, but it emitted repeated
+  `eval: expr: not found` errors and remained active. Stopped the runaway retry
+  with the host stage and log intact. Added canonical host `expr` to the
+  stage-tool policy and asserted it in the policy-data test; retry m4.
