@@ -1672,7 +1672,7 @@ def prepare_namespace_activation(
         host_paths.hidden_roots,
         tuple(sorted(set(path for path in compiler_paths if os.path.exists(path)))),
         tuple(sorted(set(path for path in tool_paths if os.path.exists(path)))),
-        tuple(system_compiler_header_paths(spec)),
+        tuple(path for path in system_compiler_header_paths(spec) if os.path.exists(path)),
         tuple(sorted(set(path for path in runtime_paths if os.path.exists(path)))),
         tuple(sorted(writable_paths)),
     )
