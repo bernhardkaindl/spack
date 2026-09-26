@@ -1406,6 +1406,10 @@ def test_namespace_selection_does_not_preflight_landlock(monkeypatch):
 
 def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path):
     calls = []
+    worker_root = tmp_path / "worker with spaces"
+    worker_root.mkdir()
+    monkeypatch.setattr(os, "environ", dict(os.environ, JAVA_TOOL_OPTIONS="-Xmx256m"))
+    monkeypatch.setattr(build.tempfile, "tempdir", "/inherited-temp")
 
     class RecordingSandbox(ns.NamespaceSandbox):
         def prepare_filesystem_policy(self, policy, mount_plan_stage):
@@ -1434,18 +1438,38 @@ def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path):
         lambda: ns.NamespaceCapability(True, None, None),
     )
     spec = SimpleNamespace(traverse=lambda **kwargs: [], prefix=tmp_path / "prefix")
-    activation = build.NamespaceActivation(object(), str(tmp_path / "mount-plan"))
-
-    assert (
-        build._prepare_namespace_sandbox_before_threads(
-            {"enable": True}, spec, str(tmp_path), namespace_activation=activation
-        )
-        is sandbox
+    policy = ns.build_namespace_filesystem_policy(
+        [], read_write_mounts=[(str(worker_root), str(worker_root))], read_only_view=True
     )
+    activation = build.NamespaceActivation(policy, str(tmp_path / "mount-plan"), str(worker_root))
+
+    def start_tee(*args):
+        assert os.environ["HOME"] == str(worker_root / "home")
+        assert os.environ["XDG_CACHE_HOME"] == str(worker_root / "cache")
+        for variable in ("TMPDIR", "TMP", "TEMP"):
+            assert os.environ[variable] == str(worker_root / "tmp")
+        assert build.tempfile.gettempdir() == str(worker_root / "tmp")
+        assert os.environ["JAVA_TOOL_OPTIONS"].startswith("-Xmx256m ")
+        assert build.shlex.split(os.environ["JAVA_TOOL_OPTIONS"])[1:] == [
+            f"-Duser.home={worker_root / 'home'}",
+            f"-Djava.io.tmpdir={worker_root / 'tmp'}",
+        ]
+        for name in ("home", "cache", "tmp"):
+            assert (worker_root / name).is_dir()
+        calls.append(("tee",))
+        return object()
+
+    monkeypatch.setattr(build, "Tee", start_tee)
+
+    _, prepared = build._start_tee_after_namespace(
+        {"enable": True}, None, None, None, "build.log", spec, str(tmp_path), activation
+    )
+    assert prepared is sandbox
     build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=sandbox)
     assert calls == [
         ("prepare policy", activation.policy, activation.mount_plan_stage),
         ("drop mount authority",),
+        ("tee",),
     ]
 
 
