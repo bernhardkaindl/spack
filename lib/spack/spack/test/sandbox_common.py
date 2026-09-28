@@ -64,6 +64,14 @@ def test_namespace_policy_data_is_loaded_from_yaml():
     assert policy["mount_plan_scratch_paths"] == ["/run/lock", "/var", "/opt"]
     assert policy["device_symlinks"]["/dev/fd"] == "/proc/self/fd"
     assert "tar" in policy["stage_programs"]
+    assert "cat" in policy["stage_programs"]
+    assert "chmod" in policy["stage_programs"]
+    assert "expr" in policy["stage_programs"]
+    assert "ls" in policy["stage_programs"]
+    assert "make" in policy["stage_programs"]
+    assert "rm" in policy["stage_programs"]
+    assert "sed" in policy["stage_programs"]
+    assert "sort" in policy["stage_programs"]
     assert header_policy["version"] == 1
     assert header_policy["system_include_root"] == "/usr/include"
     assert header_policy["compiler_roots"] == ["/usr/lib/gcc", "/usr/lib64/gcc"]
@@ -333,7 +341,7 @@ def test_stage_tool_paths_include_helper_chain_and_git_exec_path(monkeypatch):
     ]
 
 
-def test_stage_tool_alias_symlink_paths_restore_selected_spelling(monkeypatch, tmp_path):
+def test_tool_alias_symlink_paths_restore_selected_spelling(monkeypatch, tmp_path):
     from spack import sandbox_namespaces
     from spack.installer import build
 
@@ -346,7 +354,7 @@ def test_stage_tool_alias_symlink_paths_restore_selected_spelling(monkeypatch, t
     monkeypatch.setattr(build, "which_string", lambda name: str(shell) if name == "sh" else None)
 
     entry = build.ResolvedSandboxPath("sh", str(dash.resolve()))
-    assert build.stage_tool_alias_symlink_paths((entry,), (str(tool_dir),)) == [
+    assert build.tool_alias_symlink_paths((entry,), (str(tool_dir),)) == [
         sandbox_namespaces.NamespaceGeneratedSymlink(str(shell), str(dash.resolve()))
     ]
 
@@ -900,6 +908,9 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
     compiler = file(hidden_bin / "cc")
     compiler_alias = hidden_bin / "cc-selected"
     compiler_alias.symlink_to(compiler)
+    linker = file(hidden_bin / "x86_64-linux-gnu-ld")
+    linker_alias = hidden_bin / "ld"
+    linker_alias.symlink_to(linker)
     tool = file(hidden_bin / "tar")
     python = file(hidden_bin / "python3.12")
     python_alias = hidden_bin / "python3"
@@ -975,6 +986,14 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
     )
     monkeypatch.setattr(
         build,
+        "compiler_support_paths",
+        lambda compiler_path: [build.ResolvedSandboxPath("ld", str(linker))],
+    )
+    monkeypatch.setattr(
+        build, "which_string", lambda name: str(linker_alias) if name == "ld" else None
+    )
+    monkeypatch.setattr(
+        build,
         "_selected_compilers",
         lambda spec: [("c", str(compiler_alias), SimpleNamespace(name="gcc"))],
     )
@@ -1031,6 +1050,7 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
         assert activation.policy.tmpfs_paths == ("/dev/shm",)
         expected_generated_symlinks = {
             spack.sandbox_namespaces.NamespaceGeneratedSymlink(str(compiler_alias), str(compiler)),
+            spack.sandbox_namespaces.NamespaceGeneratedSymlink(str(linker_alias), str(linker)),
             spack.sandbox_namespaces.NamespaceGeneratedSymlink(str(python_alias), str(python)),
         }
         expected_generated_symlinks.update(
@@ -1050,6 +1070,7 @@ def test_prepare_namespace_activation_compiles_selected_production_policy(
         read_write_targets = {mount.target for mount in activation.policy.read_write_mounts}
         assert read_only_targets == {
             str(compiler),
+            str(linker),
             str(tool),
             str(python),
             str(headers),
