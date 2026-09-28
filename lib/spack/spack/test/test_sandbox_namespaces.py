@@ -101,6 +101,24 @@ def test_namespace_mapping_and_reentry(namespace_setup):
     assert libc.mount_calls == [(None, b"/", ns.MS_REC | ns.MS_PRIVATE)]
 
 
+def test_network_namespace_requires_mount_namespace_and_initializes_loopback(
+    namespace_setup, monkeypatch
+):
+    libc, _ = namespace_setup
+    monkeypatch.setattr(ns, "_network_namespace_entered_pids", set())
+    configured = []
+    monkeypatch.setattr(ns, "_configure_loopback", lambda: configured.append("loopback"))
+
+    with pytest.raises(ns.NamespaceSetupError, match="mount namespace is required"):
+        ns._enter_network_namespace(libc)
+
+    ns._enter_user_mount_namespace(libc)
+    ns._enter_network_namespace(libc)
+    ns._enter_network_namespace(libc)
+    assert libc.unshare_calls == [ns.CLONE_NEWUSER | ns.CLONE_NEWNS, ns.CLONE_NEWNET]
+    assert configured == ["loopback"]
+
+
 def test_probe_bypasses_reentry_guard(namespace_setup):
     libc, _ = namespace_setup
     ns._namespace_entered_pids.add(os.getpid())
@@ -1472,6 +1490,7 @@ def test_installer_normalizes_landlock_initialization_error(monkeypatch, tmp_pat
 
     sandbox = ns.NamespaceSandbox(landlock_factory=fail)
     monkeypatch.setattr(sandbox, "prepare_mount_tree", lambda hidden_dirs, stage_path: True)
+    monkeypatch.setattr(sandbox, "prepare_network_namespace", lambda: True)
     monkeypatch.setattr(sandbox, "drop_mount_authority", lambda: True)
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
     spec = SimpleNamespace(traverse=lambda **kw: [], prefix=tmp_path / "prefix")
@@ -1572,6 +1591,10 @@ def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path, failure):
             calls.append(("drop mount authority",))
             return failure != "authority"
 
+        def prepare_network_namespace(self):
+            calls.append(("prepare network namespace",))
+            return True
+
         def allow_read(self, path):
             calls.append(("read", path))
 
@@ -1612,7 +1635,7 @@ def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path, failure):
 
     monkeypatch.setattr(build, "Tee", start_tee)
 
-    if failure:
+    if failure == "policy":
         with pytest.raises(spack.error.InstallError):
             build._start_tee_after_namespace(
                 {"enable": True},
@@ -1634,11 +1657,18 @@ def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path, failure):
         {"enable": True}, channel, None, channel, "build.log", spec, str(tmp_path), activation
     )
     assert prepared is sandbox
+    if failure == "authority":
+        with pytest.raises(spack.error.InstallError):
+            build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=sandbox)
+        assert calls[-3:] == [("tee",), ("prepare network namespace",), ("drop mount authority",)]
+        return
+
     build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=sandbox)
     assert calls == [
         ("prepare policy", activation.policy, activation.mount_plan_stage),
-        ("drop mount authority",),
         ("tee",),
+        ("prepare network namespace",),
+        ("drop mount authority",),
     ]
 
 
@@ -1788,6 +1818,9 @@ with open('/dev/shm/spack-concurrent', 'x+') as stream:
         assert input_stream.readline() == 'release\\n'
     stream.seek(0)
     assert stream.read() == token
+build._enable_sandbox(
+    {'enable': True, 'allow_network': True}, spack.spec.Spec(), worker, sandbox=sandbox
+)
 status = Path('/proc/self/status').read_text().splitlines()
 assert all(int(line.split()[1], 16) == 0 for line in status
            if line.startswith(('CapEff:', 'CapPrm:', 'CapInh:')))
@@ -1966,6 +1999,64 @@ os._exit(0)
         assert (worker_root / name / variable).read_text() == "worker"
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux namespaces")
+def test_live_network_namespace_loopback_and_unix_sockets(tmp_path):
+    if not ns.namespace_sandbox_available():
+        pytest.skip("user, mount, or network namespaces unavailable")
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    (hidden / "host-only").write_text("private")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    socket_path = tmp_path / "local.sock"
+    code = """
+import os
+import socket
+import sys
+from spack.sandbox_namespaces import NamespaceSandbox
+
+hidden, stage, socket_path = sys.argv[1:]
+host_net_namespace = os.stat('/proc/self/ns/net').st_ino
+sandbox = NamespaceSandbox()
+assert sandbox.prepare_mount_tree([hidden], stage)
+assert not os.path.exists(os.path.join(hidden, 'host-only'))
+assert sandbox.prepare_network_namespace()
+assert os.stat('/proc/self/ns/net').st_ino != host_net_namespace
+assert sandbox.drop_mount_authority()
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as ipv4:
+    ipv4.bind(('127.0.0.1', 0))
+    assert ipv4.getsockname()[0] == '127.0.0.1'
+if socket.has_ipv6:
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as ipv6:
+        ipv6.bind(('::1', 0))
+        assert ipv6.getsockname()[0] == '::1'
+
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    server.bind(socket_path)
+    server.listen(1)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(socket_path)
+        connection, _ = server.accept()
+        with connection:
+            client.sendall(b'local socket works')
+            assert connection.recv(64) == b'local socket works'
+finally:
+    server.close()
+    os.unlink(socket_path)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(hidden), str(stage), str(socket_path)],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_namespace_selection_uses_constrained_landlock_fallback(monkeypatch):
     capability = ns.NamespaceCapability(False, "write uid_map", "operation not permitted")
     decision = ns.NamespaceSandboxDecision(ns.NamespaceSandboxBackend.LANDLOCK, capability)
@@ -2026,7 +2117,7 @@ def test_worker_prepares_namespace_before_tee(monkeypatch):
     ]
 
 
-def test_pre_thread_setup_prepares_and_drops_namespace_authority(monkeypatch, tmp_path):
+def test_pre_thread_setup_prepares_namespace_without_dropping_authority(monkeypatch, tmp_path):
     calls = []
 
     class RecordingSandbox(ns.NamespaceSandbox):
@@ -2036,6 +2127,10 @@ def test_pre_thread_setup_prepares_and_drops_namespace_authority(monkeypatch, tm
 
         def drop_mount_authority(self):
             calls.append(("drop mount authority",))
+            return True
+
+        def prepare_network_namespace(self):
+            calls.append(("prepare network namespace",))
             return True
 
     sandbox = RecordingSandbox()
@@ -2048,14 +2143,38 @@ def test_pre_thread_setup_prepares_and_drops_namespace_authority(monkeypatch, tm
     monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
 
     assert (
-        build._prepare_namespace_sandbox_before_threads({"enable": True}, spec, str(tmp_path))
+        build._prepare_namespace_sandbox_before_threads(
+            {"enable": True, "allow_network": False}, spec, str(tmp_path)
+        )
         is sandbox
     )
-    assert calls == [
-        ("freeze",),
-        ("prepare", ["/usr/share/aclocal"], str(tmp_path)),
-        ("drop mount authority",),
-    ]
+    assert calls == [("freeze",), ("prepare", ["/usr/share/aclocal"], str(tmp_path))]
+
+
+def test_pre_thread_setup_keeps_network_namespace_when_allowed(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare",))
+            return True
+
+        def prepare_network_namespace(self):
+            calls.append(("prepare network namespace",))
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
+    sandbox = RecordingSandbox()
+    monkeypatch.setattr(ns, "freeze_namespace_sandbox_capability", lambda: None)
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    spec = SimpleNamespace(traverse=lambda **kwargs: [], prefix=tmp_path / "prefix")
+
+    build._prepare_namespace_sandbox_before_threads(
+        {"enable": True, "allow_network": True}, spec, str(tmp_path)
+    )
+    assert calls == [("prepare",)]
 
 
 def test_namespace_policy_validation_precedes_namespace_mutation(monkeypatch, tmp_path):
@@ -2155,6 +2274,10 @@ def test_installer_mounts_before_landlock(monkeypatch, tmp_path, available, exte
             calls.append(("drop mount authority",))
             return True
 
+        def prepare_network_namespace(self):
+            calls.append(("prepare network namespace",))
+            return True
+
         def apply(self, block_network=False):
             calls.append(("apply", block_network))
 
@@ -2168,14 +2291,23 @@ def test_installer_mounts_before_landlock(monkeypatch, tmp_path, available, exte
     )
     build._enable_sandbox({"enable": True, "allow_network": False}, spec, str(tmp_path))
     assert calls[0] == ("prepare", hidden_dirs, str(tmp_path))
+    if available:
+        assert calls[1] == ("prepare network namespace",)
+        assert calls[2] == ("drop mount authority",)
+    else:
+        assert ("prepare network namespace",) not in calls
     assert ("write", str(tmp_path)) in calls
     assert calls[-1] == ("apply", True)
 
 
-def test_recipe_setup_cannot_add_mounts_after_pre_thread_setup(monkeypatch, tmp_path):
+def test_namespace_authority_drops_after_recipe_setup(monkeypatch, tmp_path):
     calls = []
 
     class RecordingSandbox(ns.NamespaceSandbox):
+        def __init__(self):
+            super().__init__()
+            self._filesystem_policy_active = True
+
         def prepare_mount_tree(self, hidden_dirs, stage_path):
             calls.append(("prepare", hidden_dirs, stage_path))
             return True
@@ -2198,30 +2330,32 @@ def test_recipe_setup_cannot_add_mounts_after_pre_thread_setup(monkeypatch, tmp_
     monkeypatch.setattr(
         build,
         "_prepare_namespace_sandbox_before_threads",
-        lambda config, spec, stage_path: (
-            calls.append(("prepare", stage_path)),
-            calls.append(("drop mount authority",)),
-            sandbox,
-        )[-1],
+        lambda config, spec, stage_path: (calls.append(("prepare", stage_path)), sandbox)[-1],
     )
     monkeypatch.setattr(build, "Tee", lambda *args: calls.append(("tee", args)) or object())
     spec = SimpleNamespace(traverse=lambda **kw: [], prefix=tmp_path / "prefix")
 
     _, prepared_sandbox = build._start_tee_after_namespace(
-        {"enable": True}, "control-r", "control-w", "parent", "build.log", spec, str(tmp_path)
+        {"enable": True, "allow_network": True},
+        "control-r",
+        "control-w",
+        "parent",
+        "build.log",
+        spec,
+        str(tmp_path),
     )
     calls.append(("recipe-controlled setup",))
-    build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=prepared_sandbox)
+    build._enable_sandbox(
+        {"enable": True, "allow_network": True}, spec, str(tmp_path), sandbox=prepared_sandbox
+    )
 
-    assert calls[:4] == [
+    assert calls == [
         ("prepare", str(tmp_path)),
-        ("drop mount authority",),
         ("tee", ("control-r", "control-w", "parent", "build.log")),
         ("recipe-controlled setup",),
+        ("drop mount authority",),
     ]
-    assert not any(call[0] == "prepare" for call in calls[3:])
     assert calls.count(("drop mount authority",)) == 1
-    assert calls[-1] == ("apply", False)
 
 
 @pytest.mark.parametrize("external", [False, True])
