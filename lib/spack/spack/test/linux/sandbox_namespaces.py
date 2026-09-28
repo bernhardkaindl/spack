@@ -15,7 +15,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import spack.installer.build as build
 import spack.sandbox
 import spack.sandbox_namespaces as ns
 import spack.util.tty
@@ -71,6 +70,73 @@ def test_namespace_mapping_and_reentry(namespace_setup):
         "/proc/self/gid_map": "5678 5678 1",
     }
     assert libc.mount_calls == [(None, b"/", ns.MS_REC | ns.MS_PRIVATE)]
+
+
+def test_network_namespace_requires_mount_namespace_and_initializes_loopback(
+    namespace_setup, monkeypatch
+):
+    libc, _ = namespace_setup
+    monkeypatch.setattr(ns, "_network_namespace_entered_pids", set())
+    configured = []
+    monkeypatch.setattr(ns, "_configure_loopback", lambda: configured.append("loopback"))
+
+    with pytest.raises(ns.NamespaceSetupError, match="mount namespace is required"):
+        ns._enter_network_namespace(libc)
+
+    ns._enter_user_mount_namespace(libc)
+    ns._enter_network_namespace(libc)
+    ns._enter_network_namespace(libc)
+    assert libc.unshare_calls == [ns.CLONE_NEWUSER | ns.CLONE_NEWNS, ns.CLONE_NEWNET]
+    assert configured == ["loopback"]
+
+
+@pytest.mark.parametrize("failure", ["ipv4", "ipv6", "unix"])
+def test_loopback_configuration_reports_socket_failure(monkeypatch, failure):
+    import fcntl
+    import socket
+
+    class Endpoint:
+        def __init__(self, family):
+            self.family = family
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def fileno(self):
+            return 1
+
+        def bind(self, address):
+            self.address = address
+
+        def getsockname(self):
+            if (failure == "ipv4" and self.family == socket.AF_INET) or (
+                failure == "ipv6" and self.family == socket.AF_INET6
+            ):
+                return ("invalid", 0)
+            return self.address
+
+        def sendall(self, data):
+            pass
+
+        def recv(self, size):
+            return b"invalid"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(fcntl, "ioctl", lambda *args: None)
+    monkeypatch.setattr(socket, "socket", lambda family, kind: Endpoint(family))
+    monkeypatch.setattr(socket, "has_ipv6", True)
+    monkeypatch.setattr(
+        socket, "socketpair", lambda *args: (Endpoint(socket.AF_UNIX), Endpoint(socket.AF_UNIX))
+    )
+    with pytest.raises(ns.NamespaceSetupError) as error:
+        ns._configure_loopback()
+    assert error.value.operation == "configure network namespace loopback"
+    assert error.value.errno == (errno.EIO if failure == "unix" else errno.EADDRNOTAVAIL)
 
 
 def test_probe_bypasses_reentry_guard(namespace_setup):
@@ -1749,6 +1815,63 @@ def test_namespace_selection_does_not_preflight_landlock(monkeypatch):
     assert sandbox._landlock is None
 
 
+def test_live_network_namespace_loopback_and_unix_sockets(tmp_path):
+    if not ns.namespace_sandbox_available():
+        pytest.skip("user, mount, or network namespaces unavailable")
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    (hidden / "host-only").write_text("private")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    socket_path = tmp_path / "local.sock"
+    code = """
+import os
+import socket
+import sys
+from spack.sandbox_namespaces import NamespaceSandbox
+
+hidden, stage, socket_path = sys.argv[1:]
+host_net_namespace = os.stat('/proc/self/ns/net').st_ino
+sandbox = NamespaceSandbox()
+assert sandbox.prepare_mount_tree([hidden], stage)
+assert not os.path.exists(os.path.join(hidden, 'host-only'))
+assert sandbox.prepare_network_namespace()
+assert os.stat('/proc/self/ns/net').st_ino != host_net_namespace
+assert sandbox.drop_mount_authority()
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as ipv4:
+    ipv4.bind(('127.0.0.1', 0))
+    assert ipv4.getsockname()[0] == '127.0.0.1'
+if socket.has_ipv6:
+    with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as ipv6:
+        ipv6.bind(('::1', 0))
+        assert ipv6.getsockname()[0] == '::1'
+
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    server.bind(socket_path)
+    server.listen(1)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.connect(socket_path)
+        connection, _ = server.accept()
+        with connection:
+            client.sendall(b'local socket works')
+            assert connection.recv(64) == b'local socket works'
+finally:
+    server.close()
+    os.unlink(socket_path)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(hidden), str(stage), str(socket_path)],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_namespace_selection_uses_constrained_landlock_fallback(monkeypatch):
     capability = ns.NamespaceCapability(False, "write uid_map", "operation not permitted")
     decision = ns.NamespaceSandboxDecision(ns.NamespaceSandboxBackend.LANDLOCK, capability)
@@ -1780,90 +1903,6 @@ def test_namespace_selection_rejects_unconstrained_fallback(monkeypatch):
         spack.sandbox.SandboxError, match="unconstrained fallback is not permitted"
     ):
         spack.sandbox.get_sandbox()
-
-
-def test_pre_thread_setup_prepares_and_drops_namespace_authority(monkeypatch, tmp_path):
-    calls = []
-
-    class RecordingSandbox(ns.NamespaceSandbox):
-        def prepare_mount_tree(self, hidden_dirs, stage_path):
-            calls.append(("prepare", hidden_dirs, stage_path))
-            return True
-
-        def drop_mount_authority(self):
-            calls.append(("drop mount authority",))
-            return True
-
-    sandbox = RecordingSandbox()
-    spec = SimpleNamespace(traverse=lambda **kwargs: [], prefix=tmp_path / "prefix")
-    monkeypatch.setattr(
-        ns,
-        "freeze_namespace_sandbox_capability",
-        lambda: calls.append(("freeze",)) or ns.NamespaceCapability(True, None, None),
-    )
-    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
-
-    assert (
-        build._prepare_namespace_sandbox_before_threads({"enable": True}, spec, str(tmp_path))
-        is sandbox
-    )
-    assert calls == [
-        ("freeze",),
-        ("prepare", ["/usr/share/aclocal"], str(tmp_path)),
-        ("drop mount authority",),
-    ]
-
-
-def test_recipe_setup_cannot_add_mounts_after_pre_thread_setup(monkeypatch, tmp_path):
-    calls = []
-
-    class RecordingSandbox(ns.NamespaceSandbox):
-        def prepare_mount_tree(self, hidden_dirs, stage_path):
-            calls.append(("prepare", hidden_dirs, stage_path))
-            return True
-
-        def allow_read(self, path):
-            calls.append(("read", str(path)))
-
-        def allow_write(self, path):
-            calls.append(("write", str(path)))
-
-        def drop_mount_authority(self):
-            calls.append(("drop mount authority",))
-            return True
-
-        def apply(self, block_network=False):
-            calls.append(("apply", block_network))
-
-    sandbox = RecordingSandbox()
-    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
-    monkeypatch.setattr(
-        build,
-        "_prepare_namespace_sandbox_before_threads",
-        lambda config, spec, stage_path: (
-            calls.append(("prepare", stage_path)),
-            calls.append(("drop mount authority",)),
-            sandbox,
-        )[-1],
-    )
-    monkeypatch.setattr(build, "Tee", lambda *args: calls.append(("tee", args)) or object())
-    spec = SimpleNamespace(traverse=lambda **kw: [], prefix=tmp_path / "prefix")
-
-    _, prepared_sandbox = build._start_tee_after_namespace(
-        {"enable": True}, "control-r", "control-w", "parent", "build.log", spec, str(tmp_path)
-    )
-    calls.append(("recipe-controlled setup",))
-    build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=prepared_sandbox)
-
-    assert calls[:4] == [
-        ("prepare", str(tmp_path)),
-        ("drop mount authority",),
-        ("tee", ("control-r", "control-w", "parent", "build.log")),
-        ("recipe-controlled setup",),
-    ]
-    assert not any(call[0] == "prepare" for call in calls[3:])
-    assert calls.count(("drop mount authority",)) == 1
-    assert calls[-1] == ("apply", False)
 
 
 # Phases 4-6 have no implementation tests yet. They cover the policy-driven
