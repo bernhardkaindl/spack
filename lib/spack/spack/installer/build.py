@@ -433,6 +433,7 @@ class BuildRequest(NamedTuple):
     fake: bool
     install_source: bool
     run_tests: bool
+    verbose: bool
     log_path: str
     stop_before: Optional[str]
     stop_at: Optional[str]
@@ -467,6 +468,7 @@ def worker_function(
         return
 
     global_state.restore()
+    spack.util.tty.set_verbose(request.verbose)
 
     if sys.platform != "win32":
         # Isolate the process group to shield against Ctrl+C and enable safe killpg() cleanup. In

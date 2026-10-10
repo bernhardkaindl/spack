@@ -780,6 +780,7 @@ class PackageInstaller:
             fake=self.fake,
             install_source=self.install_source,
             run_tests=run_tests,
+            verbose=self.verbose,
             log_path=self.log_paths[dag_hash],
             stop_before=self.stop_before if is_root else None,
             stop_at=self.stop_at if is_root else None,

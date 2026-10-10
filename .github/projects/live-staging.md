@@ -116,6 +116,22 @@ Pending.
 
 ## Checkpoint 3: Git Progress Enhancement
 
+### Incremental Implementation Evidence
+
+Worker requests now carry installer verbosity explicitly. Git clone/fetch and
+recursive submodule commands request progress in verbose mode, and checkout
+accepts the shared progress option while preserving positional API compatibility.
+This is an incremental commit on `installer-ui/v1/live-staging-ledger`, not
+completion of this checkpoint: carriage-return rendering, parsing, and interactive
+collection independent of visibility remain open.
+
+Validation (2026-10-10):
+
+```text
+PYTHONSTARTUP= PYTHON_BASIC_REPL= PYTHONPATH="$PWD/lib/spack" .venv/bin/python -m pytest -q lib/spack/spack/test/git_fetch.py lib/spack/spack/test/util/git.py lib/spack/spack/test/installer/core.py
+122 passed, 16 skipped (expected older-Git full-repository cases).
+```
+
 - [ ] Add an explicit Git progress mode controlled by the existing installer verbose value; do not
   enable debug output.
 - [ ] In progress mode, pass `--progress`, omit `--quiet`, and preserve stderr through the worker

@@ -404,3 +404,12 @@ def test_change_jobs_commands_adjust_parallelism(temporary_store, mock_packages)
     initial = jobs_events[0][2]
     assert ("jobs_changed", initial + 1, initial + 1) in jobs_events
     assert jobs_events[-1][2] == initial  # target restored after the decrease
+
+
+def test_verbose_is_carried_to_build_request(temporary_store, mock_packages):
+    """The worker request preserves the existing installer verbose setting."""
+    spec = _make_concrete("trivial-install-test-package")
+    launcher = ScriptedLauncher({spec.name: Script()})
+    _install(launcher, spec, verbose=True)
+
+    assert launcher.requests[0].verbose

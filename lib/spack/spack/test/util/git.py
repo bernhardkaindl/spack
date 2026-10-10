@@ -151,3 +151,29 @@ def test_git_init_fetch_ommissions(mock_util_executable, git_version, ommitted_o
     spack.util.git.git_init_fetch(url, ref, git_exe=git)
     for opt in ommitted_opts:
         assert all(opt not in call for call in log)
+
+
+def test_git_init_fetch_progress(mock_util_executable):
+    """Progress mode forces Git transfer output without enabling debug mode."""
+    log, _, registered_responses = mock_util_executable
+    registered_responses["git --version"] = "2.34.1"
+    git = spack.util.git.GitExecutable("git")
+
+    spack.util.git.git_init_fetch("https://foo.git", "v1.2.3", progress=True, git_exe=git)
+
+    fetch = next(call for call in log if call.startswith("git fetch "))
+    assert "--progress" in fetch
+    assert "--quiet" not in fetch
+
+
+def test_git_clone_progress(mock_util_executable):
+    """Progress mode forces clone transfer output without enabling debug mode."""
+    log, _, registered_responses = mock_util_executable
+    registered_responses["git --version"] = "2.34.1"
+    git = spack.util.git.GitExecutable("git")
+
+    spack.util.git.git_clone("https://foo.git", progress=True, git_exe=git)
+
+    clone = next(call for call in log if "clone" in call)
+    assert "--progress" in clone
+    assert "--quiet" not in clone
