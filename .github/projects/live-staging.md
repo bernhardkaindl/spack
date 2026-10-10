@@ -1,3 +1,14 @@
+---
+name: live-staging
+description: "Live installer source-staging progress, verbose Git/submodule output, archive expansion, and interactive log visibility."
+status: active
+paths:
+  - lib/spack/spack/installer/**
+  - lib/spack/spack/fetch_strategy.py
+  - lib/spack/spack/stage.py
+  - lib/spack/spack/util/git.py
+---
+
 # Live Staging Progress Ledger
 
 This ledger tracks work to make source staging observable in the interactive installer UI. Agents
@@ -20,6 +31,9 @@ based only on code inspection.
 - [ ] Before creating a checkpoint commit, run its validation gate and record the exact commands
   and results in its evidence block.
 - [ ] Use GitButler for all branch, stack, commit, pull-request, and history operations.
+- [ ] Do not push or create pull requests unless the user explicitly requests it. GitHub cannot
+  create cross-repository stacked PRs; use the user's chosen incremental `develop`-based PR
+  workflow when that limitation applies.
 
 ## Goal
 
