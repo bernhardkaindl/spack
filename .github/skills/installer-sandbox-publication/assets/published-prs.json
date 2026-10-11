@@ -1,0 +1,51 @@
+[
+  {
+    "position": 1,
+    "number": 53186,
+    "branch": "namespace-sandbox/v2/01-backend-lifecycle",
+    "title": "installer-sandbox 1/18: establish Linux backend and lifecycle",
+    "body": "## Motivation\n\nInstalling from source means executing upstream build scripts and tools, not just placing files into an installation prefix. Those processes normally inherit the installing user's filesystem access: a faulty build can modify unrelated files, and a build can pick up host tools or libraries that are not declared in its dependency graph.\n\nThe installer sandbox aims to give build processes a deliberately limited filesystem view: selected compilers, tools, and dependency inputs, with writable access reserved for the paths needed to build and install the package. This reduces exposure of unrelated user files and makes accidental dependencies on the host environment easier to detect. Linux user and mount namespaces provide the new backend for that view; the series develops the policy and installer integration in separate phases.\n\n## Purpose\n\nEstablish the Linux backend and lifecycle for Spack's installer sandbox. When the installer builds a package rather than installing a precompiled package, sandbox setup must happen before build work, with a clear boundary between filesystem setup and execution.\n\n## Changes\n\n- Add a backend based on Linux user and mount namespaces alongside the sandbox API.\n- Probe backend capabilities explicitly and report unavailable operations rather than assuming namespace support.\n- Wire sandbox preparation into installer execution and drop mount authority after setup.\n- Cover entry-point wiring, setup failures, process lifecycle, and live masking where the host supports it.\n\n## Scope\n\nThis phase establishes the backend and its authority lifecycle. The following phases add validated mount plans and a filesystem policy describing which host inputs a build may see. It does not yet implement the complete input-selection policy."
+  },
+  {
+    "position": 2,
+    "number": 53189,
+    "branch": "namespace-sandbox/v2/02-mount-plan-validation",
+    "title": "installer-sandbox 2/18: validate and preserve namespace mount plans",
+    "body": "## Purpose\n\nGive the installer sandbox's Linux namespace backend a validated plan for filesystem setup. Hiding a parent directory must not make selected build inputs inaccessible, and a read-only sandbox view must not change permissions on the host source.\n\n## Changes\n\n- Build immutable, deterministic mount plans and reject inconsistent requests before changing namespace state.\n- Preserve selected host sources before masking their parent trees, then restore them in the sandbox view.\n- Carry explicit read-only or writable access modes through preservation and restoration.\n- Enforce read-only bind mounts and directory masks within the namespace, with precise setup-error reporting.\n- Exercise validation, syscall failures, preservation ordering, and lifecycle behavior.\n\n## Scope\n\nThis phase defines how to apply a filesystem view; it does not decide which compiler, dependency, or tool paths a build should receive. The next phase supplies the typed filesystem policy that compiles into these mount plans."
+  },
+  {
+    "position": 3,
+    "number": 53190,
+    "branch": "namespace-sandbox/v2/03-filesystem-policy",
+    "title": "installer-sandbox 3/18: define and compile filesystem policy",
+    "body": "## Purpose\n\nSeparate the installer's filesystem policy from the mount operations used by its Linux namespace backend. A build needs selected host inputs and writable working paths, while unrelated host trees should remain hidden. Those choices need validation before namespace setup begins.\n\n## Changes\n\n- Load versioned YAML policy data for sandbox inputs and Linux system headers.\n- Represent hidden roots, selected read-only and writable mounts, and generated paths in a typed filesystem policy.\n- Canonicalize source paths and reject missing inputs, conflicting classifications, and invalid generated paths.\n- Keep stage and mount-plan scratch paths separate from hidden roots.\n- Compile the validated policy into deterministic preservation, masking, and restoration requests. Revalidate policy objects at the compilation boundary.\n\n## Scope\n\nThis phase connects policy input to the mount-plan machinery introduced previously. It establishes the vocabulary and validation boundary for filesystem selection; the next phase uses that machinery to select compiler and build-tool inputs."
+  },
+  {
+    "position": 4,
+    "number": 53191,
+    "branch": "namespace-sandbox/v2/04-compiler-build-tools",
+    "title": "installer-sandbox 4/18: select compiler and build-tool inputs",
+    "body": "## Purpose\n\nMake the installer sandbox's filesystem policy usable for the selected toolchain. A compiler driver can invoke helper programs and read support files outside its own executable path; staging tools also need their interpreters and runtime dependencies. Hiding host directories without selecting those inputs would break otherwise valid builds.\n\n## Changes\n\n- Find the compilers selected by the dependency graph's language requirements, and query those drivers for helper programs, binutils, and compiler support files.\n- Select staging-tool helpers and runtime paths from their owning package prefixes and link/run dependencies.\n- Select Linux system headers and compatible GCC/libstdc++ include trees using the versioned header policy.\n- Track the requested executable spelling separately from its canonical source, so compiler aliases remain usable without exposing an entire host directory.\n- Extend filesystem policies and mount plans with validated replacement directory mounts and generated symlinks.\n- Cover compiler-query failures, tool selection, alias restoration, and invalid replacement or symlink requests.\n\n## Scope\n\nThis phase supplies compiler and build-tool inputs to the filesystem-policy machinery introduced previously. It does not activate the complete installer policy by itself. The next phase provides durable writable mount views, followed by policy preparation and activation in the installer."
+  },
+  {
+    "position": 5,
+    "number": 53194,
+    "branch": "namespace-sandbox/v2/05-writable-mount-views",
+    "title": "installer-sandbox 5/18: provide durable writable mount views",
+    "body": "## Purpose\n\nGive the sandbox's writable paths durable storage. Mount plans are built before the namespace is entered, so their scratch storage has to outlive plan construction and stay owned by the worker that uses it. A build also needs a read-only host view with explicit writable mounts, so host changes are limited to the paths it declares.\n\n## Changes\n\n- Allocate per-plan scratch storage that is attached to the worker and cleaned up with it.\n- Apply read-only host views, with explicit writable mounts layered on top.\n- Reject bad scratch bases, invalid policy flags, and mount endpoints that collide with scratch storage.\n- Detect source type changes between plan construction and setup.\n- Cover the behavior with live namespace tests.\n\n## Scope\n\nThis phase provides durable writable views for the policy built in the previous phases. It does not activate the complete installer policy by itself; the next phase prepares and activates it in the installer."
+  },
+  {
+    "position": 6,
+    "number": 53195,
+    "branch": "namespace-sandbox/v2/06-installer-policy",
+    "title": "installer-sandbox 6/18: prepare installer policy before workers",
+    "body": "## Purpose\n\nPrepare the installer's sandbox policy before any build worker starts. Build lifecycle paths must stay host-visible while the worker runs, and the host, device, and worker inputs have to be selected up front. Validating the namespace policy before worker threads begin means a bad policy fails before any build changes state.\n\n## Changes\n\n- Select host, device, and worker-state paths before compiling the policy, and canonicalize each category with its own checks.\n- Prepare and finalize the build lifecycle around the child namespace, so lifecycle paths are handled consistently.\n- Validate the namespace policy before worker threads start.\n- Carry the immutable selection into child builds.\n- Cover selection, lifecycle, and child-build behavior with tests.\n\n## Scope\n\nThis phase prepares the installer policy for workers. It builds on the durable writable mount views from the previous phase. The next phase activates the policy in production installs.\n"
+  },
+  {
+    "position": 7,
+    "number": 53196,
+    "branch": "namespace-sandbox/v2/07-production-activation",
+    "title": "installer-sandbox 7/18: activate production namespace policy",
+    "body": "Namespace-backed installs previously applied Landlock inside the build child on top of the namespace mount tree. This layer activates the complete selected filesystem policy in install children instead. The policy is compiled before any worker starts, and the child applies the namespace mount plan without a second Landlock policy. The backend exposes this state through `filesystem_policy_active`, and the legacy Landlock path is skipped while it is set.\n\nMount-plan scratch is now leased for the worker's lifetime and attached to the child's PID, so the lease follows the build process. Namespace-policy validation also rejects duplicate or conflicting paths in one pass, and a classified path outside the hidden roots fails before any build changes state.\n\n<!-- GitButler Footer Boundary Top -->\n---\nThis is PR 7/18 in a stack:\n- <kbd>&nbsp;7&nbsp;</kbd> #53196 👈\n- <kbd>&nbsp;6&nbsp;</kbd> #53195\n- <kbd>&nbsp;5&nbsp;</kbd> #53194\n- <kbd>&nbsp;4&nbsp;</kbd> #53191\n- <kbd>&nbsp;3&nbsp;</kbd> #53190\n- <kbd>&nbsp;2&nbsp;</kbd> #53189\n- <kbd>&nbsp;1&nbsp;</kbd> #53186\n<!-- GitButler Footer Boundary Bottom -->\n\n"
+  }
+]
