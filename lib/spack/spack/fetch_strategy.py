@@ -977,6 +977,7 @@ class GitFetchStrategy(VCSFetchStrategy):
 
         kwargs = {
             "debug": spack.config.CONFIG.get("config:debug"),
+            "progress": tty.is_verbose(),
             "git_exe": self.git,
             "dest": name,
         }
@@ -1036,7 +1037,10 @@ class GitFetchStrategy(VCSFetchStrategy):
 
         with working_dir(dest):
             for args in git_commands:
-                if not spack.config.CONFIG.get("config:debug"):
+                if tty.is_verbose():
+                    if args[1] == "update":
+                        args.insert(2, "--progress")
+                elif not spack.config.CONFIG.get("config:debug"):
                     args.insert(1, "--quiet")
                 git(*args)
 

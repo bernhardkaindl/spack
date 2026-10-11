@@ -12,11 +12,13 @@ import spack.error
 import spack.spec
 from spack.config import Configuration
 from spack.installer.base import ExitCode
+from spack.installer.build import BuildLifecycle
 from spack.installer.core import PackageInstaller, read_connection, write_connection
 from spack.installer.ui import ChangeJobs, SetEcho
 from spack.store import Store
 from spack.test.installer.conftest import (
     DrivingUI,
+    FakeBuild,
     RecordingUI,
     Script,
     ScriptedLauncher,
@@ -24,6 +26,12 @@ from spack.test.installer.conftest import (
     _make_concrete,
     _record,
 )
+
+
+@pytest.fixture(autouse=True)
+def disable_sandbox_for_event_loop_tests(mutable_config):
+    """Keep installer scheduling tests independent of the platform sandbox default."""
+    mutable_config.set("config:sandbox:enable", False)
 
 
 class TestPackageInstallerConstructor:
@@ -144,6 +152,47 @@ def test_build_output_streams_to_frontend(temporary_store, mock_packages):
     assert ("state_changed", dag_hash, "finished") in ui.events
 
 
+def test_namespace_activation_uses_fetch_cache(
+    temporary_store, mock_packages, mutable_config, monkeypatch, tmp_path
+):
+    import spack.installer.core as core
+    import spack.sandbox_namespaces as ns
+
+    fetch_cache = tmp_path / "fetch-cache"
+    fetch_cache.mkdir()
+    misc_cache = tmp_path / "misc-cache"
+    misc_cache.mkdir()
+    mutable_config.set("config:sandbox:enable", True)
+    mutable_config.set("config:source_cache", str(fetch_cache))
+    mutable_config.set("config:misc_cache", str(misc_cache))
+    monkeypatch.setattr(
+        ns,
+        "namespace_sandbox_decision",
+        lambda: ns.NamespaceSandboxDecision(
+            ns.NamespaceSandboxBackend.NAMESPACE, ns.NamespaceCapability(True, None, None)
+        ),
+    )
+    selected_fetch_caches = []
+
+    class Scratch:
+        def attach_worker(self, pid):
+            pass
+
+        def cleanup(self):
+            pass
+
+    def prepare(*args):
+        selected_fetch_caches.append(args[-1])
+        return object(), Scratch()
+
+    monkeypatch.setattr(core, "prepare_namespace_activation", prepare)
+    monkeypatch.setattr(FakeBuild, "pid", 1234)
+    spec = _make_concrete("trivial-install-test-package")
+    _install(ScriptedLauncher({spec.name: Script()}), spec)
+
+    assert selected_fetch_caches == [str(fetch_cache)]
+
+
 def test_package_installer_with_injected_ui(temporary_store, mock_packages):
     """The event loop runs against a custom InstallerUI frontend without any terminal code.
 
@@ -191,6 +240,7 @@ def test_capacity_serializes_launches(temporary_store, mock_packages):
     assert requests_at_finish == [1, 2]
 
 
+@pytest.mark.disable_clean_stage_check  # stopped builds retain their host-visible stage
 def test_stopped_at_phase_is_not_a_failure(temporary_store, mock_packages):
     """A build exiting with STOPPED_AT_PHASE raises nothing, reports no failure, and leaves no
     database record."""
@@ -340,6 +390,30 @@ def test_keyboard_interrupt_terminates_builds_and_flushes_db(temporary_store, mo
     assert _record(temporary_store, root) is None
 
 
+@pytest.mark.disable_clean_stage_check  # a failed launch keeps its private stage parent
+def test_launch_failure_finalizes_build_lifecycle(temporary_store, mock_packages, monkeypatch):
+    """When the launcher itself raises, the prepared build lifecycle is finalized as a build error
+    and the exception propagates."""
+    spec = _make_concrete("trivial-install-test-package")
+    finalized = []
+    original = BuildLifecycle.finalize
+
+    def record_finalize(self, exitcode):
+        finalized.append(exitcode)
+        original(self, exitcode)
+
+    monkeypatch.setattr(BuildLifecycle, "finalize", record_finalize)
+
+    def failing_launcher(request, jobserver):
+        raise RuntimeError("cannot launch")
+
+    with pytest.raises(RuntimeError, match="cannot launch"):
+        _install(failing_launcher, spec)
+
+    assert finalized == [ExitCode.BUILD_ERROR]
+    assert _record(temporary_store, spec) is None
+
+
 @pytest.mark.disable_clean_stage_check  # failed builds keep their log file in the stage root
 def test_failed_builds_reach_on_finished(temporary_store, mock_packages):
     """The loop notifies the frontend of the failed build ids before raising InstallError."""
@@ -404,3 +478,12 @@ def test_change_jobs_commands_adjust_parallelism(temporary_store, mock_packages)
     initial = jobs_events[0][2]
     assert ("jobs_changed", initial + 1, initial + 1) in jobs_events
     assert jobs_events[-1][2] == initial  # target restored after the decrease
+
+
+def test_verbose_is_carried_to_build_request(temporary_store, mock_packages):
+    """The worker request preserves the existing installer verbose setting."""
+    spec = _make_concrete("trivial-install-test-package")
+    launcher = ScriptedLauncher({spec.name: Script()})
+    _install(launcher, spec, verbose=True)
+
+    assert launcher.requests[0].verbose

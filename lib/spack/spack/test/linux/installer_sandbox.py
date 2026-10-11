@@ -1,0 +1,2416 @@
+# Copyright Spack Project Developers. See COPYRIGHT file for details.
+#
+# SPDX-License-Identifier: (Apache-2.0 OR MIT)
+"""Unit tests for the Linux installer build sandbox."""
+
+import copy
+import errno
+import io
+import os
+import pathlib
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+from typing import Any, List, Tuple, cast
+
+import pytest
+
+import spack.build_environment
+import spack.compilers.config
+import spack.concretize
+import spack.directory_layout
+import spack.error
+import spack.installer.build as build
+import spack.paths
+import spack.repo
+import spack.sandbox
+import spack.sandbox_base
+import spack.sandbox_namespaces as ns
+import spack.spec
+import spack.store
+import spack.util.ld_so_conf
+import spack.util.spack_yaml as syaml
+
+pytestmark = [
+    pytest.mark.skipif(
+        not spack.sandbox_base.installer_sandbox_supported(),
+        reason="the installer sandbox is not supported on this platform",
+    ),
+    # CPython 3.12+ warns when fork() runs while another thread is alive. The probe only
+    # forks a child that unshares namespaces and exits; os.fork is not scheduled for removal.
+    pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning"),
+]
+
+
+class MockSandbox(spack.sandbox.Sandbox):
+    def __init__(self):
+        self.read_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
+        self.write_calls: List[Tuple[pathlib.Path, pathlib.Path]] = []
+        self.apply_calls: List[bool] = []
+
+    def _allow_read(self, original: pathlib.Path, resolved: pathlib.Path):
+        self.read_calls.append((original, resolved))
+
+    def _allow_write(self, original: pathlib.Path, resolved: pathlib.Path):
+        self.write_calls.append((original, resolved))
+
+    def apply(self, block_network=False):
+        self.apply_calls.append(block_network)
+
+
+def _write_yaml(path: pathlib.Path, data: dict) -> None:
+    stream = io.StringIO()
+    syaml.dump(data, stream)
+    path.write_text(stream.getvalue(), encoding="utf-8")
+
+
+@pytest.mark.parametrize("failure", ["allocation", "compilation"])
+def test_prepare_namespace_activation_releases_scratch_on_failure(monkeypatch, tmp_path, failure):
+
+    spec = SimpleNamespace(prefix=tmp_path, traverse=lambda root=False: iter(()))
+    host_paths = SimpleNamespace(
+        hidden_roots=(),
+        replacement_roots=(),
+        host_runtime_paths=(),
+        device_paths=(),
+        read_only_paths=(),
+        writable_paths=(),
+    )
+    policy = ns.NamespaceFilesystemPolicy(())
+    cleaned = []
+    scratch = SimpleNamespace(path=str(tmp_path), cleanup=lambda: cleaned.append(True))
+    failure_error = OSError("scratch " + failure + " failed")
+
+    def allocate(*args, **kwargs):
+        if failure == "allocation":
+            raise failure_error
+        return scratch
+
+    def compile_plan(*args, **kwargs):
+        raise failure_error
+
+    monkeypatch.setattr(
+        build, "select_namespace_host_device_worker_paths", lambda *args, **kwargs: host_paths
+    )
+    monkeypatch.setattr(build, "compiler_driver_paths", lambda spec: [])
+    monkeypatch.setattr(build, "_selected_compilers", lambda spec: [])
+    monkeypatch.setattr(build, "stage_tool_paths", lambda: [])
+    monkeypatch.setattr(build, "install_tool_paths", lambda: [], raising=False)
+    monkeypatch.setattr(build, "tool_runtime_paths", lambda *args: [])
+    monkeypatch.setattr(build, "system_compiler_header_paths", lambda spec: ())
+    monkeypatch.setattr(build, "compiler_alias_symlink_paths", lambda spec: [])
+    monkeypatch.setattr(
+        build, "namespace_selected_filesystem_policy_from_inputs", lambda *args: policy
+    )
+    monkeypatch.setattr(ns, "allocate_namespace_mount_plan_scratch", allocate)
+    monkeypatch.setattr(build, "namespace_filesystem_policy_and_plan_from_inputs", compile_plan)
+
+    with pytest.raises(OSError) as error:
+        build.prepare_namespace_activation(
+            {}, spec, str(tmp_path), "", (), str(tmp_path), str(tmp_path / "cache")
+        )
+    assert error.value is failure_error
+    assert cleaned == ([] if failure == "allocation" else [True])
+
+
+def test_namespace_policy_data_is_loaded_from_yaml():
+
+    policy = build._load_sandbox_policy(build.SANDBOX_POLICY_PATH)
+    header_policy = build._load_linux_header_policy(build.LINUX_HEADER_POLICY_PATH)
+
+    assert "commands" not in policy
+    assert policy["hidden_roots"]
+    assert policy["empty_directory_paths"] == [
+        {"path": "/usr/share/aclocal", "unless_external_specs": ["autoconf"]}
+    ]
+    assert policy["external_prefix_read_paths"] == ["include", "lib", "lib64", "share"]
+    assert policy["external_spec_read_paths"] == [
+        {"spec": "llvm", "paths": ["/usr/bin/clang*", "/usr/bin/llvm*", "/usr/lib/llvm-*"]}
+    ]
+    assert policy["replacement_roots"] == ["/tmp", "/var/tmp"]
+    assert "/dev/urandom" in policy["device_nodes"]
+    assert policy["tmpfs_paths"] == ["/dev/shm"]
+    assert policy["mount_plan_scratch_paths"] == ["/run/lock", "/var", "/opt"]
+    assert policy["device_symlinks"]["/dev/fd"] == "/proc/self/fd"
+    assert "tar" in policy["stage_programs"]
+    assert "ar" in policy["binutils_programs"]
+    assert "objdump" in policy["binutils_programs"]
+    assert "cat" in policy["coreutils_file_programs"]
+    assert "chmod" in policy["coreutils_install_programs"]
+    assert "expr" in policy["coreutils_util_programs"]
+    assert "ls" in policy["coreutils_file_programs"]
+    assert "readlink" in policy["coreutils_file_programs"]
+    assert "gencat" in policy["build_utilities_programs"]
+    assert "make" in policy["build_utilities_programs"]
+    assert "rm" in policy["coreutils_install_programs"]
+    assert "sed" in policy["script_interpreter_programs"]
+    assert "sort" in policy["coreutils_util_programs"]
+    assert "cat" not in policy["stage_programs"]
+    assert "chmod" not in policy["stage_programs"]
+    assert header_policy["version"] == 1
+    assert header_policy["system_include_root"] == "/usr/include"
+    assert header_policy["compiler_roots"] == ["/usr/lib/gcc", "/usr/lib64/gcc"]
+
+
+@pytest.mark.parametrize(
+    "mutation, expected_key",
+    [
+        (lambda policy: policy.update(version=2), "version"),
+        (lambda policy: policy.update(hidden_roots="/usr/bin"), "hidden_roots"),
+        (
+            lambda policy: policy.update(empty_directory_paths=[{"path": "relative"}]),
+            "empty_directory_paths[0].path",
+        ),
+        (
+            lambda policy: policy.update(
+                empty_directory_paths=[{"path": "/tmp", "unless_external_specs": ["@"]}]
+            ),
+            "empty_directory_paths[0].unless_external_specs",
+        ),
+        (
+            lambda policy: policy.update(external_prefix_read_paths=["../etc"]),
+            "external_prefix_read_paths",
+        ),
+        (
+            lambda policy: policy.update(external_prefix_read_paths=["."]),
+            "external_prefix_read_paths",
+        ),
+        (
+            lambda policy: policy.update(
+                external_spec_read_paths=[{"spec": "llvm", "paths": ["../usr/lib/llvm-*"]}]
+            ),
+            "external_spec_read_paths[0].paths",
+        ),
+        (lambda policy: policy.update(external_spec_read_paths=None), "external_spec_read_paths"),
+        (
+            lambda policy: policy.update(external_spec_read_paths=[None]),
+            "external_spec_read_paths[0]",
+        ),
+        (
+            lambda policy: policy.update(external_spec_read_paths=[{"paths": []}]),
+            "external_spec_read_paths[0].spec",
+        ),
+        (
+            lambda policy: policy.update(external_spec_read_paths=[{"spec": "@", "paths": []}]),
+            "external_spec_read_paths[0].spec",
+        ),
+        (
+            lambda policy: policy.update(external_spec_read_paths=[{"spec": "llvm"}]),
+            "external_spec_read_paths[0].paths",
+        ),
+        (
+            lambda policy: policy.update(
+                external_spec_read_paths=[{"spec": "llvm", "paths": [1]}]
+            ),
+            "external_spec_read_paths[0].paths",
+        ),
+        (
+            lambda policy: policy.update(
+                external_spec_read_paths=[{"spec": "llvm", "paths": ["/usr/../etc/*"]}]
+            ),
+            "external_spec_read_paths[0].paths",
+        ),
+        (lambda policy: policy.update(tmpfs_paths=["relative"]), "tmpfs_paths"),
+        (
+            lambda policy: policy.update(mount_plan_scratch_paths=["relative"]),
+            "mount_plan_scratch_paths",
+        ),
+        (lambda policy: policy.update(device_symlinks=[]), "device_symlinks"),
+        (lambda policy: policy.update(device_symlinks={"/dev/fd": "relative"}), "device_symlinks"),
+        (
+            lambda policy: policy["compiler_driver_aliases"].update(cxx="g++"),
+            "compiler_driver_aliases",
+        ),
+    ],
+)
+def test_namespace_policy_rejects_malformed_data(tmp_path: pathlib.Path, mutation, expected_key):
+
+    policy = copy.deepcopy(build._load_sandbox_policy(build.SANDBOX_POLICY_PATH))
+    mutation(policy)
+    policy_path = tmp_path / "sandbox.yaml"
+    _write_yaml(policy_path, policy)
+
+    with pytest.raises(spack.error.InstallError, match=str(policy_path)) as error:
+        build._load_sandbox_policy(str(policy_path))
+    assert expected_key in str(error.value)
+
+
+@pytest.mark.parametrize("unsafe_path", ["../stdio.h", "/etc/passwd", "foo\\..\\bar.h"])
+def test_linux_header_policy_rejects_unsafe_relative_paths(
+    tmp_path: pathlib.Path, unsafe_path: str
+):
+
+    policy = copy.deepcopy(build._load_linux_header_policy(build.LINUX_HEADER_POLICY_PATH))
+    policy["glibc"]["files"][0] = unsafe_path
+    policy_path = tmp_path / "linux-header-policy.yaml"
+    _write_yaml(policy_path, policy)
+
+    with pytest.raises(spack.error.InstallError, match=str(policy_path)) as error:
+        build._load_linux_header_policy(str(policy_path))
+    assert "glibc.files" in str(error.value)
+
+
+def test_linux_header_policy_rejects_relative_compiler_roots(tmp_path: pathlib.Path):
+
+    policy = _minimal_header_policy(tmp_path)
+    policy["compiler_roots"] = ["relative"]
+    policy_path = tmp_path / "linux-header-policy.yaml"
+    _write_yaml(policy_path, policy)
+
+    with pytest.raises(spack.error.InstallError) as error:
+        build._load_linux_header_policy(str(policy_path))
+    assert str(policy_path) in str(error.value)
+    assert "compiler_roots" in str(error.value)
+
+
+def _minimal_header_policy(include_root: pathlib.Path, maximum_major: int = 15) -> dict:
+    return {
+        "version": 1,
+        "system_include_root": str(include_root),
+        "compiler_roots": [str(include_root / "gcc")],
+        "glibc": {
+            "files": ["stdio.h"],
+            "directories": ["arpa"],
+            "target_files": ["fpu_control.h"],
+            "target_directories": ["bits", "sys"],
+        },
+        "linux": {"directories": ["linux"], "target_directories": ["asm"]},
+        "libstdcxx": {"maximum_major_for_non_gcc": maximum_major},
+    }
+
+
+def _compiler_spec(name: str, compilers: dict) -> SimpleNamespace:
+    return SimpleNamespace(name=name, extra_attributes={"compilers": compilers})
+
+
+@pytest.mark.parametrize("result", [None, (1, "/usr/bin/cc1"), (0, "cc1"), (0, "/usr/bin/cc1\n")])
+def test_compiler_query_failure_and_absolute_result(monkeypatch, tmp_path, result):
+
+    absolute_path = str(tmp_path / "cc1")
+
+    def query(arguments, **kwargs):
+        assert arguments == ["/usr/bin/gcc", "-print-prog-name=cc1"]
+        if result is None:
+            raise OSError("compiler unavailable")
+        return SimpleNamespace(
+            returncode=result[0], stdout=result[1].replace("/usr/bin/cc1", absolute_path)
+        )
+
+    monkeypatch.setattr(build.subprocess, "run", query)
+    expected = absolute_path if result == (0, "/usr/bin/cc1\n") else None
+    assert build._compiler_query("/usr/bin/gcc", "-print-prog-name=cc1") == expected
+
+
+def test_selected_compilers_uses_language_edges_and_deduplicates(monkeypatch):
+
+    compiler = _compiler_spec(
+        "llvm", {"c": "/usr/bin/clang", "cxx": "/usr/bin/clang++", "fortran": "/usr/bin/flang"}
+    )
+    edge = SimpleNamespace(spec=compiler, virtuals=("c",))
+    root = SimpleNamespace(
+        name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge, edge]
+    )
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [root]))
+    monkeypatch.setattr(spack.compilers.config, "supported_compilers", lambda *, repo: ["gcc"])
+
+    selected = build._selected_compilers(spec, {"compiler_languages": ["c", "cxx", "fortran"]})
+
+    assert [(language, path) for language, path, _ in selected] == [("c", "/usr/bin/clang")]
+
+
+def test_selected_compilers_includes_supported_compiler_nodes(monkeypatch):
+
+    compiler = _compiler_spec(
+        "gcc", {"c": "/usr/bin/gcc", "cxx": "/usr/bin/g++", "fortran": "/usr/bin/gfortran"}
+    )
+    compiler.edges_to_dependencies = lambda: []
+    spec = SimpleNamespace(traverse=lambda: [compiler])
+    monkeypatch.setattr(spack.compilers.config, "supported_compilers", lambda *, repo: ["gcc"])
+
+    selected = build._selected_compilers(spec, {"compiler_languages": ["c", "cxx", "fortran"]})
+
+    assert [(language, path) for language, path, _ in selected] == [
+        ("c", "/usr/bin/gcc"),
+        ("cxx", "/usr/bin/g++"),
+        ("fortran", "/usr/bin/gfortran"),
+    ]
+
+
+def test_compiler_support_paths_ignores_bare_names_and_spack_binutils(monkeypatch):
+
+    policy = {
+        "compiler_programs": ["cc1", "cc1plus"],
+        "binutils_programs": ["as", "ld"],
+        "compiler_files": ["liblto_plugin.so"],
+    }
+    responses = {
+        "-print-prog-name=cc1": "/usr/libexec/cc1\n",
+        "-print-prog-name=cc1plus": "cc1plus\n",
+        "-print-prog-name=as": "/opt/libexec/spack/as\n",
+        "-print-prog-name=ld": "/usr/bin/ld\n",
+        "-print-file-name=liblto_plugin.so": "/usr/lib/liblto_plugin.so\n",
+    }
+    queries = []
+
+    def run(command, **kwargs):
+        queries.append(command[1])
+        return SimpleNamespace(returncode=0, stdout=responses[command[1]])
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+
+    paths = build.compiler_support_paths("/usr/bin/cc", policy)
+
+    assert queries == list(responses)
+    assert paths == [
+        build.ResolvedSandboxPath("cc1", "/usr/libexec/cc1"),
+        build.ResolvedSandboxPath("ld", str(pathlib.Path("/usr/bin/ld").resolve())),
+        build.ResolvedSandboxPath("liblto_plugin.so", "/usr/lib/liblto_plugin.so"),
+    ]
+
+
+def test_gcc_installation_uses_configured_compiler_roots(tmp_path: pathlib.Path, monkeypatch):
+
+    installation = tmp_path / "usr" / "lib" / "gcc" / "x86_64-linux-gnu" / "14"
+    library = installation / "libgcc.a"
+    library.parent.mkdir(parents=True)
+    library.touch()
+    monkeypatch.setattr(
+        build.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=f"{library}\n"),
+    )
+
+    policy = {"compiler_roots": [str(tmp_path / "usr" / "lib" / "gcc")]}
+
+    assert build._gcc_installation("cc", policy) == installation
+
+
+def test_compiler_driver_paths_preserve_alias_spellings(tmp_path: pathlib.Path, monkeypatch):
+
+    compiler = tmp_path / "bin" / "clang"
+    compiler.parent.mkdir()
+    compiler.touch()
+    compiler_spec = _compiler_spec("llvm", {"c": str(compiler)})
+    edge = SimpleNamespace(spec=compiler_spec, virtuals=("c",))
+    root = SimpleNamespace(name="root", edges_to_dependencies=lambda: [edge])
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [root]))
+    policy = {"compiler_languages": ["c"], "compiler_driver_aliases": {"c": ["cc", "gcc"]}}
+    monkeypatch.setattr(spack.compilers.config, "supported_compilers", lambda *, repo: [])
+
+    assert build.compiler_driver_paths(spec, policy) == [
+        build.ResolvedSandboxPath(str(compiler), str(compiler)),
+        build.ResolvedSandboxPath(str(compiler.parent / "cc"), str(compiler)),
+        build.ResolvedSandboxPath(str(compiler.parent / "gcc"), str(compiler)),
+    ]
+    assert build.compiler_alias_symlink_paths(spec, policy) == [
+        ns.NamespaceGeneratedSymlink(str(compiler.parent / "cc"), str(compiler)),
+        ns.NamespaceGeneratedSymlink(str(compiler.parent / "gcc"), str(compiler)),
+    ]
+
+
+def test_compiler_driver_paths_give_generic_aliases_to_first_compiler(monkeypatch, tmp_path):
+
+    compiler_bin = tmp_path / "bin"
+    compiler_bin.mkdir()
+    primary = compiler_bin / "g++-16"
+    secondary = compiler_bin / "g++-15"
+    primary.touch()
+    secondary.touch()
+    selected = [
+        ("cxx", str(primary), SimpleNamespace()),
+        ("cxx", str(secondary), SimpleNamespace()),
+    ]
+    monkeypatch.setattr(build, "_selected_compilers", lambda spec, policy: selected)
+    policy = {"compiler_driver_aliases": {"cxx": ["c++", "g++"]}}
+
+    assert build.compiler_driver_paths(cast(spack.spec.Spec, object()), policy) == [
+        build.ResolvedSandboxPath(str(primary), str(primary)),
+        build.ResolvedSandboxPath(str(compiler_bin / "c++"), str(primary)),
+        build.ResolvedSandboxPath(str(compiler_bin / "g++"), str(primary)),
+        build.ResolvedSandboxPath(str(secondary), str(secondary)),
+    ]
+
+
+def test_executable_support_paths_select_file_magic_and_cpp_cc1(
+    tmp_path: pathlib.Path, monkeypatch
+):
+
+    magic = tmp_path / "magic.mgc"
+    magic.touch()
+    policy = {"file_runtime_read_paths": [str(magic)]}
+    monkeypatch.setattr(
+        build.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="/usr/lib/cc1\n"),
+    )
+
+    assert build.executable_support_paths("/usr/bin/file", policy) == [
+        build.ResolvedSandboxPath(str(magic), str(magic))
+    ]
+    assert build.executable_support_paths("/usr/bin/cpp", policy) == [
+        build.ResolvedSandboxPath("cc1", "/usr/lib/cc1")
+    ]
+
+
+def test_stage_tool_paths_include_helper_chain_and_git_exec_path(monkeypatch):
+
+    policy = {"stage_programs": ["gunzip", "git"]}
+    tools = {
+        "gunzip": "/tools/gunzip",
+        "gzip": "/tools/gzip",
+        "sh": "/tools/sh",
+        "git": "/tools/git",
+    }
+    monkeypatch.setattr(build, "which_string", tools.get)
+    monkeypatch.setattr(
+        build.subprocess,
+        "run",
+        lambda command, **kwargs: SimpleNamespace(returncode=0, stdout="/tools/git-core\n"),
+    )
+
+    # Sources go through realpath, which maps POSIX paths to drive-rooted paths on Windows.
+    assert build.stage_tool_paths(policy) == [
+        build.ResolvedSandboxPath("gunzip", os.path.realpath("/tools/gunzip")),
+        build.ResolvedSandboxPath("git", os.path.realpath("/tools/git")),
+        build.ResolvedSandboxPath("/tools/git --exec-path", os.path.realpath("/tools/git-core")),
+        build.ResolvedSandboxPath("gzip", os.path.realpath("/tools/gzip")),
+        build.ResolvedSandboxPath("sh", os.path.realpath("/tools/sh")),
+    ]
+
+
+def test_install_tool_paths_union_policy_program_groups(monkeypatch, tmp_path):
+
+    groups = {
+        "binutils_programs": ["ar", "ld"],
+        "coreutils_install_programs": ["chmod", "rm"],
+        "coreutils_file_programs": ["cat", "ls"],
+        "coreutils_util_programs": ["expr", "sort"],
+        "build_utilities_programs": ["make", "git"],
+        "script_interpreter_programs": ["awk", "sed"],
+    }
+    tool_dir = tmp_path / "bin"
+    tool_dir.mkdir()
+    tools = {}
+    for program in (program for group in groups.values() for program in group):
+        tools[program] = tool_dir / program
+        tools[program].touch()
+    monkeypatch.setattr(
+        build, "which_string", lambda name: str(tools[name]) if name in tools else None
+    )
+    monkeypatch.setattr(build, "git_support_paths", lambda path: [])
+
+    selected = build.install_tool_paths(groups)
+
+    assert {entry.spelling for entry in selected} == {
+        program for group in groups.values() for program in group
+    }
+
+
+def test_tool_alias_symlink_paths_restore_selected_spelling(monkeypatch, tmp_path):
+
+    tool_dir = tmp_path / "usr" / "bin"
+    tool_dir.mkdir(parents=True)
+    shell = tool_dir / "sh"
+    dash = tool_dir / "dash"
+    dash.touch()
+    shell.symlink_to("dash")
+    monkeypatch.setattr(build, "which_string", lambda name: str(shell) if name == "sh" else None)
+
+    entry = build.ResolvedSandboxPath("sh", str(dash.resolve()))
+    assert build.tool_alias_symlink_paths((entry,), (str(tool_dir),)) == [
+        ns.NamespaceGeneratedSymlink(str(shell), str(dash.resolve()))
+    ]
+
+
+def test_tool_runtime_paths_include_owner_and_link_run_dependencies(tmp_path: pathlib.Path):
+
+    tool_prefix = tmp_path / "tar"
+    tool = tool_prefix / "bin" / "tar"
+    tool.parent.mkdir(parents=True)
+    tool.touch()
+    dependency = SimpleNamespace(prefix=tmp_path / "libiconv")
+    owner = SimpleNamespace(
+        prefix=tool_prefix, external=False, traverse=lambda **kwargs: [dependency]
+    )
+    unrelated = SimpleNamespace(prefix=tmp_path / "unrelated", external=False)
+    external_owner = SimpleNamespace(
+        prefix=tmp_path,
+        external=True,
+        traverse=lambda **kwargs: [SimpleNamespace(prefix=tmp_path / "external-dependency")],
+    )
+    spec = cast(
+        spack.spec.Spec, SimpleNamespace(traverse=lambda: [owner, unrelated, external_owner])
+    )
+
+    assert build.tool_runtime_paths(spec, [build.ResolvedSandboxPath("tar", str(tool))]) == [
+        str(tool_prefix),
+        str(dependency.prefix),
+    ]
+
+
+def _system_gcc_layout(tmp_path: pathlib.Path):
+    install_root = tmp_path / "lib" / "gcc"
+    target = install_root / "test-linux-gnu"
+    (target / "15").mkdir(parents=True)
+    (target / "16").mkdir()
+    include_root = tmp_path / "include"
+    (include_root / "c++" / "15").mkdir(parents=True)
+    (include_root / "c++" / "16").mkdir()
+    return target, include_root
+
+
+@pytest.mark.parametrize("compiler_name, expected_version", [("llvm", "15"), ("gcc", "16")])
+def test_system_compiler_headers_select_libstdcxx_policy_version(
+    tmp_path: pathlib.Path, monkeypatch, compiler_name: str, expected_version: str
+):
+
+    target, include_root = _system_gcc_layout(tmp_path)
+    compiler = _compiler_spec(compiler_name, {"cxx": "/usr/bin/clang++"})
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [root]))
+    policy = _minimal_header_policy(include_root)
+    monkeypatch.setattr(build, "_gcc_installation", lambda compiler_path, policy: target / "16")
+
+    paths = build.system_compiler_header_paths(spec, policy)
+
+    assert str(include_root / "stdio.h") in paths
+    assert str(include_root / "linux") in paths
+    assert str(include_root / "c++" / expected_version) in paths
+    assert str(include_root / "c++" / ("16" if expected_version == "15" else "15")) not in paths
+
+
+def test_system_compiler_headers_ignore_non_system_compilers(tmp_path: pathlib.Path):
+
+    compiler = _compiler_spec("llvm", {"cxx": str(tmp_path / "clang++")})
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [root]))
+
+    assert build.system_compiler_header_paths(spec, _minimal_header_policy(tmp_path)) == []
+
+
+def test_gcc_installation_mask_excludes_permitted_cxx_installation(
+    tmp_path: pathlib.Path, monkeypatch
+):
+
+    target, include_root = _system_gcc_layout(tmp_path)
+    compiler = _compiler_spec("llvm", {"cxx": "/usr/bin/clang++"})
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [root]))
+    monkeypatch.setattr(build, "_gcc_installation", lambda compiler_path, policy: target / "16")
+
+    assert build.gcc_installation_dirs_to_mask(spec, _minimal_header_policy(include_root)) == [
+        str(target / "16")
+    ]
+
+
+@pytest.mark.parametrize("failure", ["oserror", "failed", "relative"])
+def test_git_support_paths_ignore_unusable_exec_path(monkeypatch, failure):
+    def run(*args, **kwargs):
+        if failure == "oserror":
+            raise OSError("git unavailable")
+        if failure == "failed":
+            return SimpleNamespace(returncode=1, stdout="/usr/lib/git-core\n")
+        return SimpleNamespace(returncode=0, stdout="git-core\n")
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+
+    assert build.git_support_paths("/usr/bin/git") == []
+
+
+@pytest.mark.parametrize("failure", ["oserror", "failed", "relative"])
+def test_gcc_installation_ignores_unusable_driver_output(monkeypatch, tmp_path, failure):
+    def run(*args, **kwargs):
+        if failure == "oserror":
+            raise OSError("driver unavailable")
+        if failure == "failed":
+            return SimpleNamespace(returncode=1, stdout=f"{tmp_path}/libgcc.a\n")
+        return SimpleNamespace(returncode=0, stdout="libgcc.a\n")
+
+    monkeypatch.setattr(build.subprocess, "run", run)
+
+    assert build._gcc_installation("cc", {"compiler_roots": [str(tmp_path)]}) is None
+
+
+def test_versioned_directories_skip_files_and_unversioned_entries(tmp_path: pathlib.Path):
+    (tmp_path / "14").mkdir()
+    (tmp_path / "14.2").mkdir()
+    (tmp_path / "15").touch()
+    (tmp_path / "unversioned").mkdir()
+
+    result = build._versioned_directories_by_major(tmp_path)
+
+    assert result == {14: [tmp_path / "14", tmp_path / "14.2"]}
+    assert build._versioned_directories_by_major(tmp_path / "missing") == {}
+
+
+@pytest.mark.parametrize(
+    "value, expected", [("15.1", 15), ("16", 16), ("abc", None), (None, None)]
+)
+def test_major_version_parses_leading_number(value, expected):
+    assert build._major_version(value) == expected
+
+
+def test_stage_tool_paths_skip_helpers_that_are_not_installed(monkeypatch):
+    available = {"gunzip": "/tools/gunzip"}
+    monkeypatch.setattr(build, "which_string", lambda name: available.get(name))
+
+    assert build.stage_tool_paths({"stage_programs": ["gunzip"]}) == [
+        build.ResolvedSandboxPath("gunzip", os.path.realpath("/tools/gunzip"))
+    ]
+
+
+def test_tool_runtime_paths_ignore_relative_tool_sources(tmp_path: pathlib.Path):
+    prefix = tmp_path / "tar"
+    node = SimpleNamespace(prefix=str(prefix), traverse=lambda root=True, deptype=None: iter(()))
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [node]))
+    tool = build.ResolvedSandboxPath("tar", "relative/tar")
+
+    assert build.tool_runtime_paths(spec, [tool]) == []
+
+
+def test_policy_paths_reject_absolute_and_parent_entries(tmp_path: pathlib.Path):
+    for value in ("/usr/include", "../include"):
+        with pytest.raises(spack.error.InstallError, match="Invalid relative Linux header policy"):
+            build._policy_paths(tmp_path, [value])
+
+
+def test_permitted_gcc_installation_requires_reported_driver_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(build, "_gcc_installation", lambda compiler_path, policy: None)
+    compiler = _compiler_spec("gcc", {})
+
+    assert (
+        build._permitted_gcc_installation("cc", compiler, _minimal_header_policy(tmp_path)) is None
+    )
+
+
+def test_permitted_gcc_installation_rejects_unversioned_installation(monkeypatch, tmp_path):
+    installation = tmp_path / "lib" / "gcc" / "target" / "unversioned"
+    installation.mkdir(parents=True)
+    monkeypatch.setattr(build, "_gcc_installation", lambda compiler_path, policy: installation)
+    compiler = _compiler_spec("llvm", {})
+
+    assert (
+        build._permitted_gcc_installation("cc", compiler, _minimal_header_policy(tmp_path)) is None
+    )
+
+
+def test_system_compiler_headers_skip_unresolved_compilers(monkeypatch, tmp_path):
+    target, include_root = _system_gcc_layout(tmp_path)
+    c_compiler = _compiler_spec("gcc", {"c": "/usr/bin/gcc"})
+    cxx_compiler = _compiler_spec("llvm", {"cxx": "/usr/bin/clang++"})
+    edges = [
+        SimpleNamespace(spec=c_compiler, virtuals=("c",)),
+        SimpleNamespace(spec=cxx_compiler, virtuals=("cxx",)),
+    ]
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: edges)
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [root]))
+    policy = _minimal_header_policy(include_root)
+
+    monkeypatch.setattr(build, "_gcc_installation", lambda compiler_path, policy: None)
+    assert str(include_root / "stdio.h") in build.system_compiler_header_paths(spec, policy)
+    assert not any("c++" in path for path in build.system_compiler_header_paths(spec, policy))
+
+    monkeypatch.setattr(build, "_gcc_installation", lambda compiler_path, policy: target / "16")
+    monkeypatch.setattr(build, "_permitted_gcc_installation", lambda *args: None)
+    paths = build.system_compiler_header_paths(spec, policy)
+    assert not any("c++" in path for path in paths)
+
+
+def test_gcc_installation_mask_is_empty_without_permitted_installation(monkeypatch, tmp_path):
+    compiler = _compiler_spec("llvm", {"cxx": "/usr/bin/clang++"})
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [root]))
+    monkeypatch.setattr(build, "_permitted_gcc_installation", lambda *args: None)
+
+    assert build.gcc_installation_dirs_to_mask(spec, _minimal_header_policy(tmp_path)) == []
+
+
+def test_gcc_installation_mask_ignores_non_system_cxx_compilers(tmp_path: pathlib.Path):
+    compiler = _compiler_spec("llvm", {"cxx": str(tmp_path / "clang++")})
+    edge = SimpleNamespace(spec=compiler, virtuals=("cxx",))
+    root = SimpleNamespace(name="root", extra_attributes={}, edges_to_dependencies=lambda: [edge])
+    spec = cast(spack.spec.Spec, SimpleNamespace(traverse=lambda: [root]))
+
+    assert build.gcc_installation_dirs_to_mask(spec, _minimal_header_policy(tmp_path)) == []
+
+
+@pytest.mark.parametrize(
+    "entrypoint", ["_prepare_namespace_sandbox_before_threads", "_enable_sandbox"]
+)
+def test_sandbox_creation_error_is_install_error(monkeypatch, entrypoint):
+
+    monkeypatch.setattr(ns, "freeze_namespace_sandbox_capability", lambda: None)
+
+    def unavailable():
+        raise spack.sandbox.SandboxError("backend unavailable")
+
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", unavailable)
+    with pytest.raises(
+        spack.error.InstallError, match="Cannot enable build sandbox: backend unavailable"
+    ):
+        getattr(build, entrypoint)({"enable": True}, None, "unused-stage")
+
+
+@pytest.mark.parametrize("prepared, dropped", [(False, True), (True, False)])
+def test_namespace_preparation_reports_failure(monkeypatch, prepared, dropped, capsys):
+
+    class FailedNamespace(ns.NamespaceSandbox):
+        filesystem_policy_active = False
+
+        def __init__(self):
+            pass
+
+        def prepare_mount_tree(self, paths, stage_path):
+            assert paths == ["/usr/share/aclocal"]
+            assert stage_path == "unused-stage"
+            return prepared
+
+        def drop_mount_authority(self):
+            assert prepared
+            return dropped
+
+    sandbox = FailedNamespace()
+    monkeypatch.setattr(ns, "freeze_namespace_sandbox_capability", lambda: None)
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    spec = type("Spec", (), {"traverse": lambda self, **kwargs: []})()
+    if prepared:
+        with pytest.raises(
+            spack.error.InstallError, match="Cannot drop namespace mount authority"
+        ):
+            build._enable_sandbox({"enable": True, "allow_network": True}, spec, "unused-stage")
+    else:
+        assert (
+            build._prepare_namespace_sandbox_before_threads({"enable": True}, spec, "unused-stage")
+            is sandbox
+        )
+        assert "kernel namespaces unavailable" in capsys.readouterr().err
+
+
+def test_worker_setup_reports_error_when_log_cannot_be_written(monkeypatch, tmp_path, capsys):
+
+    class StateStream:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    stream = StateStream()
+    monkeypatch.setattr(build, "make_state_stream", lambda state: stream)
+
+    def fail_setup(*args, **kwargs):
+        raise spack.sandbox.SandboxError("namespace setup failed")
+
+    monkeypatch.setattr(build, "_start_tee_after_namespace", fail_setup)
+    with pytest.raises(SystemExit) as exited:
+        build._start_worker_output({}, None, None, None, None, str(tmp_path / "missing" / "log"))
+    assert exited.value.code == build.ExitCode.BUILD_ERROR
+    assert stream.closed
+    assert "namespace setup failed" in capsys.readouterr().err
+
+
+def test_enable_sandbox_paths(
+    config, mock_packages, monkeypatch, temporary_store: spack.store.Store, tmp_path: pathlib.Path
+):
+    """Test that _enable_sandbox in the installer calls allow_read/allow_write correctly."""
+    mock_sandbox = MockSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+
+    spec = spack.concretize.concretize_one("dependent-install")
+
+    # Create prefix directories so resolved.exists() passes
+    pathlib.Path(spec.prefix).mkdir(parents=True, exist_ok=True)
+    for dep in spec.traverse(root=False):
+        pathlib.Path(dep.prefix).mkdir(parents=True, exist_ok=True)
+
+    stage_path = tmp_path / "stage"
+    stage_path.mkdir()
+
+    custom_write = tmp_path / "custom_write"
+    custom_write.mkdir()
+
+    custom_read = tmp_path / "custom_read"
+    custom_read.mkdir()
+
+    temporary_store.install_sbang()
+    sbang_file = pathlib.Path(temporary_store.unpadded_root) / "bin" / "sbang"
+    upstream_root = tmp_path / "upstream"
+    upstream_sbang = upstream_root / "bin" / "sbang"
+    upstream_sbang.parent.mkdir(parents=True)
+    upstream_sbang.write_text("upstream sbang", encoding="utf-8")
+    upstream = type("Upstream", (), {"root": str(upstream_root)})()
+    monkeypatch.setattr(temporary_store, "upstreams", [upstream])
+
+    config = {
+        "enable": True,
+        "allow_read": [str(custom_read)],
+        "allow_write": [str(custom_write)],
+        "allow_network": True,
+    }
+
+    build._enable_sandbox(config, spec, str(stage_path))
+
+    allow_read_resolved = [c[1] for c in mock_sandbox.read_calls]
+    for dep in spec.traverse(root=False):
+        assert pathlib.Path(dep.prefix).resolve() in allow_read_resolved
+
+    assert custom_read.resolve() in allow_read_resolved
+    assert upstream_sbang.resolve() in allow_read_resolved
+
+    assert sbang_file.resolve() in allow_read_resolved
+
+    allow_write_resolved = [c[1] for c in mock_sandbox.write_calls]
+    assert stage_path.resolve() in allow_write_resolved
+    assert pathlib.Path(spec.prefix).resolve() in allow_write_resolved
+    assert custom_write.resolve() in allow_write_resolved
+    assert pathlib.Path(tempfile.gettempdir()).resolve() in allow_write_resolved
+
+    assert mock_sandbox.apply_calls == [False]
+
+
+class MockNamespaceSandbox(ns.NamespaceSandbox):
+    """NamespaceSandbox that records mount-tree preparation instead of mounting."""
+
+    def __init__(self):
+        super().__init__()
+        self.prepare_mount_tree_calls = []
+        self.apply_calls: List[bool] = []
+
+    def _allow_read(self, original: pathlib.Path, resolved: pathlib.Path):
+        pass
+
+    def _allow_write(self, original: pathlib.Path, resolved: pathlib.Path):
+        pass
+
+    def prepare_mount_tree(self, hidden_dirs, stage_path):
+        self.prepare_mount_tree_calls.append((list(hidden_dirs), stage_path))
+        return True
+
+    def drop_mount_authority(self):
+        return True
+
+    def apply(self, block_network=False):
+        self.apply_calls.append(block_network)
+
+
+def test_enable_sandbox_prepares_namespace_mount_tree(
+    config, mock_packages, monkeypatch, temporary_store: spack.store.Store, tmp_path: pathlib.Path
+):
+    """The namespace backend hides host directories before Landlock is applied.
+
+    ``_enable_sandbox`` must call ``prepare_mount_tree`` on the selected
+    NamespaceSandbox with the default hidden directories, and the returned
+    Landlock-visible tree is what ``apply`` then confines.
+    """
+    mock_sandbox = MockNamespaceSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: mock_sandbox)
+
+    spec = spack.concretize.concretize_one("dependent-install")
+    pathlib.Path(spec.prefix).mkdir(parents=True, exist_ok=True)
+    for dep in spec.traverse(root=False):
+        pathlib.Path(dep.prefix).mkdir(parents=True, exist_ok=True)
+
+    stage_path = tmp_path / "stage"
+    stage_path.mkdir()
+
+    build._enable_sandbox({"enable": True, "allow_network": True}, spec, str(stage_path))
+
+    assert mock_sandbox.prepare_mount_tree_calls == [(["/usr/share/aclocal"], str(stage_path))]
+    assert mock_sandbox.apply_calls == [False]
+
+
+def test_configured_empty_directory_paths_match_external_spec_constraints():
+    """External dependencies can disable configured empty-directory features."""
+
+    def fake_spec(dependencies):
+        spec = SimpleNamespace()
+        spec.traverse = lambda root=True: iter(dependencies)
+        return cast(Any, spec)
+
+    policy = {
+        "empty_directory_paths": [
+            {"path": "/usr/share/aclocal", "unless_external_specs": ["autoconf@2.70:+foo"]}
+        ]
+    }
+    external = spack.spec.Spec("autoconf@2.72+foo", external_path="/opt/external-autoconf")
+    assert build.configured_empty_directory_paths(fake_spec([external]), policy) == []
+
+    nonmatching = spack.spec.Spec("autoconf@2.69+foo", external_path="/opt/external-autoconf")
+    assert build.configured_empty_directory_paths(fake_spec([nonmatching]), policy) == [
+        "/usr/share/aclocal"
+    ]
+
+
+def test_external_prefix_read_paths_select_configured_existing_subdirectories(tmp_path):
+
+    prefix = tmp_path / "external"
+    expected = tuple(
+        sorted(str((prefix / relative).resolve()) for relative in ("include", "share"))
+    )
+    for path in expected:
+        pathlib.Path(path).mkdir(parents=True)
+    (prefix / "etc").mkdir()
+    (prefix / "lib").touch()
+    external = spack.spec.Spec("tool@1.2+feature", external_path=str(prefix))
+    spec = SimpleNamespace(traverse=lambda root=False: iter([external]))
+    policy = {
+        "external_prefix_read_paths": ["include", "lib", "lib64", "share"],
+        "external_spec_read_paths": [],
+    }
+
+    assert build.external_prefix_read_paths(spec, policy) == expected
+
+
+def test_external_spec_read_paths_match_external_dependency_and_preserve_alias(tmp_path):
+
+    host = tmp_path / "usr"
+    llvm_root = host / "lib" / "llvm-18"
+    llvm_config = llvm_root / "bin" / "llvm-config"
+    llvm_config.parent.mkdir(parents=True)
+    llvm_config.touch()
+    bin_dir = host / "bin"
+    bin_dir.mkdir()
+    llvm_config_alias = bin_dir / "llvm-config"
+    llvm_config_alias.symlink_to(pathlib.Path("..") / "lib" / "llvm-18" / "bin" / "llvm-config")
+    (bin_dir / "llvm-missing").symlink_to(llvm_root / "missing")
+
+    llvm = spack.spec.Spec("llvm@18+clang", external_path=str(host))
+    spec = SimpleNamespace(traverse=lambda root=False: iter([llvm]))
+    policy = {
+        "external_prefix_read_paths": [],
+        "external_spec_read_paths": [
+            {
+                "spec": "llvm+clang",
+                "paths": [str(bin_dir / "llvm*"), str(llvm_config_alias), str(llvm_root)],
+            }
+        ],
+    }
+
+    assert build.external_prefix_read_paths(spec, policy) == (
+        str(llvm_root.resolve()),
+        str(llvm_config),
+    )
+    assert build.external_spec_alias_symlink_paths(spec, [str(host)], policy) == (
+        ns.NamespaceGeneratedSymlink(str(llvm_config_alias), str(llvm_config)),
+    )
+
+    other = spack.spec.Spec("other", external_path=str(host))
+    nonmatching = SimpleNamespace(traverse=lambda root=False: iter([other]))
+    assert build.external_prefix_read_paths(nonmatching, policy) == ()
+    assert build.external_spec_alias_symlink_paths(nonmatching, [str(host)], policy) == ()
+    assert build.external_spec_alias_symlink_paths(spec, [str(tmp_path / "hidden")], policy) == ()
+
+
+def test_namespace_filesystem_policy_from_installer_inputs(monkeypatch, tmp_path: pathlib.Path):
+
+    dependency_prefix = tmp_path / "dependency"
+    dependency_prefix.mkdir()
+    external_prefix = tmp_path / "external"
+    external_prefix.mkdir()
+    install_prefix = tmp_path / "prefix"
+    install_prefix.mkdir()
+    stage_path = tmp_path / "stage"
+    stage_path.mkdir()
+    temporary_path = tmp_path / "temporary"
+    temporary_path.mkdir()
+    custom_read = tmp_path / "custom-read"
+    custom_read.mkdir()
+    custom_write = tmp_path / "custom-write"
+    custom_write.mkdir()
+    store_root = tmp_path / "store"
+    sbang = store_root / "bin" / "sbang"
+    sbang.parent.mkdir(parents=True)
+    sbang.touch()
+
+    dependencies = [
+        SimpleNamespace(name="dependency", external=False, prefix=dependency_prefix),
+        spack.spec.Spec("external", external_path=str(external_prefix)),
+    ]
+    spec = cast(
+        Any, SimpleNamespace(prefix=install_prefix, traverse=lambda root=True: iter(dependencies))
+    )
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(store_root))
+    monkeypatch.setattr(spack.store.STORE, "upstreams", None)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temporary_path))
+
+    policy = build.namespace_filesystem_policy_from_inputs(
+        {"allow_read": [str(custom_read)], "allow_write": [str(custom_write)]},
+        spec,
+        str(stage_path),
+    )
+
+    read_only_targets = {pathlib.Path(mount.target) for mount in policy.read_only_mounts}
+    assert read_only_targets == {
+        dependency_prefix.resolve(),
+        custom_read.resolve(),
+        sbang.resolve(),
+    }
+    read_write_targets = {pathlib.Path(mount.target) for mount in policy.read_write_mounts}
+    assert read_write_targets == {
+        stage_path.resolve(),
+        install_prefix.resolve(),
+        temporary_path.resolve(),
+        custom_write.resolve(),
+        pathlib.Path(os.devnull).resolve(),
+    }
+    assert external_prefix.resolve() not in read_only_targets
+
+
+def test_complete_namespace_policy_from_installer_inputs(monkeypatch, tmp_path: pathlib.Path):
+
+    host = tmp_path / "host"
+
+    def directory(path):
+        path.mkdir(parents=True)
+        return path
+
+    def file(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return path
+
+    compiler = file(host / "usr" / "bin" / "cc")
+    tool = file(host / "usr" / "bin" / "make")
+    headers = directory(host / "usr" / "include")
+    compiler_headers = directory(headers / "compiler")
+    runtime = directory(host / "usr" / "lib")
+    repository_python_path = directory(host / "repos-python")
+    repository_composition_root = directory(repository_python_path / "spack_repo")
+    repository = directory(repository_composition_root / "builtin")
+    repository_alias = host / "repository-alias"
+    repository_alias.symlink_to(repository, target_is_directory=True)
+    hidden_host_state = directory(host / "home")
+    dependency_prefix = directory(host / "store" / "dependency")
+    external_prefix = directory(host / "external")
+    install_prefix = directory(host / "store" / "install")
+    stage_path = directory(host / "build" / "stage")
+    temporary_path = directory(host / "build" / "tmp")
+    mount_plan_stage = directory(tmp_path / "mount-plan")
+    sbang = file(host / "store" / "bin" / "sbang")
+
+    spack_prefix = host / "spack"
+    spack_source_paths = (
+        directory(spack_prefix / "bin"),
+        directory(spack_prefix / "lib"),
+        directory(spack_prefix / "share" / "spack"),
+        directory(spack_prefix / "etc" / "spack"),
+    )
+    monkeypatch.setattr(spack.paths, "bin_path", str(spack_source_paths[0]))
+    monkeypatch.setattr(spack.paths, "lib_path", str(spack_source_paths[1]))
+    monkeypatch.setattr(spack.paths, "share_path", str(spack_source_paths[2]))
+    monkeypatch.setattr(spack.paths, "etc_path", str(spack_source_paths[3]))
+    monkeypatch.setattr(
+        spack.repo,
+        "PATH",
+        SimpleNamespace(
+            repos=[
+                SimpleNamespace(
+                    root=str(repository_alias), python_path=str(repository_python_path)
+                )
+            ]
+        ),
+    )
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(host / "store"))
+    monkeypatch.setattr(spack.store.STORE, "upstreams", None)
+
+    dependencies = (
+        SimpleNamespace(name="dependency", external=False, prefix=dependency_prefix),
+        SimpleNamespace(name="stale-build-dependency", external=False, prefix=host / "missing"),
+        SimpleNamespace(name="external", external=True, prefix=external_prefix),
+    )
+    spec = cast(
+        Any, SimpleNamespace(prefix=install_prefix, traverse=lambda root=True: iter(dependencies))
+    )
+    selected_paths = build.NamespacePolicyInputPaths(
+        hidden_roots=(
+            str(hidden_host_state),
+            str(host / "usr"),
+            str(host / "repos-python"),
+            str(host / "store"),
+            str(host / "build"),
+            str(spack_prefix),
+            str(pathlib.Path(os.devnull).parent),
+        ),
+        compiler_paths=(str(compiler),),
+        tool_paths=(str(tool),),
+        header_paths=(str(headers), str(compiler_headers)),
+        runtime_paths=(str(runtime), str(dependency_prefix)),
+        temporary_paths=(str(temporary_path),),
+    )
+
+    policy, plan = build.namespace_filesystem_policy_and_plan_from_inputs(
+        {}, spec, str(stage_path), str(mount_plan_stage), selected_paths
+    )
+
+    assert policy.read_only_view
+    assert plan.read_only_view
+    read_only_targets = {pathlib.Path(mount.target) for mount in policy.read_only_mounts}
+    assert read_only_targets == {
+        compiler.resolve(),
+        tool.resolve(),
+        headers.resolve(),
+        runtime.resolve(),
+        repository.resolve(),
+        dependency_prefix.resolve(),
+        sbang.resolve(),
+        *(path.resolve() for path in spack_source_paths),
+    }
+    read_write_targets = {pathlib.Path(mount.target) for mount in policy.read_write_mounts}
+    assert read_write_targets == {
+        stage_path.resolve(),
+        install_prefix.resolve(),
+        temporary_path.resolve(),
+        pathlib.Path(os.devnull).resolve(),
+    }
+    assert external_prefix.resolve() not in read_only_targets
+    assert compiler_headers.resolve() not in read_only_targets
+    assert set(policy.hidden_roots) == {
+        str(pathlib.Path(os.devnull).resolve().parent),
+        str((host / "build").resolve()),
+        str(hidden_host_state.resolve()),
+        str(repository_python_path.resolve()),
+        str(spack_prefix.resolve()),
+        str((host / "store").resolve()),
+        str((host / "usr").resolve()),
+    }
+    assert all(
+        pathlib.Path(root) != mount_plan_stage.resolve()
+        and pathlib.Path(root) not in mount_plan_stage.resolve().parents
+        for root in policy.hidden_roots
+    )
+    assert plan.stage_path == str(mount_plan_stage.resolve())
+    assert {mount.target for mount in plan.restoration_mounts} == {
+        str(path) for path in read_only_targets | read_write_targets
+    }
+
+
+def test_namespace_selects_host_device_and_worker_inputs(monkeypatch, tmp_path: pathlib.Path):
+
+    host = tmp_path / "host"
+    for relative in ("bin", "lib", "share", "etc", "config", "repo", "store/bin"):
+        (host / relative).mkdir(parents=True)
+    runtime = host / "lib" / "libc.so"
+    runtime.touch()
+    dependency = host / "store" / "dependency"
+    dependency.mkdir()
+    external_prefix = host / "store" / "external"
+    external_include = external_prefix / "include"
+    external_share = external_prefix / "share"
+    external_etc = external_prefix / "etc"
+    external_include.mkdir(parents=True)
+    external_share.mkdir()
+    external_etc.mkdir()
+    install_prefix = host / "store" / "install"
+    install_prefix.mkdir()
+    stage = host / "stage"
+    stage.mkdir()
+    worker_root = host / "worker"
+    worker_root.mkdir()
+    fetch_cache = host / "fetch-cache"
+    fetch_cache.mkdir()
+    log_path = host / "worker.log"
+    log_path.touch()
+    jobserver = host / "jobserver_fifo"
+    jobserver.touch()
+    repository = host / "repo"
+    device = pathlib.Path(os.devnull)
+
+    monkeypatch.setattr(spack.paths, "bin_path", str(host / "bin"))
+    monkeypatch.setattr(spack.paths, "lib_path", str(host / "lib"))
+    monkeypatch.setattr(spack.paths, "share_path", str(host / "share"))
+    monkeypatch.setattr(spack.paths, "etc_path", str(host / "etc"))
+    monkeypatch.setattr(spack.paths, "user_config_path", str(host / "config"))
+    monkeypatch.setattr(spack.paths, "system_config_path", str(host / "config"))
+    monkeypatch.setattr(
+        spack.repo, "PATH", SimpleNamespace(repos=[SimpleNamespace(root=str(repository))])
+    )
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(host / "store"))
+    monkeypatch.setattr(spack.store.STORE, "upstreams", None)
+    monkeypatch.setattr(
+        spack.util.ld_so_conf, "host_dynamic_linker_search_paths", lambda: [str(runtime)]
+    )
+
+    spec = cast(
+        Any,
+        SimpleNamespace(
+            prefix=install_prefix,
+            traverse=lambda root=False: iter(
+                [
+                    SimpleNamespace(prefix=dependency, external=False),
+                    spack.spec.Spec("external", external_path=str(external_prefix)),
+                ]
+            ),
+        ),
+    )
+    monkeypatch.setattr(build, "required_build_dependency_paths", lambda spec: (str(dependency),))
+    policy = {
+        "hidden_roots": [str(host / "store"), str(host / "stage")],
+        "replacement_roots": [str(host / "stage")],
+        "host_runtime_read_paths": [str(runtime), str(host / "missing-runtime")],
+        "file_runtime_read_paths": [],
+        "device_nodes": [str(device), str(host / "not-a-device")],
+        "external_prefix_read_paths": ["include", "lib", "lib64", "share"],
+        "external_spec_read_paths": [],
+    }
+
+    selected = build.select_namespace_host_device_worker_paths(
+        {"allow_read": [str(repository)], "allow_write": [str(worker_root)]},
+        spec,
+        str(stage),
+        log_path=str(log_path),
+        jobserver_paths=(str(jobserver),),
+        worker_root=str(worker_root),
+        fetch_cache_path=str(fetch_cache),
+        policy=policy,
+    )
+
+    assert selected.hidden_roots == tuple(
+        sorted((str((host / "stage").resolve()), str((host / "store").resolve())))
+    )
+    assert selected.replacement_roots == (str((host / "stage").resolve()),)
+    assert selected.host_runtime_paths == (str(runtime.resolve()),)
+    assert selected.device_paths == (str(device.resolve()),)
+    assert set(selected.read_only_paths) >= {
+        str((host / "bin").resolve()),
+        str((host / "lib").resolve()),
+        str((host / "share").resolve()),
+        str((host / "etc").resolve()),
+        str(dependency.resolve()),
+        str(external_include.resolve()),
+        str(external_share.resolve()),
+        str(repository.resolve()),
+    }
+    assert str(external_etc.resolve()) not in selected.read_only_paths
+    assert set(selected.writable_paths) >= {
+        str(stage.resolve()),
+        str(install_prefix.resolve()),
+        str(worker_root.resolve()),
+        str(fetch_cache.resolve()),
+        str(log_path.resolve()),
+        str(jobserver.resolve()),
+    }
+
+    with pytest.raises(ns.NamespaceSetupError, match="does not exist"):
+        build.select_namespace_host_device_worker_paths(
+            {},
+            spec,
+            str(stage),
+            log_path=None,
+            jobserver_paths=(),
+            worker_root=str(worker_root),
+            fetch_cache_path=str(host / "missing-fetch-cache"),
+            policy=policy,
+        )
+
+
+def test_required_build_dependency_paths_rejects_missing_prefix(monkeypatch, tmp_path):
+
+    root = SimpleNamespace(external=False)
+    dependency = SimpleNamespace(external=False, prefix=tmp_path / "missing")
+    monkeypatch.setattr(
+        spack.build_environment,
+        "effective_deptypes",
+        lambda spec, context: ((root, object()), (dependency, object())),
+    )
+
+    with pytest.raises(
+        spack.directory_layout.InconsistentInstallDirectoryError,
+        match=r"Install prefix .* does not exist\.",
+    ):
+        build.required_build_dependency_paths(root)
+
+
+def test_prepare_namespace_activation_compiles_selected_production_policy(
+    monkeypatch, tmp_path: pathlib.Path
+):
+
+    host = tmp_path / "host"
+
+    def directory(path):
+        path.mkdir(parents=True)
+        return path
+
+    def file(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return path
+
+    hidden_bin = directory(host / "usr" / "bin")
+    hidden_include = directory(host / "usr" / "include")
+    selected_hidden_runtime = directory(host / "usr" / "lib")
+    compiler = file(hidden_bin / "cc")
+    compiler_alias = hidden_bin / "cc-selected"
+    compiler_alias.symlink_to(compiler)
+    linker = file(hidden_bin / "x86_64-linux-gnu-ld")
+    linker_alias = hidden_bin / "ld"
+    linker_alias.symlink_to(linker)
+    tool = file(hidden_bin / "tar")
+    python = file(hidden_bin / "python3.12")
+    python_alias = hidden_bin / "python3"
+    python_alias.symlink_to(python)
+    headers = directory(hidden_include / "compiler")
+    runtime = file(host / "etc" / "passwd")
+    repository = directory(host / "repository")
+    repository_python = directory(host / "repository-python")
+    hidden_home = directory(host / "home")
+    dependency = directory(host / "store" / "dependency")
+    prefix = directory(host / "store" / "install")
+    stage = directory(host / "stage")
+    worker_root = directory(host / "worker")
+    user_cache = directory(hidden_home / ".spack")
+    fetch_cache = user_cache / "source-cache"
+    misc_cache = directory(user_cache / "misc-cache")
+    log_path = file(host / "build.log")
+    jobserver = file(host / "jobserver")
+
+    spack_source_paths = tuple(
+        directory(path)
+        for path in (
+            host / "spack" / "bin",
+            host / "spack" / "lib",
+            host / "spack" / "share" / "spack",
+            host / "spack" / "etc" / "spack",
+        )
+    )
+    sbang = file(host / "store" / "bin" / "sbang")
+    spec = cast(
+        Any,
+        SimpleNamespace(
+            prefix=prefix,
+            traverse=lambda root=False: iter([SimpleNamespace(prefix=dependency, external=False)]),
+        ),
+    )
+    selected_host_paths = build.NamespaceHostDeviceWorkerPaths(
+        hidden_roots=(
+            str(hidden_bin),
+            str(hidden_include),
+            str(selected_hidden_runtime),
+            str(hidden_home),
+            str(pathlib.Path("/dev")),
+        ),
+        replacement_roots=(),
+        host_runtime_paths=(str(runtime), str(selected_hidden_runtime), os.devnull),
+        device_paths=(os.devnull,),
+        read_only_paths=(
+            str(repository),
+            str(repository_python),
+            str(user_cache),
+            str(misc_cache),
+        ),
+        writable_paths=(
+            str(stage),
+            str(prefix),
+            str(worker_root),
+            str(fetch_cache),
+            str(log_path),
+            str(jobserver),
+        ),
+    )
+
+    monkeypatch.setattr(
+        build,
+        "select_namespace_host_device_worker_paths",
+        lambda *args, **kwargs: selected_host_paths,
+    )
+    monkeypatch.setattr(
+        build,
+        "compiler_driver_paths",
+        lambda spec: [build.ResolvedSandboxPath(str(compiler_alias), str(compiler))],
+    )
+    monkeypatch.setattr(
+        build,
+        "compiler_support_paths",
+        lambda compiler_path: [build.ResolvedSandboxPath("ld", str(linker))],
+    )
+    monkeypatch.setattr(
+        build, "which_string", lambda name: str(linker_alias) if name == "ld" else None
+    )
+    monkeypatch.setattr(
+        build,
+        "_selected_compilers",
+        lambda spec: [("c", str(compiler_alias), SimpleNamespace(name="gcc"))],
+    )
+    monkeypatch.setattr(
+        build, "stage_tool_paths", lambda: [build.ResolvedSandboxPath(str(tool), str(tool))]
+    )
+    monkeypatch.setattr(build, "install_tool_paths", lambda: [])
+    monkeypatch.setattr(build, "tool_runtime_paths", lambda spec, tools: [])
+    monkeypatch.setattr(build, "sys", SimpleNamespace(executable=str(python_alias), path=()))
+    missing_header = headers / "a.out.h"
+    monkeypatch.setattr(
+        build, "system_compiler_header_paths", lambda spec: (str(headers), str(missing_header))
+    )
+    monkeypatch.setattr(
+        build,
+        "compiler_alias_symlink_paths",
+        lambda spec: [ns.NamespaceGeneratedSymlink(str(compiler_alias), str(compiler))],
+    )
+    monkeypatch.setattr(
+        spack.repo,
+        "PATH",
+        SimpleNamespace(
+            repos=[SimpleNamespace(root=str(repository), python_path=str(repository_python))]
+        ),
+    )
+    monkeypatch.setattr(spack.paths, "bin_path", str(spack_source_paths[0]))
+    monkeypatch.setattr(spack.paths, "lib_path", str(spack_source_paths[1]))
+    monkeypatch.setattr(spack.paths, "share_path", str(spack_source_paths[2]))
+    monkeypatch.setattr(spack.paths, "etc_path", str(spack_source_paths[3]))
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(host / "store"))
+    monkeypatch.setattr(spack.store.STORE, "upstreams", None)
+
+    inherited_environment = dict(os.environ)
+    inherited_tempdir = build.tempfile.tempdir
+    activation, scratch = build.prepare_namespace_activation(
+        {}, spec, str(stage), str(log_path), (str(jobserver),), str(worker_root), str(fetch_cache)
+    )
+    try:
+        assert fetch_cache.is_dir()
+        fetch_cache_alias = user_cache / "source-cache-alias"
+        fetch_cache_alias.symlink_to(fetch_cache, target_is_directory=True)
+        with pytest.raises(ns.NamespaceSetupError, match="not canonical"):
+            build.prepare_namespace_activation(
+                {},
+                spec,
+                str(stage),
+                str(log_path),
+                (str(jobserver),),
+                str(worker_root),
+                str(fetch_cache_alias),
+            )
+        assert activation.worker_root == str(worker_root)
+        assert activation.policy.tmpfs_paths == ("/dev/shm",)
+        expected_generated_symlinks = {
+            ns.NamespaceGeneratedSymlink(str(compiler_alias), str(compiler)),
+            ns.NamespaceGeneratedSymlink(str(linker_alias), str(linker)),
+            ns.NamespaceGeneratedSymlink(str(python_alias), str(python)),
+        }
+        expected_generated_symlinks.update(
+            ns.NamespaceGeneratedSymlink("/dev/" + name, target)
+            for name, target in (
+                ("fd", "/proc/self/fd"),
+                ("stdin", "/proc/self/fd/0"),
+                ("stdout", "/proc/self/fd/1"),
+                ("stderr", "/proc/self/fd/2"),
+            )
+        )
+        assert set(activation.policy.generated_symlinks) == expected_generated_symlinks
+        assert os.environ == inherited_environment
+        assert build.tempfile.tempdir == inherited_tempdir
+        assert not list(worker_root.iterdir())
+        read_only_targets = {mount.target for mount in activation.policy.read_only_mounts}
+        read_write_targets = {mount.target for mount in activation.policy.read_write_mounts}
+        assert read_only_targets == {
+            str(compiler),
+            str(linker),
+            str(tool),
+            str(python),
+            str(headers),
+            str(user_cache),
+        }
+        assert str(missing_header) not in read_only_targets
+        assert read_write_targets == {
+            os.devnull,
+            str(stage),
+            str(prefix),
+            str(worker_root),
+            str(fetch_cache),
+            str(log_path),
+            str(jobserver),
+        }
+        assert str(runtime) not in read_only_targets
+        assert str(selected_hidden_runtime) not in activation.policy.hidden_roots
+        assert str(selected_hidden_runtime) not in read_only_targets
+        assert str(misc_cache) not in read_only_targets
+        assert str(repository) not in read_only_targets
+        assert str(dependency) not in read_only_targets
+        assert str(sbang) not in read_only_targets
+        assert sbang.exists()
+        ns.build_namespace_mount_plan_from_policy(activation.policy, activation.mount_plan_stage)
+    finally:
+        scratch.cleanup()
+
+
+def test_complete_namespace_policy_rejects_missing_selected_path(
+    monkeypatch, tmp_path: pathlib.Path
+):
+
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    hidden = tmp_path / "hidden"
+    hidden.mkdir()
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    missing = tmp_path / "missing-compiler"
+    spec = cast(Any, SimpleNamespace(prefix=existing, traverse=lambda root=True: iter(())))
+    selected_paths = build.NamespacePolicyInputPaths(
+        hidden_roots=(str(hidden),),
+        compiler_paths=(str(missing),),
+        tool_paths=(str(source_root),),
+        header_paths=(str(source_root),),
+        runtime_paths=(str(source_root),),
+        temporary_paths=(str(existing),),
+    )
+    monkeypatch.setattr(
+        spack.repo,
+        "PATH",
+        SimpleNamespace(repos=[SimpleNamespace(root=str(source_root), python_path=None)]),
+    )
+    monkeypatch.setattr(spack.paths, "bin_path", str(source_root))
+    monkeypatch.setattr(spack.paths, "lib_path", str(source_root))
+    monkeypatch.setattr(spack.paths, "share_path", str(source_root))
+    monkeypatch.setattr(spack.paths, "etc_path", str(source_root))
+    sbang = source_root / "store" / "bin" / "sbang"
+    sbang.parent.mkdir(parents=True)
+    sbang.touch()
+    monkeypatch.setattr(spack.store.STORE, "unpadded_root", str(source_root / "store"))
+    monkeypatch.setattr(spack.store.STORE, "upstreams", None)
+
+    with pytest.raises(ns.NamespaceSetupError, match=str(missing)):
+        build.namespace_filesystem_policy_and_plan_from_inputs(
+            {}, spec, str(existing), str(tmp_path / "mount-plan"), selected_paths
+        )
+
+    compiler = tmp_path / "compiler"
+    compiler.touch()
+    compiler_link = tmp_path / "compiler-link"
+    compiler_link.symlink_to(compiler)
+    with pytest.raises(ns.NamespaceSetupError, match="required path is not canonical"):
+        build.namespace_filesystem_policy_and_plan_from_inputs(
+            {},
+            spec,
+            str(existing),
+            str(tmp_path / "mount-plan"),
+            selected_paths._replace(compiler_paths=(str(compiler_link),)),
+        )
+
+    uncovered_temporary = tmp_path / "uncovered-temporary"
+    uncovered_temporary.mkdir()
+    policy, plan = build.namespace_filesystem_policy_and_plan_from_inputs(
+        {},
+        spec,
+        str(existing),
+        str(tmp_path / "mount-plan"),
+        selected_paths._replace(
+            compiler_paths=(str(compiler),), temporary_paths=(str(uncovered_temporary),)
+        ),
+    )
+    assert str(uncovered_temporary) in {mount.target for mount in policy.read_write_mounts}
+    assert str(uncovered_temporary) in {mount.target for mount in plan.restoration_mounts}
+
+    compilerless_policy, _ = build.namespace_filesystem_policy_and_plan_from_inputs(
+        {},
+        spec,
+        str(existing),
+        str(tmp_path / "mount-plan-compilerless"),
+        selected_paths._replace(compiler_paths=(), header_paths=()),
+    )
+    assert str(compiler) not in {mount.target for mount in compilerless_policy.read_only_mounts}
+
+
+def test_installer_normalizes_landlock_initialization_error(monkeypatch, tmp_path):
+    def fail(libc):
+        raise OSError(errno.ENOSYS, "Landlock unavailable")
+
+    sandbox = ns.NamespaceSandbox(landlock_factory=fail)
+    monkeypatch.setattr(sandbox, "prepare_mount_tree", lambda hidden_dirs, stage_path: True)
+    monkeypatch.setattr(sandbox, "prepare_network_namespace", lambda: True)
+    monkeypatch.setattr(sandbox, "drop_mount_authority", lambda: True)
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    spec = SimpleNamespace(traverse=lambda **kw: [], prefix=tmp_path / "prefix")
+
+    with pytest.raises(spack.error.InstallError, match="Cannot enable build sandbox"):
+        build._enable_sandbox({"enable": True}, spec, str(tmp_path))
+
+
+@pytest.mark.parametrize("failure", ["symlink", "tmpfs"])
+def test_private_device_setup_failure_stops_before_tee(
+    namespace_setup, monkeypatch, tmp_path, failure
+):
+    libc, _ = namespace_setup
+    hidden = tmp_path / "dev"
+    hidden.mkdir()
+    worker = tmp_path / "worker"
+    worker.mkdir()
+    policy = ns.build_namespace_filesystem_policy(
+        [str(hidden)],
+        read_write_mounts=[(str(worker), str(worker))],
+        generated_symlinks=[ns.NamespaceGeneratedSymlink(str(hidden / "fd"), "/proc/self/fd")],
+        tmpfs_paths=[str(hidden / "shm")],
+        read_only_view=True,
+    )
+    sandbox = ns.NamespaceSandbox(cast(ns.ctypes.CDLL, libc))
+    acquisitions = []
+    monkeypatch.setattr(
+        spack.sandbox, "get_sandbox", lambda: acquisitions.append(sandbox) or sandbox
+    )
+    monkeypatch.setattr(
+        sandbox, "drop_mount_authority", lambda: pytest.fail("drop after failed setup")
+    )
+    monkeypatch.setattr(build, "Tee", lambda *args: pytest.fail("Tee after failed setup"))
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EPERM, "D3 setup denied")
+
+    if failure == "symlink":
+        monkeypatch.setattr(ns.os, "symlink", fail)
+    else:
+        monkeypatch.setattr(ns, "_mount_private_tmpfs", fail)
+    inherited_environment = dict(os.environ)
+    inherited_tempdir = build.tempfile.tempdir
+    activation = build.NamespaceActivation(policy, str(tmp_path / "scratch"), str(worker))
+    channel = cast(build.IpcChannel, None)
+    with pytest.raises(OSError, match="D3 setup denied"):
+        build._start_tee_after_namespace(
+            {"enable": True},
+            channel,
+            None,
+            channel,
+            "build.log",
+            spack.spec.Spec(),
+            str(tmp_path),
+            activation,
+        )
+    assert acquisitions == [sandbox]
+    assert not sandbox.filesystem_policy_active
+    assert not sandbox.namespace_ready
+    assert os.environ == inherited_environment
+    assert build.tempfile.tempdir == inherited_tempdir
+    assert not list(worker.iterdir())
+
+
+@pytest.mark.parametrize("failure", [None, "policy", "authority"])
+def test_active_namespace_policy_skips_landlock(monkeypatch, tmp_path, failure):
+    calls = []
+    worker_root = tmp_path / "worker with spaces"
+    worker_root.mkdir()
+    monkeypatch.setattr(os, "environ", dict(os.environ, JAVA_TOOL_OPTIONS="-Xmx256m"))
+    monkeypatch.setattr(build.tempfile, "tempdir", "/inherited-temp")
+    inherited_environment = dict(os.environ)
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_filesystem_policy(self, policy, stage_path):
+            calls.append(("prepare policy", policy, stage_path))
+            self._filesystem_policy_active = True
+            return failure != "policy"
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return failure != "authority"
+
+        def prepare_network_namespace(self):
+            calls.append(("prepare network namespace",))
+            return True
+
+        def allow_read(self, path):
+            calls.append(("read", path))
+
+        def allow_write(self, path):
+            calls.append(("write", path))
+
+        def apply(self, block_network=False):
+            calls.append(("apply", block_network))
+
+    sandbox = RecordingSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    monkeypatch.setattr(
+        ns, "freeze_namespace_sandbox_capability", lambda: ns.NamespaceCapability(True, None, None)
+    )
+    spec = spack.spec.Spec()
+    channel = cast(build.IpcChannel, None)
+    policy = ns.build_namespace_filesystem_policy(
+        [], read_write_mounts=[(str(worker_root), str(worker_root))], read_only_view=True
+    )
+    activation = build.NamespaceActivation(policy, str(tmp_path / "mount-plan"), str(worker_root))
+
+    def start_tee(*args):
+        spack.build_environment.clean_environment().apply_modifications()
+        assert os.environ["HOME"] == str(worker_root / "home")
+        assert os.environ["XDG_CACHE_HOME"] == str(worker_root / "cache")
+        for variable in ("TMPDIR", "TMP", "TEMP"):
+            assert os.environ[variable] == str(worker_root / "tmp")
+        assert build.tempfile.gettempdir() == str(worker_root / "tmp")
+        assert os.environ["JAVA_TOOL_OPTIONS"].startswith("-Xmx256m ")
+        assert build.shlex.split(os.environ["JAVA_TOOL_OPTIONS"])[1:] == [
+            f"-Duser.home={worker_root / 'home'}",
+            f"-Djava.io.tmpdir={worker_root / 'tmp'}",
+        ]
+        for name in ("home", "cache", "tmp"):
+            assert (worker_root / name).is_dir()
+        calls.append(("tee",))
+        return object()
+
+    monkeypatch.setattr(build, "Tee", start_tee)
+
+    if failure == "policy":
+        with pytest.raises(spack.error.InstallError):
+            build._start_tee_after_namespace(
+                {"enable": True},
+                channel,
+                None,
+                channel,
+                "build.log",
+                spec,
+                str(tmp_path),
+                activation,
+            )
+        assert os.environ == inherited_environment
+        assert build.tempfile.tempdir == "/inherited-temp"
+        assert not list(worker_root.iterdir())
+        assert ("tee",) not in calls
+        return
+
+    _, prepared = build._start_tee_after_namespace(
+        {"enable": True}, channel, None, channel, "build.log", spec, str(tmp_path), activation
+    )
+    assert prepared is sandbox
+    assert not sandbox.network_namespace_active
+    if failure == "authority":
+        with pytest.raises(spack.error.InstallError):
+            build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=sandbox)
+        assert calls[-3:] == [("tee",), ("prepare network namespace",), ("drop mount authority",)]
+        return
+
+    build._enable_sandbox({"enable": True}, spec, str(tmp_path), sandbox=sandbox)
+    assert calls == [
+        ("prepare policy", activation.policy, activation.mount_plan_stage),
+        ("tee",),
+        ("prepare network namespace",),
+        ("drop mount authority",),
+    ]
+
+
+def test_active_namespace_policy_network_failure_is_reported(monkeypatch, tmp_path):
+    class FailingSandbox(ns.NamespaceSandbox):
+        def prepare_network_namespace(self):
+            raise spack.sandbox.SandboxError("network namespace unavailable")
+
+        def drop_mount_authority(self):
+            raise AssertionError("mount authority must be kept after a network failure")
+
+    sandbox = FailingSandbox()
+    sandbox._filesystem_policy_active = True
+
+    with pytest.raises(spack.error.InstallError, match="network namespace unavailable"):
+        build._enable_sandbox({"enable": True}, spack.spec.Spec(), str(tmp_path), sandbox=sandbox)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["missing", "file", "symlink", "relative", "dotdot", "unselected"]
+)
+def test_namespace_worker_root_validation(tmp_path, invalid):
+    root = tmp_path / "worker"
+    root.mkdir()
+    policy = ns.build_namespace_filesystem_policy(
+        [], read_write_mounts=[(str(root), str(root))], read_only_view=True
+    )
+    if invalid == "missing":
+        root.rmdir()
+    elif invalid == "file":
+        root.rmdir()
+        root.touch()
+    elif invalid == "symlink":
+        alias = tmp_path / "alias"
+        alias.symlink_to(root)
+        root = alias
+    elif invalid == "relative":
+        root = os.path.relpath(root)
+    elif invalid == "dotdot":
+        root = root / ".." / "worker"
+    elif invalid == "unselected":
+        root = tmp_path
+    activation = build.NamespaceActivation(policy, str(tmp_path / "scratch"), str(root))
+    with pytest.raises((spack.error.InstallError, ns.NamespaceSetupError)):
+        build._validate_namespace_worker_root(activation)
+
+
+@pytest.mark.parametrize("name", ["home", "cache", "tmp"])
+@pytest.mark.parametrize("existing", ["directory", "file", "symlink"])
+def test_namespace_worker_environment_rejects_existing_paths(
+    tmp_path, monkeypatch, name, existing
+):
+    root = tmp_path / "worker"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = root / name
+    if existing == "directory":
+        target.mkdir()
+    elif existing == "file":
+        target.touch()
+    else:
+        target.symlink_to(outside)
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setattr(build.tempfile, "tempdir", "/inherited-temp")
+    inherited_environment = dict(os.environ)
+    with pytest.raises(FileExistsError):
+        build._configure_namespace_worker_environment(str(root))
+    assert os.environ == inherited_environment
+    assert build.tempfile.tempdir == "/inherited-temp"
+    assert not list(outside.iterdir())
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_namespace_worker_environment_unchanged_for_fallback(tmp_path, monkeypatch, enabled):
+    fallback = object()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: fallback)
+    monkeypatch.setattr(ns, "freeze_namespace_sandbox_capability", lambda: None)
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    monkeypatch.setattr(build.tempfile, "tempdir", "/inherited-temp")
+    inherited_environment = dict(os.environ)
+    sandbox = build._prepare_namespace_sandbox_before_threads(
+        {"enable": enabled}, spack.spec.Spec(), str(tmp_path)
+    )
+    assert sandbox is (fallback if enabled else None)
+    assert os.environ == inherited_environment
+    assert build.tempfile.tempdir == "/inherited-temp"
+    assert not list(tmp_path.iterdir())
+
+
+def test_live_private_devices_and_concurrent_shared_memory(tmp_path):
+    if not ns.namespace_sandbox_available():
+        pytest.skip("unprivileged namespaces unavailable")
+    code = """
+import errno
+import os
+import stat
+import sys
+from pathlib import Path
+from spack.installer import build
+import spack.spec
+import spack.sandbox_namespaces as ns
+
+worker, scratch, host_shm, token = sys.argv[1:]
+data = build._load_sandbox_policy()
+devices = [(path, path) for path in data['device_nodes'] if os.path.exists(path)]
+device_ids = {path: os.stat(path).st_rdev for path, _ in devices}
+policy = ns.build_namespace_filesystem_policy(
+    ['/dev'], read_write_mounts=devices + [(worker, worker)],
+    generated_symlinks=[ns.NamespaceGeneratedSymlink(path, target)
+                        for path, target in data['device_symlinks'].items()],
+    tmpfs_paths=data['tmpfs_paths'], read_only_view=True,
+)
+sandbox = build._prepare_namespace_sandbox_before_threads(
+    {'enable': True}, spack.spec.Spec(), worker,
+    namespace_activation=build.NamespaceActivation(policy, scratch, worker),
+)
+assert sandbox.filesystem_policy_active
+assert set(os.listdir('/dev')) == {
+    Path(path).name for path, _ in devices
+} | {'shm', 'fd', 'stdin', 'stdout', 'stderr'}
+for path, device_id in device_ids.items():
+    assert stat.S_ISCHR(os.stat(path).st_mode)
+    assert os.stat(path).st_rdev == device_id
+assert stat.S_IMODE(os.stat('/dev/shm').st_mode) == 0o1777
+assert not os.path.exists(host_shm)
+for path, target in data['device_symlinks'].items():
+    assert os.readlink(path) == target
+with open('/dev/null', 'wb') as stream:
+    stream.write(b'discard')
+with open('/dev/null', 'rb') as stream:
+    assert stream.read(1) == b''
+with open('/dev/zero', 'rb') as stream:
+    assert stream.read(16) == bytes(16)
+for path in ('/dev/random', '/dev/urandom'):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        assert len(os.read(descriptor, 16)) == 16
+    finally:
+        os.close(descriptor)
+descriptor = os.open('/dev/full', os.O_WRONLY)
+try:
+    try:
+        os.write(descriptor, b'full')
+    except OSError as error:
+        assert error.errno == errno.ENOSPC
+    else:
+        raise AssertionError('/dev/full accepted write')
+finally:
+    os.close(descriptor)
+with open('/dev/shm/spack-concurrent', 'x+') as stream:
+    stream.write(token)
+    stream.flush()
+    with open('/dev/fd/' + str(stream.fileno())) as alias:
+        assert alias.read() == token
+    with open('/dev/stdout', 'w') as output:
+        output.write('ready\\n')
+    with open('/dev/stderr', 'w') as output:
+        output.write('descriptor stderr\\n')
+    with open('/dev/stdin') as input_stream:
+        assert input_stream.readline() == 'release\\n'
+    stream.seek(0)
+    assert stream.read() == token
+build._enable_sandbox(
+    {'enable': True, 'allow_network': True}, spack.spec.Spec(), worker, sandbox=sandbox
+)
+status = Path('/proc/self/status').read_text().splitlines()
+assert all(int(line.split()[1], 16) == 0 for line in status
+           if line.startswith(('CapEff:', 'CapPrm:', 'CapInh:')))
+try:
+    sandbox.bind_mount(worker)
+except ns.SandboxError:
+    pass
+else:
+    raise AssertionError('mount authority retained')
+os._exit(0)
+"""
+    processes = []
+    with build.tempfile.NamedTemporaryFile(prefix="spack-host-shm-", dir="/dev/shm") as host:
+        host.write(b"host-private")
+        host.flush()
+        try:
+            for index in range(2):
+                worker = tmp_path / f"worker-{index}"
+                worker.mkdir()
+                scratch = tmp_path / f"scratch-{index}"
+                scratch.mkdir()
+                processes.append(
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            code,
+                            str(worker),
+                            str(scratch),
+                            host.name,
+                            str(index),
+                        ],
+                        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        universal_newlines=True,
+                    )
+                )
+            for process in processes:
+                assert select.select([process.stdout], [], [], 20)[0], "worker never became ready"
+                ready = process.stdout.readline()
+                if ready != "ready\n":
+                    _, errors = process.communicate(timeout=10)
+                    pytest.fail(errors)
+            for process in processes:
+                _, errors = process.communicate("release\n", timeout=20)
+                assert process.returncode == 0, errors
+                assert errors == "descriptor stderr\n"
+            host.seek(0)
+            assert host.read() == b"host-private"
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=10)
+
+
+def test_live_namespace_worker_environment(tmp_path):
+    if not ns.namespace_sandbox_available():
+        pytest.skip("unprivileged namespaces unavailable")
+    hidden = tmp_path / "hidden-home"
+    hidden.mkdir()
+    secret = hidden / "host-secret"
+    secret.write_text("private")
+    stage_parent = hidden / "stage-parent"
+    stage_parent.mkdir()
+    stage_configure = stage_parent / "spack-stage-gmake" / "spack-src" / "configure"
+    stage_configure.parent.mkdir(parents=True)
+    stage_configure.write_text("stage source")
+    worker_root = stage_parent / "worker with 'single' and \"double\" quotes"
+    worker_root.mkdir()
+    replacement = hidden
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    inherited_environment = dict(os.environ)
+    inherited_tempdir = build.tempfile.tempdir
+    code = """
+import errno
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from spack.installer import build
+from spack.sandbox_namespaces import (
+    build_namespace_filesystem_policy, freeze_namespace_sandbox_capability,
+)
+
+hidden, stage_parent, root, replacement, scratch = map(Path, sys.argv[1:6])
+policy = build_namespace_filesystem_policy(
+    [str(hidden)],
+    read_write_mounts=[(str(stage_parent), str(stage_parent))],
+    replacement_mounts=[(str(root), str(replacement))],
+    read_only_view=True,
+)
+activation = build.NamespaceActivation(policy, str(scratch), str(root))
+assert freeze_namespace_sandbox_capability().available
+os.environ['JAVA_TOOL_OPTIONS'] = '-Xmx64m -Duser.home=/old -Djava.io.tmpdir=/old'
+os.environ.pop('_JAVA_OPTIONS', None)
+os.environ.pop('JDK_JAVA_OPTIONS', None)
+tempfile.tempdir = '/stale-parent-cache'
+
+def start_tee(*args):
+    for variable, name in (
+        ('HOME', 'home'), ('XDG_CACHE_HOME', 'cache'),
+        ('TMPDIR', 'tmp'), ('TMP', 'tmp'), ('TEMP', 'tmp'),
+    ):
+        path = Path(os.environ[variable])
+        assert path == root / name, (variable, path, root / name)
+        assert path.resolve() == path
+        assert path.stat().st_mode & 0o777 == 0o700
+        (path / variable).write_text('worker')
+    generated = Path(tempfile.mkdtemp())
+    assert generated.parent == root / 'tmp'
+    with tempfile.NamedTemporaryFile() as temporary:
+        assert Path(temporary.name).parent == root / 'tmp'
+        temporary.write(b'worker')
+    assert not (hidden / 'host-secret').exists()
+    assert (
+        (stage_parent / 'spack-stage-gmake' / 'spack-src' / 'configure').read_text()
+        == 'stage source'
+    )
+    (replacement / 'private-temp').write_text('replacement')
+    try:
+        (root.parent.parent.parent / 'must-fail').write_text('denied')
+    except OSError as error:
+        assert error.errno == errno.EROFS
+    else:
+        raise AssertionError('inherited view remained writable')
+    if sys.argv[6]:
+        result = subprocess.run(
+            [sys.argv[6], '-XshowSettings:properties', '-version'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        for property_name, directory in (('user.home', 'home'), ('java.io.tmpdir', 'tmp')):
+            assert f'{property_name} = {root / directory}' in result.stderr, result.stderr
+    return object()
+
+build.Tee = start_tee
+_, sandbox = build._start_tee_after_namespace(
+    {'enable': True}, None, None, None, 'build.log', SimpleNamespace(),
+    str(stage_parent), activation,
+)
+assert sandbox.filesystem_policy_active
+os._exit(0)
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            code,
+            str(hidden),
+            str(stage_parent),
+            str(worker_root),
+            str(replacement),
+            str(scratch),
+            shutil.which("java") or "",
+        ],
+        env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert os.environ == inherited_environment
+    assert build.tempfile.tempdir == inherited_tempdir
+    assert secret.read_text() == "private"
+    assert (worker_root / "private-temp").read_text() == "replacement"
+    assert stage_configure.read_text() == "stage source"
+    for name, variable in (("home", "HOME"), ("cache", "XDG_CACHE_HOME"), ("tmp", "TMPDIR")):
+        assert (worker_root / name / variable).read_text() == "worker"
+
+
+def test_worker_prepares_namespace_before_tee(monkeypatch):
+    calls = []
+    sandbox = SimpleNamespace()
+    monkeypatch.setattr(
+        ns,
+        "freeze_namespace_sandbox_capability",
+        lambda: calls.append(("freeze",)) or ns.NamespaceCapability(True, None, None),
+    )
+    monkeypatch.setattr(
+        build,
+        "_prepare_namespace_sandbox_before_threads",
+        lambda config, spec, stage_path: calls.append(("prepare", spec, stage_path)) or sandbox,
+    )
+    monkeypatch.setattr(build, "Tee", lambda *args: calls.append(("tee", args)) or object())
+    spec = SimpleNamespace()
+
+    tee, returned_sandbox = build._start_tee_after_namespace(
+        {"enable": True}, "control-r", "control-w", "parent", "build.log", spec, "stage"
+    )
+    assert tee is not None
+    assert returned_sandbox is sandbox
+    assert calls == [
+        ("prepare", spec, "stage"),
+        ("tee", ("control-r", "control-w", "parent", "build.log")),
+    ]
+
+
+def test_pre_thread_setup_prepares_namespace_without_dropping_authority(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare", hidden_dirs, stage_path))
+            return True
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
+        def prepare_network_namespace(self):
+            calls.append(("prepare network namespace",))
+            return True
+
+    sandbox = RecordingSandbox()
+    spec = SimpleNamespace(traverse=lambda **kwargs: [], prefix=tmp_path / "prefix")
+    monkeypatch.setattr(
+        ns,
+        "freeze_namespace_sandbox_capability",
+        lambda: calls.append(("freeze",)) or ns.NamespaceCapability(True, None, None),
+    )
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+
+    assert (
+        build._prepare_namespace_sandbox_before_threads(
+            {"enable": True, "allow_network": False}, spec, str(tmp_path)
+        )
+        is sandbox
+    )
+    assert calls == [("freeze",), ("prepare", ["/usr/share/aclocal"], str(tmp_path))]
+
+
+def test_pre_thread_setup_keeps_network_namespace_when_allowed(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare",))
+            return True
+
+        def prepare_network_namespace(self):
+            calls.append(("prepare network namespace",))
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
+    sandbox = RecordingSandbox()
+    monkeypatch.setattr(ns, "freeze_namespace_sandbox_capability", lambda: None)
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    spec = SimpleNamespace(traverse=lambda **kwargs: [], prefix=tmp_path / "prefix")
+
+    build._prepare_namespace_sandbox_before_threads(
+        {"enable": True, "allow_network": True}, spec, str(tmp_path)
+    )
+    assert calls == [("prepare",)]
+
+
+def test_staging_rejects_active_network_namespace():
+    sandbox = ns.NamespaceSandbox()
+    build._require_staging_network(sandbox)
+
+    sandbox._network_namespace_ready = True
+    with pytest.raises(spack.error.InstallError, match="inactive while staging"):
+        build._require_staging_network(sandbox)
+
+
+def test_namespace_policy_validation_precedes_namespace_mutation(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare", hidden_dirs, stage_path))
+            return True
+
+    sandbox = RecordingSandbox()
+    for name in ("hidden", "tool", "header", "runtime", "temporary"):
+        (tmp_path / name).mkdir()
+    selected_paths = build.NamespacePolicyInputPaths(
+        hidden_roots=(str(tmp_path / "hidden"),),
+        compiler_paths=(str(tmp_path / "missing-compiler"),),
+        tool_paths=(str(tmp_path / "tool"),),
+        header_paths=(str(tmp_path / "header"),),
+        runtime_paths=(str(tmp_path / "runtime"),),
+        temporary_paths=(str(tmp_path / "temporary"),),
+    )
+    monkeypatch.setattr(
+        ns, "freeze_namespace_sandbox_capability", lambda: calls.append(("freeze",))
+    )
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+
+    with pytest.raises(ns.NamespaceSetupError, match="missing-compiler"):
+        build._prepare_namespace_sandbox_before_threads(
+            {"enable": True},
+            SimpleNamespace(prefix=tmp_path / "prefix", traverse=lambda **kwargs: []),
+            str(tmp_path / "stage"),
+            mount_plan_stage=str(tmp_path / "mount-plan"),
+            selected_paths=selected_paths,
+        )
+    assert calls == []
+
+
+def test_namespace_policy_validation_is_unconditional(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(
+        build,
+        "namespace_filesystem_policy_and_plan_from_inputs",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or ("policy", "plan"),
+    )
+    selected_paths = build.NamespacePolicyInputPaths((), (), (), (), (), ())
+
+    assert build.validate_namespace_policy_before_threads(
+        {},
+        SimpleNamespace(),
+        str(tmp_path / "stage"),
+        str(tmp_path / "mount-plan"),
+        selected_paths,
+    )
+    assert calls
+
+
+def test_pre_thread_namespace_failure_is_reported(monkeypatch, tmp_path):
+    class StateStream:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    state_stream = StateStream()
+    monkeypatch.setattr(build, "make_state_stream", lambda state: state_stream)
+
+    def fail(*args):
+        raise OSError(errno.EPERM, "namespace entry denied")
+
+    monkeypatch.setattr(build, "_start_tee_after_namespace", fail)
+    log_path = tmp_path / "build.log"
+
+    with pytest.raises(SystemExit) as error:
+        build._start_worker_output({}, object(), object(), None, object(), str(log_path))
+    assert error.value.code == build.ExitCode.BUILD_ERROR
+    assert state_stream.closed
+    assert "namespace entry denied" in log_path.read_text()
+
+
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("external, hidden_dirs", [(False, ["/usr/share/aclocal"]), (True, [])])
+def test_installer_mounts_before_landlock(monkeypatch, tmp_path, available, external, hidden_dirs):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare", hidden_dirs, stage_path))
+            return available
+
+        def allow_read(self, path):
+            calls.append(("read", str(path)))
+
+        def allow_write(self, path):
+            calls.append(("write", str(path)))
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
+        def prepare_network_namespace(self):
+            calls.append(("prepare network namespace",))
+            return True
+
+        def apply(self, block_network=False):
+            calls.append(("apply", block_network))
+
+    sandbox = RecordingSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    dependency = (
+        spack.spec.Spec("autoconf", external_path=str(tmp_path / "autoconf"))
+        if external
+        else SimpleNamespace(name="autoconf", external=False, prefix=tmp_path / "autoconf")
+    )
+    spec = SimpleNamespace(traverse=lambda **kw: [dependency], prefix=tmp_path / "prefix")
+    build._enable_sandbox({"enable": True, "allow_network": False}, spec, str(tmp_path))
+    assert calls[0] == ("prepare", hidden_dirs, str(tmp_path))
+    if available:
+        assert calls[1] == ("prepare network namespace",)
+        assert calls[2] == ("drop mount authority",)
+    else:
+        assert ("prepare network namespace",) not in calls
+    assert ("write", str(tmp_path)) in calls
+    assert calls[-1] == ("apply", True)
+
+
+def test_namespace_authority_drops_after_recipe_setup(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingSandbox(ns.NamespaceSandbox):
+        def __init__(self):
+            super().__init__()
+            self._filesystem_policy_active = True
+
+        def prepare_mount_tree(self, hidden_dirs, stage_path):
+            calls.append(("prepare", hidden_dirs, stage_path))
+            return True
+
+        def allow_read(self, path):
+            calls.append(("read", str(path)))
+
+        def allow_write(self, path):
+            calls.append(("write", str(path)))
+
+        def drop_mount_authority(self):
+            calls.append(("drop mount authority",))
+            return True
+
+        def apply(self, block_network=False):
+            calls.append(("apply", block_network))
+
+    sandbox = RecordingSandbox()
+    monkeypatch.setattr(spack.sandbox, "get_sandbox", lambda: sandbox)
+    monkeypatch.setattr(
+        build,
+        "_prepare_namespace_sandbox_before_threads",
+        lambda config, spec, stage_path: (calls.append(("prepare", stage_path)), sandbox)[-1],
+    )
+    monkeypatch.setattr(build, "Tee", lambda *args: calls.append(("tee", args)) or object())
+    spec = SimpleNamespace(traverse=lambda **kw: [], prefix=tmp_path / "prefix")
+
+    _, prepared_sandbox = build._start_tee_after_namespace(
+        {"enable": True, "allow_network": True},
+        "control-r",
+        "control-w",
+        "parent",
+        "build.log",
+        spec,
+        str(tmp_path),
+    )
+    calls.append(("recipe-controlled setup",))
+    build._enable_sandbox(
+        {"enable": True, "allow_network": True}, spec, str(tmp_path), sandbox=prepared_sandbox
+    )
+
+    assert calls == [
+        ("prepare", str(tmp_path)),
+        ("tee", ("control-r", "control-w", "parent", "build.log")),
+        ("recipe-controlled setup",),
+        ("drop mount authority",),
+    ]
+    assert calls.count(("drop mount authority",)) == 1
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_default_mask_does_not_hide_tools(external):
+    dependency = (
+        spack.spec.Spec("autoconf", external_path="/opt/autoconf")
+        if external
+        else SimpleNamespace(name="autoconf", external=False)
+    )
+    spec = SimpleNamespace(traverse=lambda **kw: [dependency])
+    assert build.configured_empty_directory_paths(cast(spack.spec.Spec, spec)) == (
+        [] if external else ["/usr/share/aclocal"]
+    )

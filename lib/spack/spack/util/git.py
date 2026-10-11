@@ -277,27 +277,27 @@ def get_commit_sha(path: str, ref: str) -> Optional[str]:
     return None
 
 
-def _exec_git_commands(git_exe, cmds, debug, dest=None):
+def _exec_git_commands(git_exe, cmds, debug, progress=False, dest=None):
     dest_args = ["-C", dest] if dest else []
-    error_stream = sys.stdout if debug else os.devnull  # swallow extra output for non-debug
+    error_stream = sys.stdout if debug or progress else os.devnull
     for cmd in cmds:
         git_exe(*dest_args, *cmd, error=error_stream)
 
 
-def _exec_git_commands_unique_dir(git_exe, cmds, debug, dest=None):
+def _exec_git_commands_unique_dir(git_exe, cmds, debug, progress=False, dest=None):
     if dest:
         # mimic creating a dir and clean up if there is a failure like git clone
         assert not os.path.isdir(dest)
         os.mkdir(dest)
         try:
-            _exec_git_commands(git_exe, cmds, debug, dest)
+            _exec_git_commands(git_exe, cmds, debug, progress, dest)
         except exe.ProcessError:
             shutil.rmtree(
                 dest, ignore_errors=False, onerror=fs.readonly_file_handler(ignore_errors=True)
             )
             raise
     else:
-        _exec_git_commands(git_exe, cmds, debug, dest)
+        _exec_git_commands(git_exe, cmds, debug, progress, dest)
 
 
 def protocol_supports_shallow_clone(url):
@@ -307,7 +307,7 @@ def protocol_supports_shallow_clone(url):
     return not (url.startswith("http://") or url.startswith("/"))
 
 
-def git_init_fetch(url, ref, depth=None, debug=False, dest=None, git_exe=None):
+def git_init_fetch(url, ref, depth=None, debug=False, dest=None, git_exe=None, progress=False):
     """Utilize ``git init`` and then ``git fetch`` for a minimal clone of a single git ref
     This method runs git init, repo add, fetch to get a minimal set of source data.
     Profiling has shown this method can be 10-20% less storage than purely using sparse-checkout,
@@ -333,8 +333,10 @@ def git_init_fetch(url, ref, depth=None, debug=False, dest=None, git_exe=None):
     config = ["config", "remote.origin.fetch", "+refs/heads/*:origin/refs/*"]
     fetch = ["fetch"]
 
-    if not debug:
+    if not debug and not progress:
         fetch.append("--quiet")
+    elif progress:
+        fetch.append("--progress")
     if depth and protocol_supports_shallow_clone(url):
         fetch.extend(DEPTH(version, str(depth)))
 
@@ -348,7 +350,7 @@ def git_init_fetch(url, ref, depth=None, debug=False, dest=None, git_exe=None):
         cmds = [init, partial_clone, remote, config, fetch]
     else:
         cmds = [init, remote, config, fetch]
-    _exec_git_commands_unique_dir(git_exe, cmds, debug, dest)
+    _exec_git_commands_unique_dir(git_exe, cmds, debug, progress, dest)
 
 
 def git_checkout(
@@ -357,6 +359,7 @@ def git_checkout(
     debug: bool = False,
     dest: Optional[str] = None,
     git_exe: Optional[GitExecutable] = None,
+    progress: bool = False,
 ):
     """A generic method for running ``git checkout`` that integrates sparse-checkout
     Several methods in this module explicitly delay checkout so sparse-checkout can be called.
@@ -368,7 +371,7 @@ def git_checkout(
     checkout = ["checkout"]
     sparse_checkout = SPARSE_CHECKOUT(git_exe.version)
 
-    if not debug:
+    if not debug and not progress:
         checkout.append("--quiet")
     if ref:
         checkout.append(ref)
@@ -379,7 +382,7 @@ def git_checkout(
         cmds.append(sparse_checkout)
 
     cmds.append(checkout)
-    _exec_git_commands(git_exe, cmds, debug, dest)
+    _exec_git_commands(git_exe, cmds, debug, progress, dest)
 
 
 def git_clone(
@@ -390,6 +393,7 @@ def git_clone(
     debug: bool = False,
     dest: Optional[str] = None,
     git_exe: Optional[GitExecutable] = None,
+    progress: bool = False,
 ):
     """A git clone that prefers deferring expensive blob fetching for modern git installations
     This is our fallback method for capturing more git data than the ``init && fetch`` model.
@@ -403,9 +407,12 @@ def git_clone(
     old = version < MIN_OPT_VERSION
     fetch = ["fetch"]
 
-    if not debug:
+    if not debug and not progress:
         clone.append("--quiet")
         fetch.append("--quiet")
+    elif progress:
+        clone.append("--progress")
+        fetch.append("--progress")
 
     if not old and depth and not full_repo and protocol_supports_shallow_clone(url):
         clone.extend(DEPTH(version, str(depth)))
@@ -425,6 +432,6 @@ def git_clone(
 
     if dest:
         clone.append(dest)
-    _exec_git_commands(git_exe, [clone], debug)
+    _exec_git_commands(git_exe, [clone], debug, progress)
     if old:
-        _exec_git_commands(git_exe, [fetch], debug, dest)
+        _exec_git_commands(git_exe, [fetch], debug, progress, dest)
