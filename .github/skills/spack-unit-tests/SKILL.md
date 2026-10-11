@@ -65,9 +65,10 @@ For namespace sandbox changes, the recurring focused suite is:
 PYTHONSTARTUP= PYTHON_BASIC_REPL= \
   PYTHONPATH="$PWD/lib/spack" \
   .venv/bin/python -m pytest -q \
-  lib/spack/spack/test/sandbox_common.py \
-  lib/spack/spack/test/test_sandbox_namespaces.py \
-  lib/spack/spack/test/test_namespace_probe_lifecycle.py
+  lib/spack/spack/test/sandbox_base.py \
+  lib/spack/spack/test/linux/installer_sandbox.py \
+  lib/spack/spack/test/linux/sandbox_namespaces.py \
+  lib/spack/spack/test/linux/sandbox_namespace_probe.py
 ```
 
 Add installer and configuration tests when those areas change:
