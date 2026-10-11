@@ -83,6 +83,51 @@ at its owner, rewrite tooling, closing local-gate gaps), see the
    Confirm the resulting PR's head, base, and draft state. Do not claim its CI
    passed based on local tests or the preceding PR's checks.
 
+## Recipe: Publish the Next Layer
+
+Use this for layer N, branch `namespace-sandbox/v2/NN-<name>` (for example layer 7
+is `07-production-activation`, layer 8 is `08-worker-devices`). Run it only after
+the series skill's priority rule allows it.
+
+**Remotes.** `bk` is the fork `git@github.com:bernhardkaindl/spack.git`. GitButler
+pushes each layer to `bk/<branch>`. PR heads are `bernhardkaindl:<branch>`, and PRs
+target `develop` of `spack/spack`. Never push to `origin` (`spack/spack`) or to
+`johnwparent`.
+
+1. **Preconditions.** Every published predecessor is green at its current head
+   (the GitLab exception counts as green). Layer N's tip is validated with
+   `assets/validate-layers.sh`. Its commit message and PR description draft are
+   saved in the session `files/` folder.
+2. **Dry run (read-only).**
+   `GIT_DIR=/home/bkaindl/spack/spack/.git GIT_WORK_TREE=/home/bkaindl/spack/spack but push <branch> --dry-run`
+   Check that it says `Would push to: bk/<branch>` and that the commit count is the
+   layer's own commits. A new layer prints `Would push 1 commit` or similar. If it
+   prints `Force push required` because the remote branch holds older history, the
+   real push needs `--with-force`. This is authorized for the layer's own branch in
+   this series only. Never add `--with-force` to a push of a higher layer.
+3. **Push.** The same command without `--dry-run`, with `--with-force` only when step 2
+   said so.
+4. **Verify the remote head.** `git ls-remote bk refs/heads/<branch>` must equal the
+   layer's local tip. If it does not, stop and investigate before any retry.
+5. **Check for an existing PR** (never duplicate one):
+   `gh pr list --repo spack/spack --state all --json number,headRefName,headRepositoryOwner,baseRefName,isDraft --jq '.[] | select(.headRefName=="<branch>")'`
+   If one exists, update it instead of creating another.
+6. **Create the PR** (regular, not draft; never `but pr new`):
+   `gh pr create --repo spack/spack --base develop --head bernhardkaindl:<branch> --title "installer-sandbox N/18: <summary>" --body-file <session files>/prN-body.md`
+7. **Verify the PR.**
+   `gh pr view <number> --repo spack/spack --json number,headRefOid,baseRefName,isDraft`
+   Expect the tip SHA, `develop`, and `isDraft: false`.
+8. **Record the PR in the inventory.** Add an entry with `position` N, `number`,
+   `branch`, `title`, and `body` to `assets/published-prs.json`.
+9. **Refresh footers.** Run `assets/refresh_footers.py` as a dry run, check that
+   every listed PR is a series layer, then run it with `--apply --backup-dir <dir>`.
+   Its read-back check must pass.
+10. **Ledger.** Record the layer, PR number, pushed SHA, force push (yes or no), and
+    any warning in `.github/projects/installer-sandbox-tests.md`.
+
+Only the layer's own branch and PR change. A `--with-force` push of a rewritten layer
+may also need that PR's body and footer refreshed, which step 9 covers.
+
 ## Write for Reviewers
 
 Draft and rewrite PR bodies with the [spack-pr-descriptions](../spack-pr-descriptions/SKILL.md)

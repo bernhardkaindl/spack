@@ -314,3 +314,20 @@ Installer tests moved in phase 2 from the backend file (by introducing layer):
 - Layer 7 (#53196) status at this point: head `e63f4b9d42`, unit tests, bootstrap jobs and `ci/gitlab-ci` still pending. Not green yet.
 
 - Added to the series agent: when a PR's CI fails from a GitLab infrastructure error, newer runs for other PRs have passed, and no `@spackbot run pipeline` comment was recently posted, post `@spackbot run pipeline` on that PR to re-run its failed jobs. Not triggered yet: #53196 has no failure.
+
+- Added "Recipe: Publish the Next Layer" to the publication skill: remote `bk` is the fork `bernhardkaindl/spack`, the dry-run and push commands, `gh pr create --base develop --head bernhardkaindl:<branch>` (not a draft), inventory entry, footer refresh, ledger. Verified read-only: layer 7 dry run reports nothing to push; layer 8 dry run targets `bk/namespace-sandbox/v2/08-worker-devices`, 1 commit, and needs `--with-force` because the remote branch still holds 7 pre-rewrite commits. Layer 8 not pushed (layer 7 not green).
+
+### 2026-10-12 - Layer 8 published
+
+- Layer 8 published as #53197 (`namespace-sandbox/v2/08-worker-devices`, tip `221389824e`,
+  one commit on layer 7 `e63f4b9d42`). Validation output is in `/tmp/l8-validate.log`
+  (all gates passed, 272 tests). Layer 4 (#53191) `ci/gitlab-ci` `ERROR` (pipeline 1865607)
+  is accepted as infrastructure, so layer 4 was treated as green.
+- The remote `bk/namespace-sandbox/v2/08-worker-devices` held the pre-rewrite `0dc944f8b3`
+  (7 upstream commits), so the push used `--with-force`, as in layer 7.
+- PR description (`files/pr8-body.md`) was rewritten after checking it against the diff.
+  Claims that the diff does not show were removed (compiler-wrapper ordering, descriptor
+  links, live isolation tests). The PR was opened as a regular PR, not a draft.
+- `published-prs.json` gained position 8. `refresh_footers.py --apply` updated the footers
+  on #53186, #53189, #53190, #53191, #53194, #53195, #53196 and #53197, and every read-back matched.
+- Added "Starting point for a fresh session" to the series skill.

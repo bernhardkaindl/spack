@@ -22,6 +22,20 @@ only affect later layers go into the ledger as deferred, not into the current
 session. A fix that rewrites later layers only needs those layers to apply cleanly;
 their full validation happens when they become the first layer in line.
 
+## Starting point for a fresh session
+
+1. Read the last `###` section of `.github/projects/installer-sandbox-tests.md`
+   (entries are appended, so the newest is at the bottom). It names the last layer
+   touched and its tip.
+2. Do not trust the status it records. Re-check the inventory and GitHub (Loop step 1).
+3. Apply the priority rule to find the layer to work on: the first failing layer,
+   then the first pending one, then the first unpublished one. A layer is unpublished
+   when `assets/published-prs.json` of the publication skill has no entry for its
+   position.
+4. To publish an unpublished layer, follow "Recipe: Publish the Next Layer" in the
+   publication skill. Save its PR text as `pr<N>-body.md` in the session `files/` folder.
+5. Record the outcome in the ledger as a new `###` section.
+
 ## GitLab status exception
 
 `ci/gitlab-ci` is a legacy status that an external GitLab pipeline reports; the PR
@@ -125,8 +139,9 @@ generate`. That is infrastructure, not the PR.
    PR description or footer quotes the message, refresh it too, using the
    `spack-pr-descriptions` skill and the rules under "Interactive and unattended runs".
 7. **Push** only the selected layer, with `--with-force` only when an already
-   published layer was amended, following the publication skill's command-scoped
-   `GIT_DIR`/`GIT_WORK_TREE` recipe. Run `--dry-run` first and verify the PR head
+   published layer was amended, following the publication skill's "Recipe: Publish the
+   Next Layer" (command-scoped `GIT_DIR`/`GIT_WORK_TREE`, remote `bk`). Run `--dry-run`
+   first and verify the PR head
    afterwards. Review-synchronization warnings after a successful push are
    recorded, not retried.
 8. **Record and report.** Update the ledger (tips, map files, pushed SHAs, deferred

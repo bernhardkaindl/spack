@@ -121,7 +121,10 @@ Record each comment in the ledger.
    `VALIDATE_ALL=1` only when every layer must be rechecked. All checks must pass, with
    the coverage gates reported per production file.
 6. Push only that layer, create or update its PR, verify the PR head, and confirm its
-   checks have started. Update the ledger. Refresh the numbered footers only with
+   checks have started. Follow the publication skill's "Recipe: Publish the Next Layer"
+   exactly: push to remote `bk` (the fork) with GitButler, `--with-force` only when the
+   dry run says so, then `gh pr create --base develop --head bernhardkaindl:<branch>`
+   without a draft flag. Update the ledger. Refresh the numbered footers only with
    `.github/skills/installer-sandbox-publication/assets/refresh_footers.py`: dry run
    first, then `--apply --backup-dir` with a directory outside the repository. Never
    run `gh pr edit` on a PR that the script or the inventory does not list as a series layer.
