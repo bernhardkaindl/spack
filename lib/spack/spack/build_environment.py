@@ -480,6 +480,26 @@ def optimization_flags(compiler, target):
     return result
 
 
+def link_dirs_of(query: spack.spec.SpecBuildInterface) -> List[str]:
+    """Return the library directories a build uses to link against ``query``, as returned by
+    ``spec[name]``: those of its libraries, followed by its ``lib`` and ``lib64`` subdirectories
+    that exist."""
+    link_dirs = []
+    try:
+        # Locating libraries can be time consuming, so log start and finish.
+        tty.debug(f"Collecting libraries for {query.name}")
+        link_dirs.extend(query.libs.directories)
+        tty.debug(f"Libraries for {query.name} have been collected.")
+    except NoLibrariesError:
+        tty.debug(f"No libraries found for {query.name}")
+
+    for default_lib_dir in ("lib", "lib64"):
+        default_lib_prefix = os.path.join(query.prefix, default_lib_dir)
+        if os.path.isdir(default_lib_prefix):
+            link_dirs.append(default_lib_prefix)
+    return link_dirs
+
+
 def set_wrapper_variables(pkg, env):
     """Set environment variables used by the Spack compiler wrapper (which have the prefix
     ``SPACK_``) and also add the compiler wrappers to PATH.
@@ -525,20 +545,7 @@ def set_wrapper_variables(pkg, env):
         # deps, so keying by name is wrong. In practice it is not problematic: we obtain the same
         # gcc-runtime / glibc here, and repeatedly add the same dirs that are later deduped.
         query = pkg.spec[dep.name]
-        dep_link_dirs = []
-        try:
-            # Locating libraries can be time consuming, so log start and finish.
-            tty.debug(f"Collecting libraries for {dep.name}")
-            dep_link_dirs.extend(query.libs.directories)
-            tty.debug(f"Libraries for {dep.name} have been collected.")
-        except NoLibrariesError:
-            tty.debug(f"No libraries found for {dep.name}")
-
-        for default_lib_dir in ("lib", "lib64"):
-            default_lib_prefix = os.path.join(dep.prefix, default_lib_dir)
-            if os.path.isdir(default_lib_prefix):
-                dep_link_dirs.append(default_lib_prefix)
-
+        dep_link_dirs = link_dirs_of(query)
         link_dirs[:0] = dep_link_dirs
         if dep.dag_hash() in rpath_hashes:
             rpath_dirs[:0] = dep_link_dirs
@@ -574,6 +581,11 @@ def set_wrapper_variables(pkg, env):
         spack.store.STORE.db.root,
         *(db.root for db in spack.store.STORE.db.upstream_dbs),
     }
+    stage_root = spack.stage.stage_root(spack.config.CONFIG)
+    if os.path.splitdrive(pkg.stage.path)[0] != os.path.splitdrive(stage_root)[0] or (
+        os.path.commonpath((pkg.stage.path, stage_root)) != stage_root
+    ):
+        spack_managed_dirs.add(pkg.stage.path)
     spack_managed_dirs.update([os.path.realpath(p) for p in spack_managed_dirs])
 
     env.set(SPACK_MANAGED_DIRS, "|".join(f'"{p}/"*' for p in sorted(spack_managed_dirs)))
